@@ -144,9 +144,10 @@ class Settings:
     # Groq API (LLM)
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
-    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL") or "llama-3.3-70b-versatile"
-    # Fast/cheap model for simple tasks (intent classification, response generation)
-    GROQ_LLM_MODEL_FAST: str = os.getenv("GROQ_LLM_MODEL_FAST", "llama-3.1-8b-instant")
+
+    GROQ_LLM_MODEL_HEAVY: str = os.getenv("GROQ_LLM_MODEL_HEAVY", "openai/gpt-oss-120b") # The Heavy Lifter: Deep analytical reasoning, complex business logic, and database schema mapping
+    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL") or "llama-3.3-70b-versatile" # # The Reliable Router: Multi-step tool calling, structural routing, and precise JSON generation
+    GROQ_LLM_MODEL_FAST: str = os.getenv("GROQ_LLM_MODEL_FAST", "llama-3.1-8b-instant") # Fast/cheap model for simple tasks (intent classification, response generation)
 
     @property
     def groq_api_key(self) -> Optional[str]:
