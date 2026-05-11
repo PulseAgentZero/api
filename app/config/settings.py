@@ -141,6 +141,37 @@ class Settings:
     REDIS_URL: Optional[str] = os.getenv("REDIS_URL", "").strip() or None
 
     # ------------------------------------------------------------------
+    # Qdrant (vector search for entity retrieval)
+    # ------------------------------------------------------------------
+    QDRANT_URL: Optional[str] = os.getenv("QDRANT_URL", "http://localhost:6333")
+    QDRANT_API_KEY: Optional[str] = os.getenv("QDRANT_API_KEY", "").strip() or None
+    QDRANT_COLLECTION_PREFIX: str = os.getenv("QDRANT_COLLECTION_PREFIX", "pulse_org_")
+    QDRANT_VECTOR_SIZE: int = int(os.getenv("QDRANT_VECTOR_SIZE", "1024"))
+
+    @classmethod
+    def is_qdrant_configured(cls) -> bool:
+        return bool(cls.QDRANT_URL)
+
+    @classmethod
+    def get_org_collection_name(cls, org_id: str) -> str:
+        return f"{cls.QDRANT_COLLECTION_PREFIX}{org_id}"
+
+    # ------------------------------------------------------------------
+    # Voyage AI (embeddings for vector search)
+    # ------------------------------------------------------------------
+    VOYAGEAI_API_KEY: Optional[str] = os.getenv("VOYAGEAI_API_KEY")
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "voyage-4-large")
+    EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
+
+    @classmethod
+    def get_voyageai_api_key(cls) -> Optional[str]:
+        return cls._get_secret("VOYAGEAI_API_KEY", "VOYAGEAI_API_KEY")
+
+    @classmethod
+    def is_voyage_configured(cls) -> bool:
+        return bool(cls.get_voyageai_api_key())
+
+    # ------------------------------------------------------------------
     # Groq API (LLM)
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
