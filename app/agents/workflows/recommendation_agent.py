@@ -52,13 +52,23 @@ class RecommendationAgent(BaseAgent):
         scored = state.get("scored_entities", [])
         recommendation_limit = DEFAULT_RECOMMENDATION_LIMIT
 
-        # Filter to entities with risk_score >= 0.6
-        at_risk = [e for e in scored if e.get("risk_score", 0) >= 0.6][:recommendation_limit]
+        elevated = [e for e in scored if e.get("risk_score", 0) >= 0.6]
+        at_risk = elevated[:recommendation_limit]
+
+        # Record any cap so the pipeline run row carries the sampling note.
+        if len(elevated) > recommendation_limit:
+            caps = dict(state.get("generation_caps") or {})
+            caps["recommendations"] = {
+                "elevated_total": len(elevated),
+                "limit": recommendation_limit,
+                "truncated": True,
+            }
+            state["generation_caps"] = caps
 
         if not at_risk:
             logger.info("[RecommendationAgent] No at-risk entities to recommend for")
             state["recommendations"] = []
-            state["recommendation_stats"] = {"total_generated": 0}
+            state["recommendation_stats"] = {"total_generated": 0, "total_persisted": 0}
             return state
 
         # Generate recommendations via LLM
@@ -71,12 +81,24 @@ class RecommendationAgent(BaseAgent):
             recommendation_limit=recommendation_limit,
         )
 
-        # Batch entities for LLM processing (max ~20 per call to keep context manageable)
+        # Attach profile context (in-memory only) so the LLM can reason over
+        # behavioural signals when crafting interventions. Profiles are never
+        # persisted to the Pulse application database.
+        profile_index = {
+            str(p.get("entity_id")): p
+            for p in (state.get("entity_profiles") or [])
+            if p.get("entity_id") is not None
+        }
+        enriched_at_risk = [
+            _augment_with_profile(e, profile_index.get(e.get("entity_id")))
+            for e in at_risk
+        ]
+
         all_recs: list[dict] = []
         batch_size = 20
 
-        for i in range(0, len(at_risk), batch_size):
-            batch = at_risk[i : i + batch_size]
+        for i in range(0, len(enriched_at_risk), batch_size):
+            batch = enriched_at_risk[i : i + batch_size]
             try:
                 batch_recs = await self._generate_batch(prompt, state, batch)
                 all_recs.extend(batch_recs)
@@ -84,38 +106,44 @@ class RecommendationAgent(BaseAgent):
                 logger.error(
                     "[RecommendationAgent] Batch %d failed: %s", i // batch_size, e
                 )
-                # Fall back to template-based recommendations for this batch
                 all_recs.extend(self._fallback_recommendations(batch, state))
 
-        # Persist to database — supersede existing active recs
+        # Persist atomically — supersede existing active recs and create new
+        # ones inside a single SAVEPOINT so a mid-loop failure cannot leave
+        # the org with no active recommendations.
+        created = 0
+        superseded = 0
         try:
-            repo = RecommendationRepository(db)
-            existing = await repo.list_by_org(org_id, status="active")
-            for rec in existing:
-                rec.status = "superseded"
+            async with db.begin_nested():
+                repo = RecommendationRepository(db)
+                existing = await repo.list_by_org(org_id, status="active")
+                for rec in existing:
+                    rec.status = "superseded"
+                superseded = len(existing)
 
-            created = 0
-            for rec_data in all_recs:
-                await repo.create(
-                    org_id=org_id,
-                    entity_id=str(rec_data.get("entity_id", "")),
-                    entity_label=rec_data.get("entity_name"),
-                    type=rec_data.get("type", "retention_intervention"),
-                    urgency=rec_data.get("urgency", "high"),
-                    title=rec_data.get("title", "Risk intervention required"),
-                    reasoning=rec_data.get("reasoning", ""),
-                    suggested_action=rec_data.get("suggested_action", ""),
-                    status="active",
-                )
-                created += 1
+                for rec_data in all_recs:
+                    await repo.create(
+                        org_id=org_id,
+                        entity_id=str(rec_data.get("entity_id", "")),
+                        entity_label=rec_data.get("entity_name"),
+                        type=rec_data.get("type", "retention_intervention"),
+                        urgency=rec_data.get("urgency", "high"),
+                        title=rec_data.get("title", "Risk intervention required"),
+                        reasoning=rec_data.get("reasoning", ""),
+                        suggested_action=rec_data.get("suggested_action", ""),
+                        status="active",
+                    )
+                    created += 1
 
             logger.info(
                 "[RecommendationAgent] Persisted: %d new recs, %d superseded",
-                created, len(existing),
+                created, superseded,
             )
         except Exception as e:
-            logger.error("[RecommendationAgent] DB persistence failed: %s", e)
+            # SAVEPOINT auto-rolled back; original active recs remain intact.
+            logger.error("[RecommendationAgent] DB persistence failed (rolled back): %s", e)
             state["error"] = f"Recommendation persistence failed: {e}"
+            created = 0
 
         # Build stats
         by_urgency: dict[str, int] = {}
@@ -128,15 +156,18 @@ class RecommendationAgent(BaseAgent):
 
         state["recommendations"] = all_recs
         state["recommendation_stats"] = {
-            "total_generated": len(all_recs),
+            "total_generated": created,
+            "total_drafted": len(all_recs),
+            "total_persisted": created,
+            "total_superseded": superseded,
             "by_urgency": by_urgency,
             "by_type": by_type,
         }
         state["reasoning_log"].extend(self._reasoning_entries)
 
         logger.info(
-            "[RecommendationAgent] Complete: %d recommendations generated",
-            len(all_recs),
+            "[RecommendationAgent] Complete: %d drafted, %d persisted",
+            len(all_recs), created,
         )
         return state
 
@@ -198,3 +229,18 @@ class RecommendationAgent(BaseAgent):
                 ),
             })
         return recs
+
+
+def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
+    """Merge profiling fields into an entity payload (in-memory only, not persisted)."""
+    if not profile:
+        return entity
+    enriched = dict(entity)
+    profile_fields = {
+        k: v
+        for k, v in profile.items()
+        if k not in {"entity_id", "entity_name", "risk_score", "risk_tier", "signals"}
+    }
+    if profile_fields:
+        enriched["profile"] = profile_fields
+    return enriched

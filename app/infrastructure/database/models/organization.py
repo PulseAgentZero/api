@@ -10,6 +10,7 @@ from app.infrastructure.database.base import Base, TimestampMixin, UUIDMixin
 if TYPE_CHECKING:
     from app.infrastructure.database.models.agent_conversation import AgentConversation
     from app.infrastructure.database.models.connection import Connection
+    from app.infrastructure.database.models.pipeline_run import PipelineRun
     from app.infrastructure.database.models.recommendation import Recommendation
     from app.infrastructure.database.models.schema_mapping import SchemaMapping
     from app.infrastructure.database.models.user import User
@@ -30,6 +31,7 @@ class Organization(Base, UUIDMixin, TimestampMixin):
     schema_mappings: Mapped[list[SchemaMapping]] = relationship("SchemaMapping", back_populates="organization", lazy="raise")
     recommendations: Mapped[list[Recommendation]] = relationship("Recommendation", back_populates="organization", lazy="raise")
     agent_conversations: Mapped[list[AgentConversation]] = relationship("AgentConversation", back_populates="organization", lazy="raise")
+    pipeline_runs: Mapped[list[PipelineRun]] = relationship("PipelineRun", back_populates="organization", lazy="raise")
 
     def __repr__(self) -> str:
         return f"<Organization {self.id} {self.name}>"

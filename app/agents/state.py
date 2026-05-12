@@ -46,5 +46,7 @@ class PipelineState(TypedDict, total=False):
     error: Optional[str]
     reasoning_log: list[dict]
     pipeline_metrics: dict              # per-step and aggregate metrics
+    pipeline_run_id: Optional[str]      # FK to pipeline_runs row (post-finalize)
+    generation_caps: Optional[dict]     # caps/sampling notes (e.g. narrative limit hit)
     started_at: str
     completed_at: Optional[str]

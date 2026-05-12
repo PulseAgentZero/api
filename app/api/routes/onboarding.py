@@ -159,7 +159,7 @@ async def complete_onboarding(
     from app.services.schedulers.pipeline_scheduler import schedule_org, trigger_pipeline_now
 
     schedule_org(current_user.org_id, org.name)
-    await trigger_pipeline_now(current_user.org_id)
+    await trigger_pipeline_now(current_user.org_id, trigger_source="onboarding")
 
     return CompleteOnboardingResponse(
         message="Onboarding complete",

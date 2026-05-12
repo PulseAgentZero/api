@@ -1,13 +1,20 @@
-"""Tool registry and execution for Pulse agents.
-"""
+"""Tool registry and execution for Pulse agents."""
 
+import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
+
+# Default per-tool wall-clock timeout. Tools that legitimately need longer
+# can override via Tool(timeout_seconds=...).
+DEFAULT_TOOL_TIMEOUT_SECONDS: float = float(
+    os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "30")
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,8 @@ class Tool:
     description: str
     parameters: list[ToolParam] = field(default_factory=list)
     execute: Callable[..., Awaitable[Any]] = field(repr=False, default=None)
+    # Per-tool wall-clock timeout; falls back to DEFAULT_TOOL_TIMEOUT_SECONDS.
+    timeout_seconds: float | None = None
 
     def to_claude_schema(self) -> dict:
         """Convert to Anthropic Claude tool definition."""
@@ -139,9 +148,12 @@ class ToolRegistry:
             if param.name in call.arguments:
                 resolved[param.name] = call.arguments[param.name]
 
+        timeout = tool.timeout_seconds or DEFAULT_TOOL_TIMEOUT_SECONDS
         t0 = time.monotonic()
         try:
-            result_data = await tool.execute(**resolved)
+            result_data = await asyncio.wait_for(
+                tool.execute(**resolved), timeout=timeout
+            )
             elapsed = int((time.monotonic() - t0) * 1000)
             self.call_log.append({
                 "tool": call.tool_name,
@@ -153,6 +165,24 @@ class ToolRegistry:
                 tool_name=call.tool_name,
                 success=True,
                 data=result_data,
+                duration_ms=elapsed,
+            )
+        except asyncio.TimeoutError:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            err_msg = f"Tool '{call.tool_name}' timed out after {timeout:.1f}s"
+            logger.error("%s", err_msg)
+            self.call_log.append({
+                "tool": call.tool_name,
+                "arguments": call.arguments,
+                "success": False,
+                "error": err_msg,
+                "duration_ms": elapsed,
+                "timed_out": True,
+            })
+            return ToolResult(
+                tool_name=call.tool_name,
+                success=False,
+                error=err_msg,
                 duration_ms=elapsed,
             )
         except Exception as e:

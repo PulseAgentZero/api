@@ -80,9 +80,33 @@ class RiskScoringAgent(BaseAgent):
         # Step 4: Generate LLM narratives for elevated entities (risk_score >= 0.6)
         elevated = [e for e in scored_entities if e["risk_score"] >= 0.6]
 
-        if elevated:
+        narrative_cap = 50
+        narratives_target = elevated[:narrative_cap]
+
+        if len(elevated) > narrative_cap:
+            caps = dict(state.get("generation_caps") or {})
+            caps["narratives"] = {
+                "elevated_total": len(elevated),
+                "limit": narrative_cap,
+                "truncated": True,
+            }
+            state["generation_caps"] = caps
+
+        # Pull per-entity profiles from Agent 2 so narratives can reason over
+        # behavioural context, not just deterministic signal values.
+        profile_index = {
+            str(p.get("entity_id")): p
+            for p in (state.get("entity_profiles") or [])
+            if p.get("entity_id") is not None
+        }
+
+        if narratives_target:
+            payload = [
+                _augment_with_profile(e, profile_index.get(e["entity_id"]))
+                for e in narratives_target
+            ]
             try:
-                narratives = await self._generate_narratives(state, elevated[:50])
+                narratives = await self._generate_narratives(state, payload)
                 narrative_map = {n["entity_id"]: n.get("risk_narrative", "") for n in narratives}
                 for entity in scored_entities:
                     if entity["entity_id"] in narrative_map:
@@ -165,3 +189,22 @@ class RiskScoringAgent(BaseAgent):
         except json.JSONDecodeError:
             logger.warning("[RiskScoringAgent] Failed to parse narratives JSON")
             return []
+
+
+def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
+    """Merge selected profiling fields into an entity payload for the LLM.
+
+    The profile is only attached for in-memory narrative generation. Profile
+    data is never persisted to the Pulse application database.
+    """
+    if not profile:
+        return entity
+    enriched = dict(entity)
+    profile_fields = {
+        k: v
+        for k, v in profile.items()
+        if k not in {"entity_id", "entity_name", "risk_score", "risk_tier", "signals"}
+    }
+    if profile_fields:
+        enriched["profile"] = profile_fields
+    return enriched

@@ -1,7 +1,8 @@
 """Background pipeline scheduler using APScheduler.
 
 Runs the autonomous agent pipeline on a schedule for every org
-that has completed onboarding.
+that has completed onboarding. Uses pipeline_runs.status to
+deduplicate overlapping scheduled/manual triggers.
 """
 
 import asyncio
@@ -16,6 +17,9 @@ from sqlalchemy import select
 
 from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
+from app.infrastructure.database.repositories.pipeline_run_repository import (
+    PipelineRunRepository,
+)
 from app.infrastructure.database.session import async_session_factory
 
 logger = logging.getLogger(__name__)
@@ -25,31 +29,65 @@ PIPELINE_INTERVAL_HOURS = int(os.getenv("PIPELINE_INTERVAL_HOURS", "4"))
 _scheduler: AsyncIOScheduler | None = None
 
 
-async def _run_pipeline_for_org(org_id_str: str) -> None:
-    """Execute the autonomous pipeline for one organisation."""
+async def _claim_run_slot(org_id: UUID, trigger_source: str) -> UUID | None:
+    """Create a queued PipelineRun if no run is already active for the org.
+
+    Returns the new run_id, or None if an active run already exists.
+    """
+    async with async_session_factory() as session:
+        repo = PipelineRunRepository(session)
+        active = await repo.get_active_for_org(org_id)
+        if active is not None:
+            logger.info(
+                "Pipeline run skipped for org %s — active run %s in state '%s'",
+                org_id, active.id, active.status,
+            )
+            return None
+        run = await repo.create_queued(org_id, trigger_source=trigger_source)
+        await session.commit()
+        return run.id
+
+
+async def _run_pipeline_for_org(
+    org_id_str: str, trigger_source: str = "scheduled"
+) -> None:
+    """Execute the autonomous pipeline for one organisation.
+
+    Claims a run slot (dedup) before doing real work. If the slot is taken
+    by another active run, this no-ops.
+    """
     from app.agents.orchestrators.pipeline import PipelineOrchestrator
 
     org_id = UUID(org_id_str)
-    logger.info("Scheduled pipeline run starting for org %s", org_id)
+    run_id = await _claim_run_slot(org_id, trigger_source)
+    if run_id is None:
+        return
+
+    logger.info(
+        "Pipeline run %s starting for org %s (trigger=%s)",
+        run_id, org_id, trigger_source,
+    )
 
     try:
         async with async_session_factory() as session:
             orchestrator = PipelineOrchestrator(session)
-            state = await orchestrator.execute(org_id)
+            state = await orchestrator.execute(
+                org_id, trigger_source=trigger_source, run_id=run_id,
+            )
 
             if state.get("error"):
                 logger.error(
-                    "Pipeline for org %s completed with error: %s",
-                    org_id, state["error"],
+                    "Pipeline run %s for org %s completed with error: %s",
+                    run_id, org_id, state["error"],
                 )
             else:
                 logger.info(
-                    "Pipeline for org %s completed: %d recommendations",
-                    org_id,
+                    "Pipeline run %s for org %s completed: %d recommendations",
+                    run_id, org_id,
                     state.get("recommendation_stats", {}).get("total_generated", 0),
                 )
     except Exception as e:
-        logger.exception("Pipeline for org %s failed: %s", org_id, e)
+        logger.exception("Pipeline run %s for org %s failed: %s", run_id, org_id, e)
 
 
 async def _discover_and_schedule_orgs(scheduler: AsyncIOScheduler) -> None:
@@ -69,17 +107,15 @@ async def _discover_and_schedule_orgs(scheduler: AsyncIOScheduler) -> None:
 
         for i, (org_id, org_name) in enumerate(orgs):
             job_id = f"pipeline_{org_id}"
-
-            # Stagger jobs to avoid thundering herd
             stagger_seconds = i * 30 + random.randint(0, 30)
 
             scheduler.add_job(
                 _run_pipeline_for_org,
                 trigger=IntervalTrigger(hours=PIPELINE_INTERVAL_HOURS),
                 id=job_id,
-                args=[str(org_id)],
+                args=[str(org_id), "scheduled"],
                 replace_existing=True,
-                next_run_time=None,  # Don't run immediately on startup
+                next_run_time=None,
             )
             logger.info(
                 "Scheduled pipeline for org '%s' (%s) every %dh (stagger: %ds)",
@@ -106,17 +142,45 @@ def schedule_org(org_id: UUID, org_name: str = "") -> None:
         _run_pipeline_for_org,
         trigger=IntervalTrigger(hours=PIPELINE_INTERVAL_HOURS),
         id=job_id,
-        args=[str(org_id)],
+        args=[str(org_id), "scheduled"],
         replace_existing=True,
         next_run_time=None,
     )
     logger.info("Scheduled pipeline for org '%s' (%s)", org_name, org_id)
 
 
-async def trigger_pipeline_now(org_id: UUID) -> None:
-    """Trigger an immediate pipeline run for an org (non-blocking)."""
-    asyncio.create_task(_run_pipeline_for_org(str(org_id)))
-    logger.info("Triggered immediate pipeline run for org %s", org_id)
+async def trigger_pipeline_now(
+    org_id: UUID, *, trigger_source: str = "manual"
+) -> UUID | None:
+    """Trigger an immediate pipeline run for an org (non-blocking).
+
+    Returns the new run_id, or None if a run is already active for this org.
+    """
+    run_id = await _claim_run_slot(org_id, trigger_source)
+    if run_id is None:
+        return None
+
+    async def _execute() -> None:
+        from app.agents.orchestrators.pipeline import PipelineOrchestrator
+
+        try:
+            async with async_session_factory() as session:
+                orchestrator = PipelineOrchestrator(session)
+                await orchestrator.execute(
+                    org_id, trigger_source=trigger_source, run_id=run_id,
+                )
+        except Exception as e:
+            logger.exception(
+                "Background pipeline run %s for org %s failed: %s",
+                run_id, org_id, e,
+            )
+
+    asyncio.create_task(_execute())
+    logger.info(
+        "Triggered immediate pipeline run %s for org %s (trigger=%s)",
+        run_id, org_id, trigger_source,
+    )
+    return run_id
 
 
 async def start_pipeline_scheduler() -> AsyncIOScheduler:
