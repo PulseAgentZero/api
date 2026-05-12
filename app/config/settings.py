@@ -230,7 +230,7 @@ class Settings:
     JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
     ENCRYPTION_KEY: str = os.getenv(
         "ENCRYPTION_KEY",
-        "ZmVybmV0LWtleS1mb3ItcHVsc2UtZGV2LWRvLW5vdC11c2UtaW4tcHJvZA==",
+        "K_k8N_IyoXaDyql8ijHUmO9KA6FyuAqP7guglrC0Pns=",
     )
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3001")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
