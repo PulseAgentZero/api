@@ -21,6 +21,8 @@ async def get_current_user_optional(
     payload = decode_access_token(credentials.credentials)
     if payload is None:
         return None
+    if payload.get("type") == "refresh":
+        return None
     user = await UserRepository(db).get_by_id(uuid.UUID(payload["sub"]))
     return user
 
@@ -34,6 +36,8 @@ async def get_current_user(
     payload = decode_access_token(credentials.credentials)
     if payload is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    if payload.get("type") == "refresh":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token cannot be used for this endpoint")
     user = await UserRepository(db).get_by_id(uuid.UUID(payload["sub"]))
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")

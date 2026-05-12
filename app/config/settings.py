@@ -16,6 +16,17 @@ load_dotenv(project_root / ".env")
 
 logger = logging.getLogger(__name__)
 
+CLAUDE_MODEL_SONNET_4_6 = "claude-sonnet-4-6-20250827"  # general default
+CLAUDE_MODEL_OPUS_4_6 = "claude-opus-4-6-20250826"  # highest capability
+CLAUDE_MODEL_HAIKU_4_5 = "claude-haiku-4-5-20251001"  # fast/cheap tier
+
+GROQ_MODEL_HEAVY = "openai/gpt-oss-120b"  # analytical/schema-heavy work
+GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"  # routing/tools/structured JSON
+GROQ_MODEL_FAST = "llama-3.1-8b-instant"  # low-latency/simple tasks
+
+VOYAGE_EMBEDDING_MODEL = "voyage-4-large"
+VOYAGE_EMBEDDING_DIMENSION = 1024
+
 
 def _fetch_secret_from_arn(secret_arn: str) -> Optional[dict]:
     """Fetch secret value from AWS Secrets Manager."""
@@ -146,7 +157,9 @@ class Settings:
     QDRANT_URL: Optional[str] = os.getenv("QDRANT_URL", "http://localhost:6333")
     QDRANT_API_KEY: Optional[str] = os.getenv("QDRANT_API_KEY", "").strip() or None
     QDRANT_COLLECTION_PREFIX: str = os.getenv("QDRANT_COLLECTION_PREFIX", "pulse_org_")
-    QDRANT_VECTOR_SIZE: int = int(os.getenv("QDRANT_VECTOR_SIZE", "1024"))
+    QDRANT_VECTOR_SIZE: int = int(
+        os.getenv("QDRANT_VECTOR_SIZE", str(VOYAGE_EMBEDDING_DIMENSION))
+    )
 
     @classmethod
     def is_qdrant_configured(cls) -> bool:
@@ -160,8 +173,8 @@ class Settings:
     # Voyage AI (embeddings for vector search)
     # ------------------------------------------------------------------
     VOYAGEAI_API_KEY: Optional[str] = os.getenv("VOYAGEAI_API_KEY")
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "voyage-4-large")
-    EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
+    EMBEDDING_MODEL: str = VOYAGE_EMBEDDING_MODEL
+    EMBEDDING_DIMENSION: int = VOYAGE_EMBEDDING_DIMENSION
 
     @classmethod
     def get_voyageai_api_key(cls) -> Optional[str]:
@@ -176,9 +189,9 @@ class Settings:
     # ------------------------------------------------------------------
     GROQ_API_KEY: Optional[str] = os.getenv("GROQ_API_KEY")
 
-    GROQ_LLM_MODEL_HEAVY: str = os.getenv("GROQ_LLM_MODEL_HEAVY", "openai/gpt-oss-120b") # The Heavy Lifter: Deep analytical reasoning, complex business logic, and database schema mapping
-    GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL") or "llama-3.3-70b-versatile" # # The Reliable Router: Multi-step tool calling, structural routing, and precise JSON generation
-    GROQ_LLM_MODEL_FAST: str = os.getenv("GROQ_LLM_MODEL_FAST", "llama-3.1-8b-instant") # Fast/cheap model for simple tasks (intent classification, response generation)
+    GROQ_LLM_MODEL_HEAVY: str = GROQ_MODEL_HEAVY
+    GROQ_LLM_MODEL: str = GROQ_MODEL_DEFAULT
+    GROQ_LLM_MODEL_FAST: str = GROQ_MODEL_FAST
 
     @property
     def groq_api_key(self) -> Optional[str]:
@@ -187,6 +200,22 @@ class Settings:
     @classmethod
     def is_groq_configured(cls) -> bool:
         return bool(cls._get_secret("GROQ_API_KEY", "GROQ_API_KEY"))
+
+    # ------------------------------------------------------------------
+    # Anthropic API (LLM)
+    # ------------------------------------------------------------------
+    ANTHROPIC_API_KEY: Optional[str] = os.getenv("ANTHROPIC_API_KEY")
+    ANTHROPIC_LLM_MODEL: str = CLAUDE_MODEL_SONNET_4_6
+    ANTHROPIC_LLM_MODEL_HEAVY: str = CLAUDE_MODEL_OPUS_4_6
+    ANTHROPIC_LLM_MODEL_FAST: str = CLAUDE_MODEL_HAIKU_4_5
+
+    @classmethod
+    def get_anthropic_api_key(cls) -> Optional[str]:
+        return cls._get_secret("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")
+
+    @classmethod
+    def is_anthropic_configured(cls) -> bool:
+        return bool(cls.get_anthropic_api_key())
 
     # ------------------------------------------------------------------
     # Google OAuth

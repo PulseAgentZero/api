@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.models.user import User
@@ -17,6 +17,18 @@ class UserRepository:
         result = await self.db.execute(select(User).where(User.email == email))
         return result.scalar_one_or_none()
 
+    async def list_by_org(self, org_id: UUID) -> list[User]:
+        result = await self.db.execute(
+            select(User).where(User.org_id == org_id).order_by(User.created_at)
+        )
+        return list(result.scalars().all())
+
+    async def count_admins(self, org_id: UUID) -> int:
+        result = await self.db.execute(
+            select(func.count(User.id)).where(User.org_id == org_id, User.role == "admin")
+        )
+        return int(result.scalar() or 0)
+
     async def create(self, org_id: UUID, email: str, password_hash: str, role: str = "ops_manager") -> User:
         user = User(
             org_id=org_id,
@@ -27,3 +39,11 @@ class UserRepository:
         self.db.add(user)
         await self.db.flush()
         return user
+
+    async def delete(self, user_id: UUID) -> bool:
+        user = await self.get_by_id(user_id)
+        if user is None:
+            return False
+        await self.db.delete(user)
+        await self.db.flush()
+        return True

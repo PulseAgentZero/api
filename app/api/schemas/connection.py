@@ -1,20 +1,21 @@
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CreateConnectionRequest(BaseModel):
-    db_type: str
-    host: str
-    port: int
-    database_name: str
-    username: str
-    password: str
+    db_type: Literal["postgresql", "mysql"]
+    host: str = Field(..., min_length=1, max_length=255)
+    port: int = Field(..., ge=1, le=65535)
+    database_name: str = Field(..., min_length=1, max_length=255)
+    username: str = Field(..., min_length=1, max_length=255)
+    password: str = Field(..., min_length=1)
 
 
 class UpdateConnectionRequest(BaseModel):
-    db_type: str | None = None
+    db_type: Literal["postgresql", "mysql"] | None = None
     host: str | None = None
     port: int | None = None
     database_name: str | None = None

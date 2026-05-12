@@ -7,11 +7,18 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.auth import auth_router
+from app.api.middleware import LoggingMiddleware
 from app.api.routes import (
+    agent_router,
+    alerts_router,
     connections_router,
+    dashboard_router,
+    entities_router,
     onboarding_router,
     org_router,
+    recommendations_router,
     schema_mappings_router,
+    users_router,
 )
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
@@ -34,6 +41,8 @@ app = FastAPI(
     redoc_url=None if _is_prod else "/redoc",
     openapi_url=None if _is_prod else "/openapi.json",
 )
+
+app.add_middleware(LoggingMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,6 +73,12 @@ app.include_router(org_router, prefix="/api/v1")
 app.include_router(connections_router, prefix="/api/v1")
 app.include_router(schema_mappings_router, prefix="/api/v1")
 app.include_router(onboarding_router, prefix="/api/v1")
+app.include_router(dashboard_router, prefix="/api/v1")
+app.include_router(entities_router, prefix="/api/v1")
+app.include_router(recommendations_router, prefix="/api/v1")
+app.include_router(alerts_router, prefix="/api/v1")
+app.include_router(agent_router, prefix="/api/v1")
+app.include_router(users_router, prefix="/api/v1")
 
 
 @app.get("/health")

@@ -5,12 +5,20 @@ from app.api.schemas.connection import ColumnInfo, TableInfo
 
 
 def _to_async_url(dsn: str) -> str:
-    """Convert a sync DSN (postgresql://) to async (postgresql+asyncpg://)."""
+    """Convert a sync DSN to its async SQLAlchemy driver URL."""
     if dsn.startswith("postgresql://"):
         return dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
     if dsn.startswith("postgres://"):
         return dsn.replace("postgres://", "postgresql+asyncpg://", 1)
+    if dsn.startswith("mysql://"):
+        return dsn.replace("mysql://", "mysql+aiomysql://", 1)
     return dsn
+
+
+def _connect_args(url: str) -> dict:
+    if url.startswith("mysql+aiomysql://"):
+        return {"connect_timeout": 10}
+    return {"timeout": 10}
 
 
 async def test_connection(dsn: str) -> tuple[bool, str, str | None]:
@@ -18,7 +26,7 @@ async def test_connection(dsn: str) -> tuple[bool, str, str | None]:
     url = _to_async_url(dsn)
     engine: AsyncEngine | None = None
     try:
-        engine = create_async_engine(url, connect_args={"timeout": 10})
+        engine = create_async_engine(url, connect_args=_connect_args(url))
         async with engine.connect() as conn:
             result = await conn.execute(text("SELECT version()"))
             db_version = result.scalar_one()
@@ -35,25 +43,39 @@ async def introspect_schema(dsn: str) -> list[TableInfo]:
     url = _to_async_url(dsn)
     engine: AsyncEngine | None = None
     try:
-        engine = create_async_engine(url, connect_args={"timeout": 10})
+        engine = create_async_engine(url, connect_args=_connect_args(url))
         async with engine.connect() as conn:
-            tables_result = await conn.execute(
-                text(
+            if url.startswith("mysql+aiomysql://"):
+                tables_sql = (
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() ORDER BY table_name"
+                )
+                columns_sql = (
+                    "SELECT column_name, data_type, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = :tname "
+                    "ORDER BY ordinal_position"
+                )
+            else:
+                tables_sql = (
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_schema = 'public' ORDER BY table_name"
                 )
+                columns_sql = (
+                    "SELECT column_name, data_type, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = :tname "
+                    "ORDER BY ordinal_position"
+                )
+            tables_result = await conn.execute(
+                text(tables_sql)
             )
             table_names = [row[0] for row in tables_result.all()]
 
             tables: list[TableInfo] = []
             for table_name in table_names:
                 cols_result = await conn.execute(
-                    text(
-                        "SELECT column_name, data_type, is_nullable "
-                        "FROM information_schema.columns "
-                        "WHERE table_schema = 'public' AND table_name = :tname "
-                        "ORDER BY ordinal_position"
-                    ),
+                    text(columns_sql),
                     {"tname": table_name},
                 )
                 columns = [

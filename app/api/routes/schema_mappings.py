@@ -1,4 +1,5 @@
 import logging
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +21,53 @@ from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/schema-mappings", tags=["schema-mappings"])
+
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _parse_uuid(value: str, field_name: str):
+    from uuid import UUID
+
+    try:
+        return UUID(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid {field_name}") from exc
+
+
+def _validate_mapping_payload(payload: dict) -> None:
+    identifiers = [
+        ("entity_table", payload.get("entity_table")),
+        ("entity_id_col", payload.get("entity_id_col")),
+        ("entity_name_col", payload.get("entity_name_col")),
+        ("timestamp_col", payload.get("timestamp_col")),
+    ]
+    signal_columns = payload.get("signal_columns") or {}
+    identifiers.extend((f"signal_columns.{key}", value) for key, value in signal_columns.items())
+    for label, value in identifiers:
+        if value is not None and not _IDENTIFIER.fullmatch(str(value)):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid SQL identifier for {label}: {value!r}",
+            )
+
+    raw_schema = payload.get("raw_schema") or {}
+    tables = raw_schema.get("tables") if isinstance(raw_schema, dict) else None
+    if not tables:
+        return
+    table = payload.get("entity_table")
+    table_info = next((item for item in tables if item.get("name") == table), None)
+    if not table_info:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Mapped entity_table does not exist in raw_schema",
+        )
+    columns = {column.get("name") for column in table_info.get("columns", [])}
+    for label, value in identifiers[1:]:
+        if value is not None and value not in columns:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Mapped column for {label} does not exist in raw_schema",
+            )
 
 
 def _mapping_to_response(m) -> SchemaMappingResponse:
@@ -53,8 +101,7 @@ async def get_schema_mapping(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> SchemaMappingResponse:
-    from uuid import UUID
-    mapping = await SchemaMappingRepository(db).get_by_id(UUID(mapping_id))
+    mapping = await SchemaMappingRepository(db).get_by_id(_parse_uuid(mapping_id, "mapping_id"))
     if not mapping or mapping.org_id != current_user.org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema mapping not found")
     return _mapping_to_response(mapping)
@@ -70,6 +117,7 @@ async def create_schema_mapping(
     if not conn or conn.org_id != current_user.org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
 
+    _validate_mapping_payload(body.model_dump())
     mapping = await SchemaMappingRepository(db).create(
         org_id=current_user.org_id,
         connection_id=body.connection_id,
@@ -92,8 +140,7 @@ async def update_schema_mapping(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> SchemaMappingResponse:
-    from uuid import UUID
-    mapping = await SchemaMappingRepository(db).get_by_id(UUID(mapping_id))
+    mapping = await SchemaMappingRepository(db).get_by_id(_parse_uuid(mapping_id, "mapping_id"))
     if not mapping or mapping.org_id != current_user.org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema mapping not found")
 
@@ -103,6 +150,17 @@ async def update_schema_mapping(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="At least one field must be provided",
         )
+    merged = {
+        "entity_table": mapping.entity_table,
+        "entity_id_col": mapping.entity_id_col,
+        "entity_name_col": mapping.entity_name_col,
+        "signal_columns": mapping.signal_columns,
+        "timestamp_col": mapping.timestamp_col,
+        "risk_config": mapping.risk_config,
+        "raw_schema": mapping.raw_schema,
+    }
+    merged.update(payload)
+    _validate_mapping_payload(merged)
     for key, value in payload.items():
         setattr(mapping, key, value)
     await db.flush()
@@ -116,9 +174,9 @@ async def delete_schema_mapping(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    from uuid import UUID
-    mapping = await SchemaMappingRepository(db).get_by_id(UUID(mapping_id))
+    mapping_uuid = _parse_uuid(mapping_id, "mapping_id")
+    mapping = await SchemaMappingRepository(db).get_by_id(mapping_uuid)
     if not mapping or mapping.org_id != current_user.org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema mapping not found")
-    await SchemaMappingRepository(db).delete(UUID(mapping_id))
+    await SchemaMappingRepository(db).delete(mapping_uuid)
     await db.commit()
