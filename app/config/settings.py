@@ -199,6 +199,10 @@ class Settings:
     JWT_SECRET: str = os.getenv("JWT_SECRET", "pulse-dev-secret-change-me")
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
+    ENCRYPTION_KEY: str = os.getenv(
+        "ENCRYPTION_KEY",
+        "ZmVybmV0LWtleS1mb3ItcHVsc2UtZGV2LWRvLW5vdC11c2UtaW4tcHJvZA==",
+    )
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3001")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
     PASSWORD_HASH_ITERATIONS: int = int(
