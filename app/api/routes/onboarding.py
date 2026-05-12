@@ -154,8 +154,16 @@ async def complete_onboarding(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     org.onboarding_done = True
     await db.commit()
+
+    # Schedule recurring pipeline runs and trigger the first autonomous run
+    from app.services.schedulers.pipeline_scheduler import schedule_org, trigger_pipeline_now
+
+    schedule_org(current_user.org_id, org.name)
+    await trigger_pipeline_now(current_user.org_id)
+
     return CompleteOnboardingResponse(
         message="Onboarding complete",
         onboarding_done=True,
         generated_recommendations=generated,
     )
+

@@ -16,19 +16,26 @@ from app.api.routes import (
     entities_router,
     onboarding_router,
     org_router,
+    pipeline_router,
     recommendations_router,
     schema_mappings_router,
     users_router,
 )
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
+from app.services.schedulers.pipeline_scheduler import (
+    shutdown_scheduler,
+    start_pipeline_scheduler,
+)
 
 logger = __import__("logging").getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+    scheduler = await start_pipeline_scheduler()
     yield
+    shutdown_scheduler()
 
 
 _is_prod = settings.is_production()
@@ -79,6 +86,7 @@ app.include_router(recommendations_router, prefix="/api/v1")
 app.include_router(alerts_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
 app.include_router(users_router, prefix="/api/v1")
+app.include_router(pipeline_router, prefix="/api/v1")
 
 
 @app.get("/health")
