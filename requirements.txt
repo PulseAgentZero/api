@@ -22,5 +22,3 @@ croniter==3.0.3
 qdrant-client==1.15.1
 aiohttp==3.13.2
 anthropic==0.101.0
-
-uvicorn app.api.app:app --reload --port 8000
