@@ -20,8 +20,14 @@ from app.agents.prompts.schema_intelligence import SCHEMA_INTELLIGENCE_PROMPT
 from app.agents.state import PipelineState
 from app.agents.tools.query_tools import build_query_tools
 from app.config.settings import settings
+from app.infrastructure.database.repositories.agent_memory_repository import (
+    AgentMemoryRepository,
+    compute_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
+
+_MEMORY_KEY = "SchemaIntelligenceAgent"
 
 
 class SchemaIntelligenceAgent(BaseAgent):
@@ -43,6 +49,23 @@ class SchemaIntelligenceAgent(BaseAgent):
         """Execute schema intelligence analysis."""
 
         org_id = UUID(state["org_id"])
+
+        # Try the cache first — re-running this agent is wasteful when nothing
+        # in the org's raw_schema has changed.
+        fingerprint = _build_fingerprint(state)
+        memo_repo = AgentMemoryRepository(db)
+        cached = await memo_repo.get(org_id, _MEMORY_KEY)
+        if cached is not None and cached.fingerprint == fingerprint and cached.data:
+            logger.info(
+                "[SchemaIntelligenceAgent] Cache hit — reusing analysis "
+                "from %s", cached.updated_at,
+            )
+            data = cached.data
+            state["schema_analysis"] = data
+            state["validated_columns"] = data.get("validated_columns", []) or []
+            state["related_tables"] = data.get("related_tables", []) or []
+            state["schema_issues"] = data.get("schema_issues", []) or []
+            return state
 
         # Fresh tool registry for this run
         self.registry = type(self.registry)()
@@ -93,6 +116,17 @@ class SchemaIntelligenceAgent(BaseAgent):
         state["schema_issues"] = result.get("schema_issues", [])
         state["reasoning_log"].extend(self._reasoning_entries)
 
+        # Persist the analysis so subsequent runs can short-circuit when
+        # raw_schema is unchanged.
+        try:
+            await memo_repo.upsert(
+                org_id, _MEMORY_KEY, fingerprint=fingerprint, data=result,
+            )
+        except Exception as cache_err:
+            logger.warning(
+                "[SchemaIntelligenceAgent] Failed to cache analysis: %s", cache_err
+            )
+
         logger.info(
             "[SchemaIntelligenceAgent] Complete: %d validated cols, %d related tables, %d issues",
             len(state["validated_columns"]),
@@ -100,3 +134,15 @@ class SchemaIntelligenceAgent(BaseAgent):
             len(state["schema_issues"]),
         )
         return state
+
+
+def _build_fingerprint(state: PipelineState) -> str:
+    """Fingerprint over the inputs that change schema interpretation."""
+    return compute_fingerprint({
+        "raw_schema": state.get("raw_schema") or {},
+        "entity_table": state.get("entity_table"),
+        "entity_id_col": state.get("entity_id_col"),
+        "entity_name_col": state.get("entity_name_col"),
+        "signal_columns": state.get("signal_columns") or {},
+        "timestamp_col": state.get("timestamp_col"),
+    })

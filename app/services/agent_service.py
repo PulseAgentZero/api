@@ -269,13 +269,68 @@ async def _system_prompt(db: AsyncSession, current_user: User) -> str:
     entity_label = org.entity_label if org and org.entity_label else "entities"
     goal_label = org.goal_label if org and org.goal_label else "improve operations"
     context = org.business_context if org and org.business_context else "No business context configured."
+
+    pipeline_block = await _pipeline_context_block(db, current_user.org_id)
+
     return (
         f"You are Pulse, an operational intelligence agent for {org_name}. "
         f"The organization models {entity_label} and the goal is to {goal_label}. "
         f"Business context: {context}\n"
+        f"{pipeline_block}"
         "Answer data-dependent questions only after using the provided tools. "
         "Be concise, operational, and avoid guessing."
     )
+
+
+async def _pipeline_context_block(db: AsyncSession, org_id: UUID) -> str:
+    """Compose a short autonomous-pipeline status section for the system prompt."""
+    from app.infrastructure.database.repositories.pipeline_run_repository import (
+        PipelineRunRepository,
+    )
+
+    repo = PipelineRunRepository(db)
+    try:
+        recent = await repo.list_by_org(org_id, limit=5)
+    except Exception:
+        return ""
+
+    if not recent:
+        return (
+            "Autonomous pipeline status: no pipeline run has completed yet for "
+            "this organization. If asked about the latest analysis, say so and "
+            "fall back to live tool calls.\n"
+        )
+
+    active = next((r for r in recent if r.status in ("queued", "running")), None)
+    last_done = next((r for r in recent if r.status in ("succeeded", "failed")), None)
+
+    lines = ["Autonomous pipeline status:"]
+    if active is not None:
+        lines.append(
+            f"- A pipeline run is currently {active.status} "
+            f"(step '{active.current_step or 'unknown'}', id={active.id})."
+        )
+    if last_done is not None:
+        ts = last_done.completed_at.isoformat() if last_done.completed_at else "unknown time"
+        if last_done.status == "succeeded":
+            lines.append(
+                f"- Last successful run completed at {ts}: "
+                f"{last_done.entities_scored} entities scored "
+                f"({last_done.critical_count} critical, {last_done.high_count} high), "
+                f"{last_done.recommendations_generated} recommendations generated."
+            )
+        else:
+            lines.append(
+                f"- Last run failed at {ts}: {last_done.error or 'unknown error'}."
+            )
+    if active is None and last_done is None:
+        lines.append("- No completed runs available.")
+
+    lines.append(
+        "Treat these numbers as the latest persisted snapshot; if the user asks "
+        "for live numbers, use the tools to re-query the client database."
+    )
+    return "\n".join(lines) + "\n"
 
 
 async def _fallback_reply(

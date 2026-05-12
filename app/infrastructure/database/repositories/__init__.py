@@ -1,6 +1,9 @@
 from app.infrastructure.database.repositories.agent_conversation_repository import (
     AgentConversationRepository,
 )
+from app.infrastructure.database.repositories.agent_memory_repository import (
+    AgentMemoryRepository,
+)
 from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
 from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.database.repositories.pipeline_run_repository import (
@@ -14,6 +17,7 @@ from app.infrastructure.database.repositories.user_repository import UserReposit
 
 __all__ = [
     "AgentConversationRepository",
+    "AgentMemoryRepository",
     "ConnectionRepository",
     "OrganizationRepository",
     "PipelineRunRepository",

@@ -12,16 +12,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.tools.base import Tool, ToolParam
-from app.infrastructure.database.client_queries import (
-    _get_client_engine,
-    _quote_identifier,
-    _schema_columns_sql,
-    _validate_identifier,
-    get_schema_mapping,
-    fetch_entities,
-    fetch_entity_by_id,
-    compute_risk,
+from app.agents.tools.client_db import (
+    open_client_engine,
+    quote_identifier,
+    schema_columns_sql,
+    validate_identifier,
 )
+from app.infrastructure.database.client_queries import get_schema_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -36,25 +33,25 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     ) -> dict[str, Any]:
         """Query the mapped entity table in the client database."""
         mapping = await get_schema_mapping(db, org_id)
-        engine, conn = await _get_client_engine(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
             async with engine.connect() as client_conn:
-                table = _validate_identifier(mapping.entity_table, "entity table")
-                quoted_table = _quote_identifier(table, conn.db_type)
+                table = validate_identifier(mapping.entity_table, "entity table")
+                quoted_table = quote_identifier(table, conn.db_type)
 
                 if columns == "*":
                     cols_result = await client_conn.execute(
-                        text(_schema_columns_sql(conn.db_type)),
+                        text(schema_columns_sql(conn.db_type)),
                         {"tname": mapping.entity_table},
                     )
                     col_names = [r[0] for r in cols_result.all()]
                 else:
                     col_names = [
-                        _validate_identifier(c.strip(), "column")
+                        validate_identifier(c.strip(), "column")
                         for c in columns.split(",")
                     ]
 
-                quoted_cols = [_quote_identifier(c, conn.db_type) for c in col_names]
+                quoted_cols = [quote_identifier(c, conn.db_type) for c in col_names]
                 sql = f"SELECT {', '.join(quoted_cols)} FROM {quoted_table}"
 
                 params: dict[str, Any] = {}
@@ -80,15 +77,15 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         where: str | None = None,
     ) -> dict[str, Any]:
         """Query any table in the client database (for cross-table analysis)."""
-        engine, conn = await _get_client_engine(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
             async with engine.connect() as client_conn:
-                table = _validate_identifier(table_name, "table")
-                quoted_table = _quote_identifier(table, conn.db_type)
+                table = validate_identifier(table_name, "table")
+                quoted_table = quote_identifier(table, conn.db_type)
 
                 if columns == "*":
                     cols_result = await client_conn.execute(
-                        text(_schema_columns_sql(conn.db_type)),
+                        text(schema_columns_sql(conn.db_type)),
                         {"tname": table_name},
                     )
                     col_names = [r[0] for r in cols_result.all()]
@@ -96,11 +93,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                         return {"error": f"Table '{table_name}' not found"}
                 else:
                     col_names = [
-                        _validate_identifier(c.strip(), "column")
+                        validate_identifier(c.strip(), "column")
                         for c in columns.split(",")
                     ]
 
-                quoted_cols = [_quote_identifier(c, conn.db_type) for c in col_names]
+                quoted_cols = [quote_identifier(c, conn.db_type) for c in col_names]
                 sql = f"SELECT {', '.join(quoted_cols)} FROM {quoted_table}"
 
                 params: dict[str, Any] = {}
@@ -127,11 +124,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         where: str | None = None,
     ) -> dict[str, Any]:
         """Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on the client database."""
-        engine, conn = await _get_client_engine(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
             async with engine.connect() as client_conn:
-                table = _validate_identifier(table_name, "table")
-                quoted_table = _quote_identifier(table, conn.db_type)
+                table = validate_identifier(table_name, "table")
+                quoted_table = quote_identifier(table, conn.db_type)
 
                 agg = aggregate.upper()
                 if agg not in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
@@ -140,15 +137,15 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 if column == "*":
                     agg_expr = f"{agg}(*)"
                 else:
-                    col = _validate_identifier(column, "column")
-                    agg_expr = f"{agg}({_quote_identifier(col, conn.db_type)})"
+                    col = validate_identifier(column, "column")
+                    agg_expr = f"{agg}({quote_identifier(col, conn.db_type)})"
 
                 sql = f"SELECT {agg_expr} AS result"
 
                 select_cols = ["result"]
                 if group_by:
-                    gb_col = _validate_identifier(group_by, "group_by column")
-                    quoted_gb = _quote_identifier(gb_col, conn.db_type)
+                    gb_col = validate_identifier(group_by, "group_by column")
+                    quoted_gb = quote_identifier(gb_col, conn.db_type)
                     sql = f"SELECT {quoted_gb}, {agg_expr} AS result"
                     select_cols = [gb_col, "result"]
 
@@ -173,7 +170,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
     async def list_tables() -> dict[str, Any]:
         """List all tables in the client database with their columns."""
-        engine, conn = await _get_client_engine(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
             async with engine.connect() as client_conn:
                 if conn.db_type == "mysql":
@@ -192,7 +189,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 tables = []
                 for tname in table_names:
                     cols_result = await client_conn.execute(
-                        text(_schema_columns_sql(conn.db_type)),
+                        text(schema_columns_sql(conn.db_type)),
                         {"tname": tname},
                     )
                     columns = [row[0] for row in cols_result.all()]
@@ -203,11 +200,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
     async def get_row_count(table_name: str) -> dict[str, Any]:
         """Get row count of a table in the client database."""
-        engine, conn = await _get_client_engine(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
             async with engine.connect() as client_conn:
-                table = _validate_identifier(table_name, "table")
-                quoted = _quote_identifier(table, conn.db_type)
+                table = validate_identifier(table_name, "table")
+                quoted = quote_identifier(table, conn.db_type)
                 result = await client_conn.execute(text(f"SELECT COUNT(*) FROM {quoted}"))
                 count = result.scalar_one()
                 return {"table": table, "row_count": count}
@@ -218,11 +215,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         table_name: str, column_name: str
     ) -> dict[str, Any]:
         """Check if a column exists in a table."""
-        engine, conn = await _get_client_engine(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
             async with engine.connect() as client_conn:
                 cols_result = await client_conn.execute(
-                    text(_schema_columns_sql(conn.db_type)),
+                    text(schema_columns_sql(conn.db_type)),
                     {"tname": table_name},
                 )
                 all_cols = [row[0] for row in cols_result.all()]

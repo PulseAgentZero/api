@@ -5,6 +5,7 @@ from app.infrastructure.database.models.schema_mapping import SchemaMapping
 from app.infrastructure.database.models.recommendation import Recommendation
 from app.infrastructure.database.models.agent_conversation import AgentConversation
 from app.infrastructure.database.models.pipeline_run import PipelineRun
+from app.infrastructure.database.models.agent_memory import AgentMemory
 
 __all__ = [
     "Organization",
@@ -14,4 +15,5 @@ __all__ = [
     "Recommendation",
     "AgentConversation",
     "PipelineRun",
+    "AgentMemory",
 ]

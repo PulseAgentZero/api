@@ -23,10 +23,13 @@ from app.api.routes import (
 )
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
+from app.infrastructure.logging import configure_logging
 from app.services.schedulers.pipeline_scheduler import (
     shutdown_scheduler,
     start_pipeline_scheduler,
 )
+
+configure_logging()
 
 logger = __import__("logging").getLogger(__name__)
 

@@ -567,16 +567,47 @@ def _first_text_anthropic(content_blocks) -> str:
 
 
 def _extract_json(raw: str) -> str:
-    stripped = raw.strip()
-    if stripped.startswith("{") or stripped.startswith("["):
+    stripped = _strip_fences(raw.strip())
+    if not stripped:
         return stripped
-    stripped = _strip_fences(stripped)
-    if stripped.startswith("{") or stripped.startswith("["):
+    if stripped[0] in "{[":
         return stripped
-    brace = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if brace:
-        return brace.group(0)
-    bracket = re.search(r"\[.*\]", stripped, re.DOTALL)
-    if bracket:
-        return bracket.group(0)
-    return stripped
+    span = _find_balanced_json(stripped)
+    return span if span is not None else stripped
+
+
+def _find_balanced_json(text: str) -> str | None:
+    """Return the first balanced JSON object or array in `text`.
+
+    Bracket-counting scan that ignores braces/brackets inside string
+    literals and escape sequences. Safer than a greedy regex when the
+    LLM emits prose with multiple JSON fragments.
+    """
+    start_pairs = {"{": "}", "[": "]"}
+    for i, ch in enumerate(text):
+        if ch in start_pairs:
+            close = start_pairs[ch]
+            depth = 0
+            in_string = False
+            escape = False
+            for j in range(i, len(text)):
+                c = text[j]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif c == "\\":
+                        escape = True
+                    elif c == '"':
+                        in_string = False
+                    continue
+                if c == '"':
+                    in_string = True
+                    continue
+                if c == ch:
+                    depth += 1
+                elif c == close:
+                    depth -= 1
+                    if depth == 0:
+                        return text[i : j + 1]
+            # Unbalanced — keep scanning for a later candidate.
+    return None
