@@ -71,20 +71,38 @@ def _make_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_handler(
-        _request: Request, exc: RequestValidationError
+        request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         fields: dict[str, str] = {}
         for err in exc.errors():
             loc_parts = [str(x) for x in err.get("loc", ()) if x not in ("body", "query", "path")]
             key = ".".join(loc_parts) if loc_parts else "request"
             fields[key] = err.get("msg", "Invalid value")
+        logger.warning(
+            "422 validation error %s %s fields=%s",
+            request.method,
+            request.url.path,
+            fields,
+        )
         return JSONResponse(
             status_code=422,
             content=error_payload("VALIDATION_ERROR", "Request validation failed", fields=fields),
         )
 
     @app.exception_handler(HTTPException)
-    async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        # Log 5xx as errors, 4xx as warnings (expected client errors), skip 401/404 noise
+        if exc.status_code >= 500:
+            logger.error(
+                "%s %s -> %s %s",
+                request.method, request.url.path, exc.status_code, exc.detail,
+            )
+        elif exc.status_code not in (401, 404):
+            logger.warning(
+                "%s %s -> %s %s",
+                request.method, request.url.path, exc.status_code, exc.detail,
+            )
+
         detail = exc.detail
         if isinstance(detail, dict) and "code" in detail and "message" in detail:
             err = {str(k): detail[k] for k in detail}
@@ -96,7 +114,7 @@ def _make_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         logger.exception(
-            "Unhandled exception on %s %s: %s: %s",
+            "500 unhandled %s %s — %s: %s",
             request.method,
             request.url.path,
             type(exc).__name__,

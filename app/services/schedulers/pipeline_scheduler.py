@@ -201,3 +201,23 @@ def shutdown_scheduler() -> None:
         _scheduler.shutdown(wait=False)
         logger.info("Pipeline scheduler shut down")
         _scheduler = None
+
+
+if __name__ == "__main__":
+    import signal
+
+    async def _main() -> None:
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+
+        await start_pipeline_scheduler()
+        logger.info("Scheduler running — waiting for stop signal")
+        await stop.wait()
+        shutdown_scheduler()
+        logger.info("Scheduler stopped")
+
+    asyncio.run(_main())
+

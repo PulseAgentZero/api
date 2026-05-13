@@ -56,4 +56,4 @@ def require_api_key(required_scope: str = "read"):
             scope=api_key.scope,
         )
 
-    return Depends(_check)
+    return _check

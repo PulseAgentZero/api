@@ -165,6 +165,13 @@ services:
         condition: service_healthy
       api:
         condition: service_started
+    # Scheduler is a background job process — no HTTP port, no HTTP health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import app.services.schedulers.pipeline_scheduler; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     deploy:
       replicas: 1               # always exactly one scheduler
 

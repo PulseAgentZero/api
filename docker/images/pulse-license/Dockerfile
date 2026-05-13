@@ -28,7 +28,8 @@ LABEL org.opencontainers.image.title="Pulse License Server"
 LABEL org.opencontainers.image.vendor="AgentZero"
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 

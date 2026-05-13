@@ -39,6 +39,7 @@ LABEL org.opencontainers.image.vendor="AgentZero"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
     DEPLOYMENT_MODE=cloud \
     PULSE_SERVICE=api
 
