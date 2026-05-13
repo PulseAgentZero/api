@@ -1,29 +1,49 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.auth import auth_router
+from app.api.errors import error_payload
 from app.api.middleware import LoggingMiddleware
 from app.api.routes import (
     agent_router,
     alerts_router,
+    analytics_router,
+    api_keys_router,
+    audit_logs_router,
     connections_router,
     dashboard_router,
     entities_router,
+    license_router,
+    notifications_router,
     onboarding_router,
     org_router,
     pipeline_router,
     recommendations_router,
     schema_mappings_router,
+    settings_router,
     users_router,
+    webhooks_router,
+)
+from app.api.public import (
+    public_analytics_router,
+    public_entities_router,
+    public_pipeline_router,
+    public_recommendations_router,
 )
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
+from app.infrastructure.redis.client import close_redis
+from app.services.schedulers.license_scheduler import (
+    shutdown_license_scheduler,
+    start_license_scheduler,
+)
 from app.services.schedulers.pipeline_scheduler import (
     shutdown_scheduler,
     start_pipeline_scheduler,
@@ -37,23 +57,102 @@ logger = __import__("logging").getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     scheduler = await start_pipeline_scheduler()
-    yield
-    shutdown_scheduler()
+    await start_license_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
+        shutdown_license_scheduler()
+        await close_redis()
 
+
+def _make_exception_handlers(app: FastAPI) -> None:
+    """Attach the standard error envelope handlers to any FastAPI instance."""
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_handler(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        fields: dict[str, str] = {}
+        for err in exc.errors():
+            loc_parts = [str(x) for x in err.get("loc", ()) if x not in ("body", "query", "path")]
+            key = ".".join(loc_parts) if loc_parts else "request"
+            fields[key] = err.get("msg", "Invalid value")
+        return JSONResponse(
+            status_code=422,
+            content=error_payload("VALIDATION_ERROR", "Request validation failed", fields=fields),
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+        detail = exc.detail
+        if isinstance(detail, dict) and "code" in detail and "message" in detail:
+            err = {str(k): detail[k] for k in detail}
+            return JSONResponse(status_code=exc.status_code, content={"error": err})
+        msg = detail if isinstance(detail, str) else str(detail)
+        code = "TOKEN_EXPIRED" if exc.status_code == 401 else "BAD_REQUEST"
+        return JSONResponse(status_code=exc.status_code, content=error_payload(code, msg))
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception(
+            "Unhandled exception on %s %s: %s: %s",
+            request.method,
+            request.url.path,
+            type(exc).__name__,
+            exc,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=error_payload("INTERNAL_ERROR", "Internal server error"),
+        )
+
+
+# ── Internal API ──────────────────────────────────────────────────────────────
+# Used by the Pulse dashboard (frontend).
+# Auth: JWT Bearer token only.
 
 _is_prod = settings.is_production()
+
+_internal_tags = [
+    {"name": "Auth",            "description": "Signup, login, token refresh, OAuth, email verification, password reset"},
+    {"name": "Organization",    "description": "Org profile management"},
+    {"name": "Users",           "description": "User management, invitations, roles"},
+    {"name": "Connections",     "description": "Data source connectors — databases, spreadsheets, cloud warehouses, file uploads"},
+    {"name": "Schema Mappings", "description": "Map entity tables, signal columns, and risk config"},
+    {"name": "Onboarding",      "description": "Step-by-step setup wizard"},
+    {"name": "Pipeline",        "description": "Trigger and monitor AI intelligence pipeline runs"},
+    {"name": "Dashboard",       "description": "High-level org overview and KPIs"},
+    {"name": "Entities",        "description": "Browse and inspect profiled entities"},
+    {"name": "Recommendations", "description": "AI-generated recommendations and actions"},
+    {"name": "Analytics",       "description": "Trends, cohorts, segments, and exports"},
+    {"name": "Alerts",          "description": "Alert rules and notification channels"},
+    {"name": "Notifications",   "description": "In-app notification inbox"},
+    {"name": "Webhooks",        "description": "Outbound webhook delivery log"},
+    {"name": "API Keys",        "description": "Programmatic API access"},
+    {"name": "License",         "description": "Self-hosted license activation (self-hosted only)"},
+    {"name": "Settings",        "description": "LLM key management (self-hosted only)"},
+    {"name": "Audit Logs",      "description": "Immutable audit trail (Pro only)"},
+]
+
 app = FastAPI(
-    title="Pulse API",
-    description="Real-Time Intelligence for Any Business",
-    version="2.0.0",
+    title="Pulse — Internal API",
+    description=(
+        "Internal API used by the Pulse dashboard.\n\n"
+        "**Auth:** `Authorization: Bearer <jwt_token>`\n\n"
+        "**Errors:** `{ \"error\": { \"code\": \"string\", \"message\": \"string\" } }`"
+    ),
+    version="1.0.0",
+    contact={"name": "Pulse Support", "email": "support@pulseai.io"},
+    license_info={"name": "Proprietary"},
+    openapi_tags=_internal_tags,
     lifespan=lifespan,
     docs_url=None if _is_prod else "/docs",
-    redoc_url=None if _is_prod else "/redoc",
-    openapi_url=None if _is_prod else "/openapi.json",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 app.add_middleware(LoggingMiddleware)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL],
@@ -62,37 +161,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_make_exception_handlers(app)
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception(
-        "Unhandled exception on %s %s: %s: %s",
-        request.method,
-        request.url.path,
-        type(exc).__name__,
-        exc,
-    )
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"},
-    )
-
-
-app.include_router(auth_router, prefix="/api/v1")
-app.include_router(org_router, prefix="/api/v1")
-app.include_router(connections_router, prefix="/api/v1")
+app.include_router(auth_router,            prefix="/api/v1")
+app.include_router(org_router,             prefix="/api/v1")
+app.include_router(connections_router,     prefix="/api/v1")
 app.include_router(schema_mappings_router, prefix="/api/v1")
-app.include_router(onboarding_router, prefix="/api/v1")
-app.include_router(dashboard_router, prefix="/api/v1")
-app.include_router(entities_router, prefix="/api/v1")
+app.include_router(onboarding_router,      prefix="/api/v1")
+app.include_router(dashboard_router,       prefix="/api/v1")
+app.include_router(entities_router,        prefix="/api/v1")
 app.include_router(recommendations_router, prefix="/api/v1")
-app.include_router(alerts_router, prefix="/api/v1")
-app.include_router(agent_router, prefix="/api/v1")
-app.include_router(users_router, prefix="/api/v1")
-app.include_router(pipeline_router, prefix="/api/v1")
+app.include_router(alerts_router,          prefix="/api/v1")
+app.include_router(analytics_router,       prefix="/api/v1")
+app.include_router(notifications_router,   prefix="/api/v1")
+app.include_router(webhooks_router,        prefix="/api/v1")
+app.include_router(api_keys_router,        prefix="/api/v1")
+app.include_router(license_router,         prefix="/api/v1")
+app.include_router(settings_router,        prefix="/api/v1")
+app.include_router(audit_logs_router,      prefix="/api/v1")
+app.include_router(agent_router,           prefix="/api/v1")
+app.include_router(users_router,           prefix="/api/v1")
+app.include_router(pipeline_router,        prefix="/api/v1")
 
 
-@app.get("/health")
+# ── Public API ────────────────────────────────────────────────────────────────
+# Used by external developers and integrations.
+# Auth: X-API-Key header only. JWT tokens are rejected.
+# Mounted as a sub-application so it has its own /docs, /redoc, /openapi.json.
+
+_public_tags = [
+    {"name": "Entities",        "description": "Read profiled entities and risk scores"},
+    {"name": "Recommendations", "description": "Read and action recommendations"},
+    {"name": "Pipeline",        "description": "Trigger pipeline runs and check status"},
+    {"name": "Analytics",       "description": "Aggregate risk and performance data"},
+]
+
+public_app = FastAPI(
+    title="Pulse — Public API",
+    description=(
+        "Public API for external developers and integrations.\n\n"
+        "**Auth:** `X-API-Key: <your_api_key>` (generate keys in Settings → API Keys)\n\n"
+        "**Scopes:** `read` — GET endpoints only. `write` — GET + POST/PATCH.\n\n"
+        "**Rate limits:** 30 req/min (read key), 10 req/min (write key)\n\n"
+        "**Errors:** `{ \"error\": { \"code\": \"string\", \"message\": \"string\" } }`\n\n"
+        "**Response envelope:** All responses wrap data in `{ \"data\": { ... }, \"meta\": { \"org_id\": \"...\" } }`"
+    ),
+    version="1.0.0",
+    contact={"name": "Pulse Support", "email": "support@pulseai.io"},
+    openapi_tags=_public_tags,
+    docs_url=None if _is_prod else "/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
+
+_make_exception_handlers(public_app)
+
+public_app.include_router(public_entities_router,        prefix="/v1")
+public_app.include_router(public_recommendations_router, prefix="/v1")
+public_app.include_router(public_pipeline_router,        prefix="/v1")
+public_app.include_router(public_analytics_router,       prefix="/v1")
+
+# Mount public_app under /api/public
+# Routes become: /api/public/v1/entities, /api/public/docs, etc.
+app.mount("/api/public", public_app)
+
+
+# ── Health check ──────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["System"])
 async def health_check() -> dict:
     db_status = "healthy"
     try:

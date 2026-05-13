@@ -1,0 +1,205 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Pulse — Internal Cloud Compose
+#
+# For Pulse's own infrastructure. Each concern runs as a separate service so
+# they can be scaled and deployed independently.
+#
+# Services
+#   postgres   primary database  (swap for RDS/Supabase in production)
+#   redis      job queue + token store + cache
+#   api        REST API — stateless, scale horizontally
+#   worker     pipeline execution — pulls jobs from Redis queue
+#   agent      conversational AI + SSE — isolated, LLM-heavy
+#   scheduler  cron trigger — always exactly ONE replica
+#   license    license validation for self-hosted customers (internal only)
+#
+# Usage
+#   docker compose up                          start everything
+#   docker compose up --scale worker=4        run 4 pipeline workers
+#   docker compose up api worker              start only api + worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-app: &app
+  # image: pulseai/pulse-cloud:${IMAGE_TAG:-latest}
+  # In development, build from source instead:
+  build:
+    context: ../../..
+    dockerfile: docker/images/pulse-cloud/Dockerfile
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
+    REDIS_URL: redis://redis:6379/0
+    DEPLOYMENT_MODE: cloud
+  networks:
+    - pulse
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-pulse}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - pulse
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pulse} -d ${POSTGRES_DB:-pulse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --maxmemory ${REDIS_MAX_MEMORY:-512mb}
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    volumes:
+      - redis_data:/data
+    networks:
+      - pulse
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Application ─────────────────────────────────────────────────────────────
+
+  api:
+    <<: *app
+    command: api
+    environment:
+      PULSE_SERVICE: api
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_MODE: cloud
+      API_WORKERS: ${API_WORKERS:-2}
+      # Internal URL so api can proxy /agent/* requests to the agent service
+      AGENT_SERVICE_URL: http://agent:8001
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    <<: *app
+    command: worker
+    environment:
+      PULSE_SERVICE: worker
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_MODE: cloud
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started    # wait for migrations
+    # docker compose up --scale worker=4
+    healthcheck:
+      test: ["CMD", "python", "-c", "import app.worker; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  agent:
+    <<: *app
+    command: agent
+    environment:
+      PULSE_SERVICE: agent
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_MODE: cloud
+      AGENT_PORT: "8001"
+      AGENT_WORKERS: ${AGENT_WORKERS:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # Not port-exposed — api proxies to http://agent:8001 over the internal network
+
+  scheduler:
+    <<: *app
+    command: scheduler
+    environment:
+      PULSE_SERVICE: scheduler
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
+      REDIS_URL: redis://redis:6379/0
+      DEPLOYMENT_MODE: cloud
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    deploy:
+      replicas: 1               # always exactly one scheduler
+
+  license:
+    # Internal license validation server — not exposed publicly.
+    build:
+      context: ../../..
+      dockerfile: docker/images/pulse-license/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
+      REDIS_URL: redis://redis:6379/0
+      PORT: "8002"
+    ports:
+      - "${LICENSE_PORT:-8002}:8002"
+    networks:
+      - pulse
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# ── Volumes & network ─────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  pulse:
+    driver: bridge

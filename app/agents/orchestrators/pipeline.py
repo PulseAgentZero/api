@@ -230,6 +230,24 @@ class PipelineOrchestrator:
             "completed" if not state.get("error") else state.get("current_step", "failed")
         )
 
+        if not state.get("error"):
+            try:
+                mapping = await get_schema_mapping(self._session, org_id)
+                from app.services.entity_profile_persist import (
+                    persist_entity_profiles_from_pipeline,
+                )
+
+                await persist_entity_profiles_from_pipeline(
+                    self._session,
+                    org_id=org_id,
+                    run_id=run.id,
+                    mapping_id=mapping.id,
+                    state=state,
+                )
+                run.mapping_id = mapping.id
+            except Exception as e:
+                logger.warning("[Pipeline] entity profile persist skipped: %s", e)
+
         # Commit any pending DB changes (recommendations, etc.) from agent runs.
         commit_error: str | None = None
         try:

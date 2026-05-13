@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.models.recommendation import Recommendation
@@ -18,15 +18,37 @@ class RecommendationRepository:
         org_id: UUID,
         urgency: str | None = None,
         status: str | None = None,
+        entity_id: str | None = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
     ) -> list[Recommendation]:
         stmt = select(Recommendation).where(Recommendation.org_id == org_id)
         if urgency:
             stmt = stmt.where(Recommendation.urgency == urgency)
         if status:
             stmt = stmt.where(Recommendation.status == status)
-        stmt = stmt.order_by(Recommendation.created_at.desc())
+        if entity_id:
+            stmt = stmt.where(Recommendation.entity_id == entity_id)
+        stmt = stmt.order_by(Recommendation.created_at.desc()).offset(offset).limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def count_by_org(
+        self,
+        org_id: UUID,
+        urgency: str | None = None,
+        status: str | None = None,
+        entity_id: str | None = None,
+    ) -> int:
+        stmt = select(func.count()).select_from(Recommendation).where(Recommendation.org_id == org_id)
+        if urgency:
+            stmt = stmt.where(Recommendation.urgency == urgency)
+        if status:
+            stmt = stmt.where(Recommendation.status == status)
+        if entity_id:
+            stmt = stmt.where(Recommendation.entity_id == entity_id)
+        return int(await self.db.scalar(stmt) or 0)
 
     async def create(self, **fields) -> Recommendation:
         rec = Recommendation(**fields)

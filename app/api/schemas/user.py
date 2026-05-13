@@ -4,30 +4,42 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
-
-Role = Literal["admin", "ops_manager"]
+Role = Literal["admin", "manager", "analyst", "viewer"]
 
 
 class UserResponse(BaseModel):
     id: UUID
     org_id: UUID
     email: str
+    full_name: str
     role: str
+    is_active: bool
+    is_verified: bool
+    last_login_at: datetime | None
     created_at: datetime
+
+
+class MeUpdateRequest(BaseModel):
+    full_name: str | None = None
+    avatar_url: str | None = None
+
+
+class PasswordUpdateRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
 
 
 class InviteUserRequest(BaseModel):
     email: EmailStr
-    role: Role = "ops_manager"
+    role: Literal["manager", "analyst", "viewer"]
 
 
 class InviteUserResponse(BaseModel):
-    user: UserResponse
-    temporary_password: str = Field(
-        ...,
-        description="Hackathon-only bootstrap password. Replace with email invite flow before production.",
-    )
+    invitation_id: UUID
+    email: str
+    role: str
+    expires_at: datetime
 
 
 class UpdateUserRoleRequest(BaseModel):
-    role: Role
+    role: Literal["admin", "manager", "analyst", "viewer"]

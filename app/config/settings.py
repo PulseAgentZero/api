@@ -152,9 +152,21 @@ class Settings:
     REDIS_URL: Optional[str] = os.getenv("REDIS_URL", "").strip() or None
 
     # ------------------------------------------------------------------
+    # Deployment / service URLs
+    # ------------------------------------------------------------------
+    DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "cloud").lower()
+    AGENT_SERVICE_URL: Optional[str] = os.getenv("AGENT_SERVICE_URL", "").strip() or None
+    LICENSE_SERVER_URL: str = os.getenv("LICENSE_SERVER_URL", "https://license.pulseai.io").rstrip("/")
+    # RSA PEM for offline plc_* JWT verification (LICENSE_SYSTEM.md)
+    PULSE_LICENSE_PUBLIC_KEY: Optional[str] = os.getenv("PULSE_LICENSE_PUBLIC_KEY", "").strip() or None
+    LICENSE_JWT_ISSUER: Optional[str] = os.getenv("LICENSE_JWT_ISSUER", "https://license.pulseai.io").strip() or None
+    LICENSE_OFFLINE_GRACE_DAYS: int = int(os.getenv("LICENSE_OFFLINE_GRACE_DAYS", "7"))
+    LICENSE_REVALIDATION_INTERVAL_HOURS: int = int(os.getenv("LICENSE_REVALIDATION_INTERVAL_HOURS", "24"))
+
+    # ------------------------------------------------------------------
     # Qdrant (vector search for entity retrieval)
     # ------------------------------------------------------------------
-    QDRANT_URL: Optional[str] = os.getenv("QDRANT_URL", "http://localhost:6333")
+    QDRANT_URL: Optional[str] = os.getenv("QDRANT_URL", "").strip() or None
     QDRANT_API_KEY: Optional[str] = os.getenv("QDRANT_API_KEY", "").strip() or None
     QDRANT_COLLECTION_PREFIX: str = os.getenv("QDRANT_COLLECTION_PREFIX", "pulse_org_")
     QDRANT_VECTOR_SIZE: int = int(
@@ -227,7 +239,8 @@ class Settings:
     )
     JWT_SECRET: str = os.getenv("JWT_SECRET", "pulse-dev-secret-change-me")
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+    JWT_EXPIRY_HOURS: int = int(os.getenv("JWT_EXPIRY_HOURS", "24"))  # legacy; prefer ACCESS_TOKEN_EXPIRE_MINUTES
     ENCRYPTION_KEY: str = os.getenv(
         "ENCRYPTION_KEY",
         "K_k8N_IyoXaDyql8ijHUmO9KA6FyuAqP7guglrC0Pns=",

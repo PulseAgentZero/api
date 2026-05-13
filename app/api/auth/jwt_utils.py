@@ -14,7 +14,8 @@ def create_access_token(user_id: uuid.UUID, org_id: uuid.UUID, role: str, email:
         "role": role,
         "email": email,
         "iat": datetime.now(timezone.utc),
-        "exp": datetime.now(timezone.utc) + timedelta(hours=settings.JWT_EXPIRY_HOURS),
+        "exp": datetime.now(timezone.utc)
+        + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 

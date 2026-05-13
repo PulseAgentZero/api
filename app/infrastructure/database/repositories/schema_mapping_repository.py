@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.models.schema_mapping import SchemaMapping
@@ -73,3 +73,11 @@ class SchemaMappingRepository:
         await self.db.delete(mapping)
         await self.db.flush()
         return True
+
+    async def deactivate_for_connection(self, connection_id: UUID) -> None:
+        await self.db.execute(
+            update(SchemaMapping)
+            .where(SchemaMapping.connection_id == connection_id)
+            .values(is_active=False)
+        )
+        await self.db.flush()

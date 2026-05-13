@@ -1,3 +1,5 @@
+import re
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -84,6 +86,39 @@ async def introspect_schema(dsn: str) -> list[TableInfo]:
                 ]
                 tables.append(TableInfo(name=table_name, columns=columns))
             return tables
+    finally:
+        if engine:
+            await engine.dispose()
+
+
+_SAFE_SQL_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def validate_sql_identifier(name: str) -> str:
+    if not _SAFE_SQL_IDENT.match(name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
+
+
+async def preview_table_rows(dsn: str, table_name: str, limit: int = 50) -> list[dict[str, object]]:
+    """Return up to `limit` rows as plain dicts (Postgres / MySQL)."""
+    t = validate_sql_identifier(table_name)
+    lim = max(1, min(int(limit), 500))
+    url = _to_async_url(dsn)
+    engine: AsyncEngine | None = None
+    try:
+        engine = create_async_engine(url, connect_args=_connect_args(url))
+        async with engine.connect() as conn:
+            if url.startswith("mysql+aiomysql://"):
+                q = text(f"SELECT * FROM `{t}` LIMIT :lim").bindparams(lim=lim)
+            else:
+                q = text(f'SELECT * FROM "{t}" LIMIT :lim').bindparams(lim=lim)
+            result = await conn.execute(q)
+            cols = list(result.keys())
+            rows = []
+            for row in result.fetchall():
+                rows.append({cols[i]: row[i] for i in range(len(cols))})
+            return rows
     finally:
         if engine:
             await engine.dispose()

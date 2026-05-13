@@ -94,7 +94,7 @@ async def _overview(db: AsyncSession, org_id: UUID) -> dict:
     for entity in entities:
         breakdown[entity["risk_tier"]] += 1
     top = sorted(entities, key=lambda item: item["risk_score"], reverse=True)[:3]
-    active_recs = await RecommendationRepository(db).list_by_org(org_id, status="active")
+    active_recs = await RecommendationRepository(db).list_by_org(org_id, status="open")
     return {
         "total_entities": len(entities),
         "risk_breakdown": breakdown,
@@ -151,7 +151,7 @@ async def _entity_detail(db: AsyncSession, org_id: UUID, entity_id: str) -> dict
     if entity is None:
         return {"error": "Entity not found"}
     entity = compute_risk([entity], mapping.signal_columns, mapping.risk_config)[0]
-    recs = await RecommendationRepository(db).list_by_org(org_id, status="active")
+    recs = await RecommendationRepository(db).list_by_org(org_id, status="open")
     return {
         "entity_id": entity[mapping.entity_id_col],
         "entity_label": entity.get(mapping.entity_name_col) if mapping.entity_name_col else None,
@@ -180,7 +180,7 @@ async def _recommendations(
     limit: int = 25,
 ) -> dict:
     recs = await RecommendationRepository(db).list_by_org(
-        org_id, urgency=urgency, status="active"
+        org_id, urgency=urgency, status="open"
     )
     return {
         "recommendations": [

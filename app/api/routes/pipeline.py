@@ -1,95 +1,80 @@
 """Pipeline management API routes — trigger runs and inspect run history."""
 
+import asyncio
+import json
 import logging
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from croniter import croniter
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
+from app.api.errors import bad_request, not_found, validation_error
+from app.infrastructure.database.models.pipeline_run import PipelineRun
+from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.pipeline_run_repository import (
     PipelineRunRepository,
 )
 from app.infrastructure.database.session import get_db
-from app.services.schedulers.pipeline_scheduler import trigger_pipeline_now
+from app.services.pipeline_trigger import claim_and_trigger_pipeline, serialize_pipeline_run
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
 
-def _serialize_run(run) -> dict:
-    return {
-        "id": str(run.id),
-        "org_id": str(run.org_id),
-        "status": run.status,
-        "trigger_source": run.trigger_source,
-        "current_step": run.current_step,
-        "error": run.error,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "duration_ms": run.duration_ms,
-        "entities_scored": run.entities_scored,
-        "critical_count": run.critical_count,
-        "high_count": run.high_count,
-        "recommendations_generated": run.recommendations_generated,
-        "total_llm_calls": run.total_llm_calls,
-        "total_tool_calls": run.total_tool_calls,
-        "total_tokens": run.total_tokens,
-        "provider_fallbacks": run.provider_fallbacks,
-        "created_at": run.created_at.isoformat() if run.created_at else None,
-    }
+class TriggerBody(BaseModel):
+    mapping_id: UUID | None = None
+
+
+class ScheduleBody(BaseModel):
+    cron_expression: str = "0 */6 * * *"
+    timezone: str = "UTC"
+    is_active: bool = True
+    mapping_id: UUID | None = None
+
+
+async def _trigger_common(
+    current_user: User,
+    db: AsyncSession,
+    mapping_id: UUID | None = None,
+) -> dict:
+    return await claim_and_trigger_pipeline(
+        db,
+        current_user.org_id,
+        mapping_id=mapping_id,
+        triggered_by=current_user.id,
+        trigger_source="manual",
+    )
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)
-async def trigger_pipeline(
-    current_user: User = Depends(get_current_user),
+async def trigger_pipeline_legacy(
+    current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Trigger an autonomous pipeline run for the current org.
+    return await _trigger_common(current_user, db)
 
-    Returns 202 with the new run_id, or 409 if another run is already active.
-    The pipeline executes asynchronously in the background.
-    """
-    repo = PipelineRunRepository(db)
-    active = await repo.get_active_for_org(current_user.org_id)
-    if active is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": "Pipeline run already in progress",
-                "run_id": str(active.id),
-                "status": active.status,
-                "current_step": active.current_step,
-            },
-        )
 
-    run_id = await trigger_pipeline_now(
-        current_user.org_id, trigger_source="manual"
-    )
-    if run_id is None:
-        # Race: another worker claimed the slot between our check and the trigger.
-        active = await repo.get_active_for_org(current_user.org_id)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": "Pipeline run already in progress",
-                "run_id": str(active.id) if active else None,
-                "status": active.status if active else "unknown",
-            },
-        )
-
-    return {
-        "message": "Pipeline run triggered",
-        "run_id": str(run_id),
-        "org_id": str(current_user.org_id),
-        "status": "queued",
-    }
+@router.post("/trigger", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_pipeline(
+    body: TriggerBody | None = None,
+    current_user: User = Depends(require_role("admin", "manager")),
+    db: AsyncSession = Depends(get_db),
+):
+    mid = body.mapping_id if body else None
+    return await _trigger_common(current_user, db, mapping_id=mid)
 
 
 @router.post("/run/sync")
 async def trigger_pipeline_sync(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ):
     """Run the pipeline synchronously and return results.
@@ -105,6 +90,7 @@ async def trigger_pipeline_sync(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
+                "code": "PIPELINE_ALREADY_RUNNING",
                 "message": "Pipeline run already in progress",
                 "run_id": str(active.id),
                 "status": active.status,
@@ -139,7 +125,7 @@ async def list_pipeline_runs(
     """Return the most recent pipeline runs for the current org."""
     limit = max(1, min(limit, 100))
     runs = await PipelineRunRepository(db).list_by_org(current_user.org_id, limit=limit)
-    return {"runs": [_serialize_run(r) for r in runs]}
+    return {"runs": [serialize_pipeline_run(r) for r in runs]}
 
 
 @router.get("/runs/{run_id}")
@@ -151,18 +137,129 @@ async def get_pipeline_run(
     """Return detail for one pipeline run, including step metrics."""
     try:
         rid = UUID(run_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid run_id"
-        )
+    except ValueError as exc:
+        raise bad_request("BAD_REQUEST", "Invalid run_id") from exc
 
     run = await PipelineRunRepository(db).get_by_id(rid)
     if run is None or run.org_id != current_user.org_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found"
-        )
+        raise not_found("Pipeline run not found")
 
-    payload = _serialize_run(run)
+    payload = serialize_pipeline_run(run)
     payload["step_metrics"] = run.step_metrics or []
     payload["generation_caps"] = run.generation_caps or {}
     return payload
+
+
+@router.get("/runs/{run_id}/stream")
+async def stream_pipeline_run(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        rid = UUID(run_id)
+    except ValueError as exc:
+        raise bad_request("BAD_REQUEST", "Invalid run_id") from exc
+    run = await PipelineRunRepository(db).get_by_id(rid)
+    if run is None or run.org_id != current_user.org_id:
+        raise not_found("Pipeline run not found")
+
+    async def gen():
+        if run.status in ("succeeded", "failed", "cancelled"):
+            yield f"event: done\ndata: {json.dumps({'status': run.status})}\n\n"
+            return
+        yield 'event: stage_start\ndata: {"stage":"wait","message":"Progress stream placeholder"}\n\n'
+        await asyncio.sleep(0.5)
+        yield f"event: done\ndata: {json.dumps({'status': run.status})}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_pipeline_run(
+    run_id: str,
+    current_user: User = Depends(require_role("admin", "manager")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        rid = UUID(run_id)
+    except ValueError as exc:
+        raise bad_request("BAD_REQUEST", "Invalid run_id") from exc
+    run = await PipelineRunRepository(db).get_by_id(rid)
+    if run is None or run.org_id != current_user.org_id:
+        raise not_found("Pipeline run not found")
+    if run.status in ("succeeded", "failed", "cancelled"):
+        raise bad_request("BAD_REQUEST", "Run already completed")
+    run.status = "cancelled"
+    await db.commit()
+    return {"message": "Cancellation requested"}
+
+
+@router.get("/schedule")
+async def get_schedule(
+    current_user: User = Depends(require_role("admin", "manager")),
+    db: AsyncSession = Depends(get_db),
+) -> dict | None:
+    r = await db.execute(
+        select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
+    )
+    row = r.scalar_one_or_none()
+    if row is None:
+        return None
+    return {
+        "id": str(row.id),
+        "cron_expression": row.cron_expression,
+        "timezone": row.timezone,
+        "is_active": row.is_active,
+        "next_run_at": row.next_run_at.isoformat() if row.next_run_at else None,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+        "mapping_id": str(row.mapping_id) if row.mapping_id else None,
+    }
+
+
+@router.put("/schedule")
+async def put_schedule(
+    body: ScheduleBody,
+    current_user: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        croniter(body.cron_expression)
+    except Exception:
+        raise validation_error(
+            "Invalid cron expression",
+            fields={"cron_expression": "Unparseable cron expression"},
+        )
+    r = await db.execute(
+        select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
+    )
+    row = r.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    next_at = croniter(body.cron_expression, now).get_next(datetime)
+    if row:
+        row.cron_expression = body.cron_expression
+        row.timezone = body.timezone
+        row.is_active = body.is_active
+        row.mapping_id = body.mapping_id
+        row.next_run_at = next_at
+    else:
+        row = PipelineSchedule(
+            org_id=current_user.org_id,
+            cron_expression=body.cron_expression,
+            timezone=body.timezone,
+            is_active=body.is_active,
+            mapping_id=body.mapping_id,
+            next_run_at=next_at,
+        )
+        db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": str(row.id),
+        "cron_expression": row.cron_expression,
+        "timezone": row.timezone,
+        "is_active": row.is_active,
+        "next_run_at": row.next_run_at.isoformat() if row.next_run_at else None,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+        "mapping_id": str(row.mapping_id) if row.mapping_id else None,
+    }
