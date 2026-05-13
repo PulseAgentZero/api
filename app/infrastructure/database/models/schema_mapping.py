@@ -34,6 +34,8 @@ class SchemaMapping(Base, UUIDMixin, TimestampMixin):
     timestamp_col: Mapped[str | None] = mapped_column(String(255))
     risk_config: Mapped[dict | None] = mapped_column(JSONB)
     raw_schema: Mapped[dict | None] = mapped_column(JSONB)
+    target_column: Mapped[str | None] = mapped_column(String(255))
+    rag_config: Mapped[dict | None] = mapped_column(JSONB)
 
     organization: Mapped[Organization] = relationship("Organization", back_populates="schema_mappings")
     connection: Mapped[Connection] = relationship("Connection", back_populates="schema_mappings")

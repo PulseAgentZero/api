@@ -20,6 +20,7 @@ from app.agents.prompts.profiling import PROFILING_PROMPT
 from app.agents.state import PipelineState
 from app.agents.tools.query_tools import build_query_tools
 from app.config.settings import settings
+from app.infrastructure.external_services.rag import embed_and_store_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,10 @@ class ProfilingAgent(BaseAgent):
         state["entity_profiles"] = result.get("entity_profiles", [])
         state["profile_stats"] = result.get("profile_stats", {})
         state["reasoning_log"].extend(self._reasoning_entries)
+
+        # Persist profile embeddings to Qdrant for future-cycle RAG retrieval.
+        # Helper handles graceful degradation if Voyage/Qdrant is unavailable.
+        await embed_and_store_profiles(str(org_id), state["entity_profiles"])
 
         logger.info(
             "[ProfilingAgent] Complete: %d entities profiled",

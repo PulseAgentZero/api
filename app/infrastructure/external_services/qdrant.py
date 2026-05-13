@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Sequence
 
 from qdrant_client import AsyncQdrantClient, models
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.config.settings import settings
 
@@ -20,13 +27,29 @@ class SearchResult:
 
 
 _POINT_ID_NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")  # DNS namespace
+_UPSERT_BATCH_SIZE = 64
+
+# Qdrant client raises generic Exception for transient errors; we retry on
+# everything except validation-style errors (ValueError, TypeError).
+_RETRYABLE = (ConnectionError, TimeoutError, OSError)
 
 
 def _to_point_id(entity_id: str) -> str:
     return str(uuid.uuid5(_POINT_ID_NS, entity_id))
 
 
+def _retry() -> AsyncRetrying:
+    return AsyncRetrying(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, max=4.0),
+        retry=retry_if_exception_type(_RETRYABLE),
+        reraise=True,
+    )
+
+
 class QdrantService:
+    """Async Qdrant wrapper with batched upserts and retries on transients."""
+
     def __init__(self) -> None:
         self.client: AsyncQdrantClient | None = None
 
@@ -53,6 +76,31 @@ class QdrantService:
                 scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8),
             ),
         )
+        # Indexes enable metadata filtering and hybrid keyword search; safe to
+        # create alongside the collection. Each call is idempotent server-side.
+        try:
+            await client.create_payload_index(
+                collection_name=collection_name,
+                field_name="profile_summary",
+                field_schema=models.TextIndexParams(
+                    type=models.TextIndexType.TEXT,
+                    tokenizer=models.TokenizerType.WORD,
+                    lowercase=True,
+                ),
+            )
+            for keyword_field in ("risk_tier", "status", "model_version"):
+                await client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=keyword_field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            await client.create_payload_index(
+                collection_name=collection_name,
+                field_name="last_scored_at",
+                field_schema=models.PayloadSchemaType.FLOAT,
+            )
+        except Exception as exc:
+            logger.warning("Payload index creation skipped: %s", exc)
         logger.info("Created Qdrant collection %s for org %s", collection_name, org_id)
 
     async def upsert_entity(
@@ -62,19 +110,71 @@ class QdrantService:
         vector: list[float],
         payload: dict[str, Any],
     ) -> None:
+        await self.upsert_batch(org_id, [(entity_id, vector, payload)])
+
+    async def upsert_batch(
+        self,
+        org_id: str,
+        items: Sequence[tuple[str, list[float], dict[str, Any]]],
+    ) -> None:
+        """Batch upsert with retry on transients. Each item is (id, vector, payload)."""
+        if not items:
+            return
         client = await self._get_client()
         collection_name = settings.get_org_collection_name(org_id)
-        payload["_entity_id"] = entity_id
-        await client.upsert(
-            collection_name=collection_name,
-            points=[
-                models.PointStruct(
-                    id=_to_point_id(entity_id),
-                    vector=vector,
-                    payload=payload,
+
+        points = [
+            models.PointStruct(
+                id=_to_point_id(entity_id),
+                vector=vector,
+                payload={**payload, "_entity_id": entity_id},
+            )
+            for entity_id, vector, payload in items
+        ]
+
+        async for attempt in _retry():
+            with attempt:
+                t0 = time.perf_counter()
+                for start in range(0, len(points), _UPSERT_BATCH_SIZE):
+                    chunk = points[start : start + _UPSERT_BATCH_SIZE]
+                    await client.upsert(collection_name=collection_name, points=chunk)
+                logger.info(
+                    "[Qdrant] upserted %d points to %s in %.0fms",
+                    len(points),
+                    collection_name,
+                    (time.perf_counter() - t0) * 1000,
                 )
-            ],
-        )
+
+    async def set_entity_payload(
+        self,
+        org_id: str,
+        entity_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Partial payload update for an existing point. No vector change."""
+        client = await self._get_client()
+        collection_name = settings.get_org_collection_name(org_id)
+        async for attempt in _retry():
+            with attempt:
+                await client.set_payload(
+                    collection_name=collection_name,
+                    payload=payload,
+                    points=[_to_point_id(entity_id)],
+                )
+
+    async def set_payload_batch(
+        self,
+        org_id: str,
+        updates: Iterable[tuple[str, dict[str, Any]]],
+    ) -> None:
+        """Apply per-entity payload patches sequentially with retry."""
+        for entity_id, payload in updates:
+            try:
+                await self.set_entity_payload(org_id, entity_id, payload)
+            except Exception as exc:
+                logger.warning(
+                    "[Qdrant] set_payload failed for %s: %s", entity_id, exc
+                )
 
     async def search_similar(
         self,
@@ -87,13 +187,97 @@ class QdrantService:
     ) -> list[SearchResult]:
         client = await self._get_client()
         collection_name = settings.get_org_collection_name(org_id)
-        results = await client.query_points(
-            collection_name=collection_name,
-            query=vector,
-            query_filter=filter_condition,
-            limit=limit,
-            score_threshold=score_threshold,
-            with_payload=True,
+        t0 = time.perf_counter()
+        async for attempt in _retry():
+            with attempt:
+                results = await client.query_points(
+                    collection_name=collection_name,
+                    query=vector,
+                    query_filter=filter_condition,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                )
+        logger.debug(
+            "[Qdrant] search_similar %s limit=%d took %.0fms returned=%d",
+            collection_name,
+            limit,
+            (time.perf_counter() - t0) * 1000,
+            len(results.points),
+        )
+        return [
+            SearchResult(
+                entity_id=(p.payload or {}).get("_entity_id", str(p.id)),
+                score=p.score,
+                payload=p.payload or {},
+            )
+            for p in results.points
+        ]
+
+    async def hybrid_search(
+        self,
+        org_id: str,
+        vector: list[float],
+        *,
+        text_query: str | None = None,
+        limit: int = 10,
+        prefetch_limit: int = 40,
+        filter_condition: models.Filter | None = None,
+    ) -> list[SearchResult]:
+        """Dense + keyword fused via Reciprocal Rank Fusion.
+
+        Keyword stage uses Qdrant `MatchText` on the indexed `profile_summary`
+        payload field. Falls back to dense-only if no text query supplied.
+        """
+        if not text_query:
+            return await self.search_similar(
+                org_id,
+                vector,
+                limit=limit,
+                filter_condition=filter_condition,
+            )
+
+        client = await self._get_client()
+        collection_name = settings.get_org_collection_name(org_id)
+
+        text_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="profile_summary",
+                    match=models.MatchText(text=text_query),
+                )
+            ]
+        )
+
+        prefetch = [
+            models.Prefetch(query=vector, limit=prefetch_limit),
+            models.Prefetch(filter=text_filter, limit=prefetch_limit),
+        ]
+
+        t0 = time.perf_counter()
+        try:
+            results = await client.query_points(
+                collection_name=collection_name,
+                prefetch=prefetch,
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=filter_condition,
+                limit=limit,
+                with_payload=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Qdrant] hybrid_search failed, falling back to dense: %s", exc
+            )
+            return await self.search_similar(
+                org_id, vector, limit=limit, filter_condition=filter_condition
+            )
+
+        logger.debug(
+            "[Qdrant] hybrid_search %s limit=%d took %.0fms returned=%d",
+            collection_name,
+            limit,
+            (time.perf_counter() - t0) * 1000,
+            len(results.points),
         )
         return [
             SearchResult(

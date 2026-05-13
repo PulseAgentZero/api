@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+set -eu
+
+git update-index -q --refresh

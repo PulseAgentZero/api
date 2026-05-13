@@ -76,8 +76,9 @@ async def save_and_test_connection(
         database_name=body.database_name,
         username=body.username,
         encrypted_dsn=encrypt_dsn(dsn),
+        sslmode=body.sslmode,
     )
-    success, message, db_version = await test_connection(dsn)
+    success, message, db_version = await test_connection(dsn, body.sslmode)
     conn.status = "active" if success else "failed"
     from datetime import datetime, timezone
 
@@ -105,7 +106,7 @@ async def get_connection_schema(
     if not conns:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
     conn = conns[-1]
-    tables = await introspect_schema(decrypt_dsn(conn.encrypted_dsn))
+    tables = await introspect_schema(decrypt_dsn(conn.encrypted_dsn), conn.sslmode)
     return IntrospectResponse(tables=tables)
 
 
@@ -130,6 +131,7 @@ async def save_schema_mapping(
         timestamp_col=body.timestamp_col,
         risk_config=body.risk_config,
         raw_schema=body.raw_schema,
+        target_column=body.target_column,
     )
     await db.commit()
     return OnboardingSchemaMappingResponse(schema_mapping=_mapping_to_response(mapping))
