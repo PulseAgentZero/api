@@ -82,6 +82,8 @@ def _mapping_to_response(m) -> SchemaMappingResponse:
         timestamp_col=m.timestamp_col,
         risk_config=m.risk_config,
         raw_schema=m.raw_schema,
+        target_column=m.target_column,
+        rag_config=m.rag_config,
         created_at=m.created_at,
     )
 
@@ -128,6 +130,8 @@ async def create_schema_mapping(
         timestamp_col=body.timestamp_col,
         risk_config=body.risk_config,
         raw_schema=body.raw_schema,
+        target_column=body.target_column,
+        rag_config=body.rag_config,
     )
     await db.commit()
     return _mapping_to_response(mapping)
@@ -158,6 +162,8 @@ async def update_schema_mapping(
         "timestamp_col": mapping.timestamp_col,
         "risk_config": mapping.risk_config,
         "raw_schema": mapping.raw_schema,
+        "target_column": mapping.target_column,
+        "rag_config": mapping.rag_config,
     }
     merged.update(payload)
     _validate_mapping_payload(merged)

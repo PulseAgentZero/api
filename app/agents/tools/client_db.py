@@ -6,14 +6,16 @@ ad-hoc reuse. This module exposes a small, public surface that agent tools
 can depend on without reaching into private names.
 """
 
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from app.infrastructure.database.client_queries import (
     _get_client_engine as _impl_get_client_engine,
     _quote_identifier as _impl_quote_identifier,
+    _safe_client_connection as _impl_safe_client_connection,
     _schema_columns_sql as _impl_schema_columns_sql,
     _validate_identifier as _impl_validate_identifier,
 )
@@ -28,6 +30,17 @@ async def open_client_engine(
     Caller owns disposal (`await engine.dispose()`).
     """
     return await _impl_get_client_engine(db, org_id)
+
+
+def safe_client_connection(
+    engine: AsyncEngine, conn: Connection,
+) -> asynccontextmanager:
+    """Open a read-only, time-bounded connection to the client DB.
+
+    Enforces READ ONLY session mode and statement timeout.
+    Use this instead of raw `engine.connect()` for all client queries.
+    """
+    return _impl_safe_client_connection(engine, conn)
 
 
 def quote_identifier(value: str, db_type: str | None) -> str:
@@ -47,7 +60,9 @@ def schema_columns_sql(db_type: str | None) -> str:
 
 __all__ = [
     "open_client_engine",
+    "safe_client_connection",
     "quote_identifier",
     "validate_identifier",
     "schema_columns_sql",
 ]
+

@@ -47,6 +47,7 @@ def _make_dsn(
     database_name: str,
     username: str,
     password: str,
+    sslmode: str | None = None,
 ) -> str:
     scheme = "mysql" if db_type == "mysql" else "postgresql"
     return (
@@ -71,6 +72,7 @@ def _connection_to_response(conn) -> ConnectionResponse:
         port=conn.port,
         database_name=conn.database_name,
         username=conn.username,
+        sslmode=conn.sslmode,
         status=conn.status,
         last_tested_at=conn.last_tested_at,
         last_test_error=conn.last_test_error,
@@ -334,6 +336,7 @@ async def _update_connection_record(
         "port": payload.get("port", conn.port),
         "database_name": payload.get("database_name", conn.database_name),
         "username": payload.get("username", conn.username),
+        "sslmode": payload.get("sslmode", conn.sslmode),
     }
 
     for key, value in payload.items():

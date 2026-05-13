@@ -5,6 +5,29 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.api.schemas.connection import ColumnInfo, TableInfo
 
+logger = logging.getLogger(__name__)
+
+_QUERY_TIMEOUT_S = 30
+
+
+async def _set_session_guards(conn, url: str) -> None:
+    """Set read-only + statement timeout on a client DB connection."""
+    try:
+        if url.startswith("mysql+aiomysql://"):
+            await conn.execute(text("SET SESSION TRANSACTION READ ONLY"))
+            await conn.execute(
+                text(f"SET max_execution_time = {_QUERY_TIMEOUT_S * 1000}")
+            )
+        else:
+            await conn.execute(
+                text("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+            )
+            await conn.execute(
+                text(f"SET statement_timeout = '{_QUERY_TIMEOUT_S}s'")
+            )
+    except Exception as e:
+        logger.warning("Failed to set session guards: %s", e)
+
 
 def _to_async_url(dsn: str) -> str:
     """Convert a sync DSN to its async SQLAlchemy driver URL."""
@@ -17,19 +40,27 @@ def _to_async_url(dsn: str) -> str:
     return dsn
 
 
-def _connect_args(url: str) -> dict:
+def _connect_args(url: str, sslmode: str | None = None) -> dict:
+    args: dict = {}
     if url.startswith("mysql+aiomysql://"):
-        return {"connect_timeout": 10}
-    return {"timeout": 10}
+        args["connect_timeout"] = 10
+        if sslmode and sslmode != "prefer":
+            args["ssl"] = {"ssl": True}
+    else:
+        args["timeout"] = 10
+        if sslmode and sslmode != "prefer":
+            args["ssl"] = sslmode
+    return args
 
 
-async def test_connection(dsn: str) -> tuple[bool, str, str | None]:
+async def test_connection(dsn: str, sslmode: str | None = None) -> tuple[bool, str, str | None]:
     """Try connecting and running SELECT version(). Returns (success, message, db_version)."""
     url = _to_async_url(dsn)
     engine: AsyncEngine | None = None
     try:
-        engine = create_async_engine(url, connect_args=_connect_args(url))
+        engine = create_async_engine(url, connect_args=_connect_args(url, sslmode))
         async with engine.connect() as conn:
+            await _set_session_guards(conn, url)
             result = await conn.execute(text("SELECT version()"))
             db_version = result.scalar_one()
         return True, "Connection successful", db_version
@@ -40,13 +71,14 @@ async def test_connection(dsn: str) -> tuple[bool, str, str | None]:
             await engine.dispose()
 
 
-async def introspect_schema(dsn: str) -> list[TableInfo]:
+async def introspect_schema(dsn: str, sslmode: str | None = None) -> list[TableInfo]:
     """Introspect the remote database and return all tables with their columns."""
     url = _to_async_url(dsn)
     engine: AsyncEngine | None = None
     try:
-        engine = create_async_engine(url, connect_args=_connect_args(url))
+        engine = create_async_engine(url, connect_args=_connect_args(url, sslmode))
         async with engine.connect() as conn:
+            await _set_session_guards(conn, url)
             if url.startswith("mysql+aiomysql://"):
                 tables_sql = (
                     "SELECT table_name FROM information_schema.tables "
@@ -86,6 +118,9 @@ async def introspect_schema(dsn: str) -> list[TableInfo]:
                 ]
                 tables.append(TableInfo(name=table_name, columns=columns))
             return tables
+    except Exception as exc:
+        logger.error("Schema introspection failed: %s", exc)
+        raise
     finally:
         if engine:
             await engine.dispose()

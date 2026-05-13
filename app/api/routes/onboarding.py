@@ -86,7 +86,7 @@ async def save_and_test_connection(
         name=body.name,
         connector_type=body.connector_type or body.db_type,
     )
-    success, message, db_version = await test_connection(dsn)
+    success, message, db_version = await test_connection(dsn, body.sslmode)
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     await db.commit()
@@ -143,6 +143,7 @@ async def save_schema_mapping(
         timestamp_col=body.timestamp_col,
         risk_config=body.risk_config,
         raw_schema=body.raw_schema,
+        target_column=body.target_column,
     )
     await db.commit()
     return OnboardingSchemaMappingResponse(schema_mapping=_mapping_to_response(mapping))

@@ -14,6 +14,7 @@ class CreateConnectionRequest(BaseModel):
     database_name: str = Field(..., min_length=1, max_length=255)
     username: str = Field(..., min_length=1, max_length=255)
     password: str = Field(..., min_length=1)
+    sslmode: str = Field("prefer", min_length=1, max_length=20)
 
 
 class UpdateConnectionRequest(BaseModel):
@@ -24,6 +25,7 @@ class UpdateConnectionRequest(BaseModel):
     database_name: str | None = None
     username: str | None = None
     password: str | None = None
+    sslmode: str | None = None
 
 
 class ConnectionResponse(BaseModel):
@@ -38,6 +40,7 @@ class ConnectionResponse(BaseModel):
     port: int | None
     database_name: str | None
     username: str | None
+    sslmode: str | None
     status: str
     last_tested_at: datetime | None
     last_test_error: str | None = None

@@ -79,6 +79,19 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "find_similar_entities",
+        "description": "Find entities similar to a given entity by behaviour profile. Returns ranked list with similarity scores.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string", "description": "Entity ID to find similar entities for"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["entity_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -199,6 +212,56 @@ async def _recommendations(
     }
 
 
+async def _find_similar(
+    db: AsyncSession,
+    org_id: UUID,
+    entity_id: str,
+    limit: int = 10,
+) -> dict:
+    """Semantic search for entities similar to the given entity_id."""
+    from app.infrastructure.external_services.embeddings import embedding_service
+    from app.infrastructure.external_services.qdrant import QdrantService
+
+    if not settings.is_voyage_configured():
+        return {"error": "Vector search not available", "similar_entities": []}
+
+    mapping = await get_schema_mapping(db, org_id)
+    entity = await fetch_entity_by_id(db, org_id, entity_id, mapping)
+    if entity is None:
+        return {"error": "Entity not found"}
+
+    signals = {
+        sig_label: entity.get(col_name)
+        for sig_label, col_name in (mapping.signal_columns or {}).items()
+        if col_name in entity
+    }
+    query_text = f"Entity {entity_id}: signals {json.dumps(signals, default=str)}"
+
+    try:
+        qdrant = QdrantService()
+        await qdrant.ensure_collection(str(org_id))
+        vector = await embedding_service.embed_query(query_text)
+        results = await qdrant.search_similar(str(org_id), vector, limit=limit + 1)
+    except Exception as exc:
+        return {"error": f"Vector search failed: {exc}", "similar_entities": []}
+
+    similar = [
+        {
+            "entity_id": r.entity_id,
+            "similarity": round(float(r.score), 4),
+            "profile_summary": r.payload.get("profile_summary", ""),
+        }
+        for r in results
+        if str(r.entity_id) != str(entity_id)
+    ][:limit]
+
+    return {
+        "query_entity": entity_id,
+        "similar_entities": similar,
+        "total": len(similar),
+    }
+
+
 async def _action_draft(
     db: AsyncSession,
     org_id: UUID,
@@ -257,6 +320,13 @@ async def _run_tool(
                 org_id,
                 str(tool_input["entity_id"]),
                 str(tool_input["action_type"]),
+            )
+        if name == "find_similar_entities":
+            return await _find_similar(
+                db,
+                org_id,
+                str(tool_input["entity_id"]),
+                limit=int(tool_input.get("limit") or 10),
             )
     except ClientDBError as exc:
         return {"error": str(exc)}

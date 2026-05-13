@@ -1,10 +1,14 @@
 """Shared query tools for autonomous agents.
 
-These wrap the existing client_queries engine so agents can fire live
-queries against the org's external database via tool calls.
+Security hardened:
+- WHERE clause blocklist prevents SQL injection via LLM-generated clauses
+- All connections use READ-ONLY mode via _safe_client_connection
+- Structured audit logging on every client data access
+- Row limits enforced (max 500 per query)
 """
 
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
@@ -15,13 +19,78 @@ from app.agents.tools.base import Tool, ToolParam
 from app.agents.tools.client_db import (
     open_client_engine,
     quote_identifier,
+    safe_client_connection,
     schema_columns_sql,
     validate_identifier,
 )
-from app.infrastructure.database.client_queries import get_schema_mapping
+from app.infrastructure.database.client_queries import ClientDBError, get_schema_mapping
 
 logger = logging.getLogger(__name__)
 
+# Dedicated audit logger for client data access — separate from application logs
+# so it can be routed to compliance/SIEM systems independently.
+audit_logger = logging.getLogger("pulse.client_data_audit")
+
+# ─── SQL injection prevention ───────────────────────────────────────────
+
+_DANGEROUS_SQL = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE"
+    r"|EXEC|EXECUTE|COPY|LOAD|INTO\s+OUTFILE|INTO\s+DUMPFILE)\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_where_clause(where: str | None) -> str | None:
+    """Validate a WHERE clause for safety before SQL interpolation.
+
+    Blocks:
+    - Semicolons (statement chaining)
+    - Dangerous SQL keywords (INSERT, UPDATE, DELETE, DROP, etc.)
+    - Comment markers (-- or /*)
+    """
+    if where is None:
+        return None
+
+    # Block statement chaining
+    if ";" in where:
+        raise ClientDBError("WHERE clause must not contain semicolons")
+
+    # Block SQL comments
+    if "--" in where or "/*" in where:
+        raise ClientDBError("WHERE clause must not contain SQL comments")
+
+    # Block dangerous keywords
+    if _DANGEROUS_SQL.search(where):
+        raise ClientDBError(
+            "WHERE clause contains forbidden SQL keyword. "
+            "Only SELECT-compatible expressions are allowed."
+        )
+
+    return where
+
+
+# ─── Audit logging ──────────────────────────────────────────────────────
+
+def _log_client_access(
+    org_id: UUID,
+    table: str,
+    operation: str,
+    row_count: int,
+    columns: str | None = None,
+) -> None:
+    """Emit a structured audit log entry for every client data access.
+
+    These logs can be collected by SIEM/compliance tooling to answer:
+    "What data was accessed, when, for which org, and how many rows?"
+    """
+    audit_logger.info(
+        "CLIENT_DATA_ACCESS org=%s table=%s op=%s rows=%d cols=%s",
+        org_id, table, operation, row_count,
+        columns if columns else "*",
+    )
+
+
+# ─── Tool implementations ──────────────────────────────────────────────
 
 def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     """Build the set of query tools available to autonomous agents."""
@@ -31,11 +100,12 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         limit: int = 100,
         where: str | None = None,
     ) -> dict[str, Any]:
-        """Query the mapped entity table in the client database."""
+        """Query the mapped entity table in the client database (READ-ONLY)."""
+        where = _validate_where_clause(where)
         mapping = await get_schema_mapping(db, org_id)
         engine, conn = await open_client_engine(db, org_id)
         try:
-            async with engine.connect() as client_conn:
+            async with safe_client_connection(engine, conn) as client_conn:
                 table = validate_identifier(mapping.entity_table, "entity table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
@@ -62,6 +132,9 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
                 result = await client_conn.execute(text(sql), params)
                 rows = result.all()
+
+                _log_client_access(org_id, table, "query_entity_table", len(rows), columns)
+
                 return {
                     "rows": [dict(zip(col_names, row)) for row in rows],
                     "count": len(rows),
@@ -76,10 +149,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         limit: int = 100,
         where: str | None = None,
     ) -> dict[str, Any]:
-        """Query any table in the client database (for cross-table analysis)."""
+        """Query any table in the client database for cross-table analysis (READ-ONLY)."""
+        where = _validate_where_clause(where)
         engine, conn = await open_client_engine(db, org_id)
         try:
-            async with engine.connect() as client_conn:
+            async with safe_client_connection(engine, conn) as client_conn:
                 table = validate_identifier(table_name, "table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
@@ -108,6 +182,9 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
                 result = await client_conn.execute(text(sql), params)
                 rows = result.all()
+
+                _log_client_access(org_id, table, "query_related_table", len(rows), columns)
+
                 return {
                     "rows": [dict(zip(col_names, row)) for row in rows],
                     "count": len(rows),
@@ -123,10 +200,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         group_by: str | None = None,
         where: str | None = None,
     ) -> dict[str, Any]:
-        """Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on the client database."""
+        """Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on the client database (READ-ONLY)."""
+        where = _validate_where_clause(where)
         engine, conn = await open_client_engine(db, org_id)
         try:
-            async with engine.connect() as client_conn:
+            async with safe_client_connection(engine, conn) as client_conn:
                 table = validate_identifier(table_name, "table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
@@ -159,6 +237,9 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
                 result = await client_conn.execute(text(sql), params)
                 rows = result.all()
+
+                _log_client_access(org_id, table, f"query_aggregate({agg})", len(rows))
+
                 return {
                     "results": [dict(zip(select_cols, row)) for row in rows],
                     "aggregate": agg,
@@ -169,10 +250,10 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
             await engine.dispose()
 
     async def list_tables() -> dict[str, Any]:
-        """List all tables in the client database with their columns."""
+        """List all tables in the client database with their columns (READ-ONLY)."""
         engine, conn = await open_client_engine(db, org_id)
         try:
-            async with engine.connect() as client_conn:
+            async with safe_client_connection(engine, conn) as client_conn:
                 if conn.db_type == "mysql":
                     tables_sql = (
                         "SELECT table_name FROM information_schema.tables "
@@ -194,19 +275,25 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                     )
                     columns = [row[0] for row in cols_result.all()]
                     tables.append({"table": tname, "columns": columns})
+
+                _log_client_access(org_id, "information_schema", "list_tables", len(tables))
+
                 return {"tables": tables, "count": len(tables)}
         finally:
             await engine.dispose()
 
     async def get_row_count(table_name: str) -> dict[str, Any]:
-        """Get row count of a table in the client database."""
+        """Get row count of a table in the client database (READ-ONLY)."""
         engine, conn = await open_client_engine(db, org_id)
         try:
-            async with engine.connect() as client_conn:
+            async with safe_client_connection(engine, conn) as client_conn:
                 table = validate_identifier(table_name, "table")
                 quoted = quote_identifier(table, conn.db_type)
                 result = await client_conn.execute(text(f"SELECT COUNT(*) FROM {quoted}"))
                 count = result.scalar_one()
+
+                _log_client_access(org_id, table, "get_row_count", 1)
+
                 return {"table": table, "row_count": count}
         finally:
             await engine.dispose()
@@ -214,16 +301,19 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     async def validate_column_exists(
         table_name: str, column_name: str
     ) -> dict[str, Any]:
-        """Check if a column exists in a table."""
+        """Check if a column exists in a table (READ-ONLY)."""
         engine, conn = await open_client_engine(db, org_id)
         try:
-            async with engine.connect() as client_conn:
+            async with safe_client_connection(engine, conn) as client_conn:
                 cols_result = await client_conn.execute(
                     text(schema_columns_sql(conn.db_type)),
                     {"tname": table_name},
                 )
                 all_cols = [row[0] for row in cols_result.all()]
                 exists = column_name in all_cols
+
+                _log_client_access(org_id, table_name, "validate_column_exists", 1)
+
                 return {
                     "table": table_name,
                     "column": column_name,
@@ -237,46 +327,56 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     return [
         Tool(
             name="query_entity_table",
-            description="Query the mapped entity table. Returns rows from the org's primary entity table.",
+            description=(
+                "Query the mapped entity table (READ-ONLY). "
+                "Returns rows from the org's primary entity table. "
+                "All queries run in a read-only transaction — writes are impossible."
+            ),
             parameters=[
                 ToolParam("columns", "string", "Comma-separated column names or '*' for all", required=False),
                 ToolParam("limit", "integer", "Max rows to return (max 500)", required=False),
-                ToolParam("where", "string", "SQL WHERE clause (use parameterized values)", required=False),
+                ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_entity_table,
         ),
         Tool(
             name="query_related_table",
-            description="Query any table in the client database for cross-table analysis.",
+            description=(
+                "Query any table in the client database for cross-table analysis (READ-ONLY). "
+                "All queries run in a read-only transaction — writes are impossible."
+            ),
             parameters=[
                 ToolParam("table_name", "string", "Name of the table to query"),
                 ToolParam("columns", "string", "Comma-separated column names or '*'", required=False),
                 ToolParam("limit", "integer", "Max rows to return (max 500)", required=False),
-                ToolParam("where", "string", "SQL WHERE clause", required=False),
+                ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_related_table,
         ),
         Tool(
             name="query_aggregate",
-            description="Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on any table.",
+            description=(
+                "Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on any table (READ-ONLY). "
+                "All queries run in a read-only transaction — writes are impossible."
+            ),
             parameters=[
                 ToolParam("table_name", "string", "Table to aggregate"),
                 ToolParam("aggregate", "string", "Aggregate function: COUNT, SUM, AVG, MIN, MAX"),
                 ToolParam("column", "string", "Column to aggregate (or '*' for COUNT)"),
                 ToolParam("group_by", "string", "Column to group by", required=False),
-                ToolParam("where", "string", "SQL WHERE clause", required=False),
+                ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_aggregate,
         ),
         Tool(
             name="list_tables",
-            description="List all tables in the client database with their column names.",
+            description="List all tables in the client database with their column names (READ-ONLY).",
             parameters=[],
             execute=list_tables,
         ),
         Tool(
             name="get_row_count",
-            description="Get the total row count of a table.",
+            description="Get the total row count of a table (READ-ONLY).",
             parameters=[
                 ToolParam("table_name", "string", "Name of the table"),
             ],
@@ -284,7 +384,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         ),
         Tool(
             name="validate_column_exists",
-            description="Check if a specific column exists in a table.",
+            description="Check if a specific column exists in a table (READ-ONLY).",
             parameters=[
                 ToolParam("table_name", "string", "Table to check"),
                 ToolParam("column_name", "string", "Column name to validate"),
