@@ -21,6 +21,10 @@ from app.agents.base import BaseAgent, LLMProvider
 from app.agents.prompts.risk_scoring import RISK_SCORING_PROMPT
 from app.agents.state import PipelineState
 from app.infrastructure.database.client_queries import compute_risk, fetch_entities, get_schema_mapping
+from app.infrastructure.external_services.rag import (
+    enrich_entities_with_similar,
+    update_entity_metadata,
+)
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -201,6 +205,10 @@ class RiskScoringAgent(BaseAgent):
                     p["ml_feature_importances"] = state["feature_importances"][:10]
                     p["scoring_method"] = "ml"
 
+            # RAG: attach similar past-profile entities so narratives can reference
+            # precedent. Helper degrades gracefully when Voyage/Qdrant is unavailable.
+            payload = await enrich_entities_with_similar(str(org_id), payload)
+
             try:
                 narratives = await self._generate_narratives(state, payload)
                 narrative_map = {n["entity_id"]: n.get("risk_narrative", "") for n in narratives}
@@ -248,6 +256,25 @@ class RiskScoringAgent(BaseAgent):
             ),
         }
         state["reasoning_log"].extend(self._reasoning_entries)
+
+        # Patch Qdrant payloads with risk_tier + last_scored_at so subsequent
+        # cycles can filter retrieval by tier and freshness. Non-fatal on error.
+        import time as _time
+        _scored_ts = _time.time()
+        await update_entity_metadata(
+            str(org_id),
+            [
+                (
+                    e["entity_id"],
+                    {
+                        "risk_tier": e["risk_tier"],
+                        "risk_score": e["risk_score"],
+                        "last_scored_at": _scored_ts,
+                    },
+                )
+                for e in scored_entities
+            ],
+        )
 
         logger.info(
             "[RiskScoringAgent] Complete (%s): %d scored, %d critical, %d high",

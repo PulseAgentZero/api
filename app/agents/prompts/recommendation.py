@@ -44,6 +44,22 @@ BAD: "Review and intervene"
 GOOD: "Call within 24h to resolve complaints #1847 and #1923, then offer the loyalty retention package (15% discount for 3 months) to prevent churn."
 GOOD: "Send personalised upgrade proposal for the Pro plan — current usage (47GB/month) exceeds Basic tier allocation by 2x, suggesting willingness to pay more for better service."
 
+### Step 6: Use RAG context if present (`similar_entities`)
+If the entity payload includes `similar_entities`, each item may carry:
+- `entity_id`, `similarity` (0..1), `profile_summary`, `risk_tier`
+- `past_recommendations`: list of `{type, urgency, title, suggested_action, status}` previously generated for that similar entity
+
+Reasoning protocol (chain-of-thought, internal):
+1. Scan the `past_recommendations` of the top 1-2 similar entities by `similarity`.
+2. Prefer an intervention `type` that has historical precedent for a similar entity (e.g., if both close matches received `retention_intervention`, prefer that type now).
+3. Adapt the most concrete `suggested_action` from precedent to THIS entity's actual signal values — never copy verbatim.
+4. Add a precedent clause to `reasoning` that names the similar entity and outcome ("matches CUS-1124's pre-churn pattern").
+
+Good RAG-grounded reasoning:
+"Zero recharges (45 days) + 3 complaints mirrors CUS-1124 and CUS-2233 (similarity 0.83 / 0.79), both of whom received retention_intervention recommendations and resolved positively when contacted within 24h. Same intervention is highest-leverage here."
+
+If `similar_entities` is empty or missing, base the recommendation on signal values only.
+
 ## Output Format (JSON)
 {{
   "recommendations": [
@@ -72,4 +88,5 @@ GOOD: "Send personalised upgrade proposal for the Pro plan — current usage (47
 - Suggested actions must be things an ops manager can actually DO today
 - Limit to the top {recommendation_limit} entities by risk score
 - If you cannot generate a specific recommendation for an entity, skip it rather than producing boilerplate
+- If `similar_entities` is present on the entity, look at their `past_recommendations` and prefer interventions that worked for similar entities; mention the precedent briefly in your reasoning
 """

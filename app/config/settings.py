@@ -184,6 +184,26 @@ class Settings:
     def is_voyage_configured(cls) -> bool:
         return bool(cls.get_voyageai_api_key())
 
+    @classmethod
+    def is_voyageai_configured(cls) -> bool:
+        return cls.is_voyage_configured()
+
+    # ------------------------------------------------------------------
+    # RAG tuning (env-overridable; per-org overrides can be layered later)
+    # ------------------------------------------------------------------
+    VOYAGE_RERANK_MODEL: str = os.getenv("VOYAGE_RERANK_MODEL", "rerank-2-lite")
+    RAG_PREFETCH_K: int = int(os.getenv("RAG_PREFETCH_K", "20"))
+    RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
+    RAG_SCORE_THRESHOLD: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.6"))
+    RAG_ENABLE_RERANK: bool = os.getenv("RAG_ENABLE_RERANK", "true").lower() == "true"
+    RAG_ENABLE_HYBRID: bool = os.getenv("RAG_ENABLE_HYBRID", "true").lower() == "true"
+    RAG_ENABLE_QUERY_REWRITE: bool = (
+        os.getenv("RAG_ENABLE_QUERY_REWRITE", "true").lower() == "true"
+    )
+    RAG_FRESHNESS_WINDOW_DAYS: int = int(
+        os.getenv("RAG_FRESHNESS_WINDOW_DAYS", "180")
+    )
+
     # ------------------------------------------------------------------
     # Groq API (LLM)
     # ------------------------------------------------------------------

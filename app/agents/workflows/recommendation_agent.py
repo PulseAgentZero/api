@@ -22,6 +22,7 @@ from app.agents.state import PipelineState
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.infrastructure.external_services.rag import enrich_entities_with_similar
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -94,12 +95,22 @@ class RecommendationAgent(BaseAgent):
             for e in at_risk
         ]
 
+        # Build a compact past-recommendation index once, keyed by entity_id, so
+        # RAG enrichment can attach prior interventions for similar entities
+        # without re-querying Pulse DB per entity.
+        past_recs_by_entity = await _load_past_recs_by_entity(db, org_id)
+
         all_recs: list[dict] = []
         batch_size = 20
 
         for i in range(0, len(enriched_at_risk), batch_size):
             batch = enriched_at_risk[i : i + batch_size]
             try:
+                batch = await enrich_entities_with_similar(
+                    str(org_id),
+                    batch,
+                    past_recs_by_entity=past_recs_by_entity,
+                )
                 batch_recs = await self._generate_batch(prompt, state, batch)
                 all_recs.extend(batch_recs)
             except Exception as e:
@@ -244,3 +255,29 @@ def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
     if profile_fields:
         enriched["profile"] = profile_fields
     return enriched
+
+
+async def _load_past_recs_by_entity(
+    db: AsyncSession, org_id: UUID
+) -> dict[str, list[dict]]:
+    """Index all org recommendations by entity_id with compact fields."""
+    try:
+        recs = await RecommendationRepository(db).list_by_org(org_id)
+    except Exception as exc:
+        logger.warning(
+            "[RecommendationAgent] Could not load past recommendations: %s", exc
+        )
+        return {}
+
+    grouped: dict[str, list[dict]] = {}
+    for rec in recs:
+        if not rec.entity_id:
+            continue
+        grouped.setdefault(str(rec.entity_id), []).append({
+            "type": rec.type,
+            "urgency": rec.urgency,
+            "title": rec.title,
+            "suggested_action": rec.suggested_action,
+            "status": rec.status,
+        })
+    return grouped

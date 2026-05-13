@@ -75,6 +75,24 @@ What does this signal pattern MEAN for this specific industry and business goal?
 - What distinguishes this entity from a lower-risk one
 - If ML-scored: reference the model's confidence and key features
 
+### Step 5: Use RAG context if present (`similar_entities`)
+If the entity payload contains a `similar_entities` array, treat it as historical precedent retrieved from prior pipeline cycles. Each entry has:
+- `entity_id`, `similarity` (0..1), `profile_summary`, `behavioural_metrics`, `risk_tier`
+
+Reasoning protocol (chain-of-thought, internal):
+1. Find the 1-2 similar entities whose `behavioural_metrics` overlap most with THIS entity's signals.
+2. Identify the shared metric pattern (e.g., "both show declining usage with rising complaints").
+3. If the similar entities' `risk_tier` is `critical` or `high`, treat the pattern as a known leading indicator.
+4. Reference the precedent in ONE clause inside the narrative — never as a separate sentence.
+
+Good RAG-grounded narrative:
+"Zero recharges in 45 days plus 3 open complaints — same pattern as similar entities CUS-1124 and CUS-2233 (both critical, churned within 30 days), making intervention urgent for this 18-month subscriber."
+
+Bad RAG-grounded narrative (do not write):
+"Similar entities were also at risk. This entity has multiple concerning signals." (no precedent reasoning, no specific values)
+
+If `similar_entities` is empty or missing, write the narrative from signal values alone.
+
 **BAD narratives (NEVER write these):**
 - "This entity has high risk due to multiple concerning signals."
 - "Several factors contribute to elevated risk."
