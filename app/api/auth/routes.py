@@ -40,6 +40,7 @@ from app.infrastructure.database.repositories.organization_repository import (
 )
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.session import get_db
+from app.infrastructure.email import send_password_reset_email, send_verification_email
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis import tokens as redis_tokens
 
@@ -92,12 +93,13 @@ async def signup(body: SignupRequest, db: AsyncSession = Depends(get_db)) -> Tok
     )
     user.full_name = body.full_name or ""
     user.is_verified = False
+    await db.commit()
     try:
         if await get_redis() is not None:
-            await redis_tokens.set_email_verify_token(user.id)
+            token = await redis_tokens.set_email_verify_token(user.id)
+            await send_verification_email(user.email, token)
     except Exception:
-        logger.exception("email verify token skipped")
-    await db.commit()
+        logger.exception("verification email skipped for %s", user.email)
     await db.refresh(user)
     await db.refresh(org)
 
@@ -194,20 +196,32 @@ async def verify_email(token: str = Query(...), db: AsyncSession = Depends(get_d
 async def resend_verification(current_user: User = Depends(get_current_user)) -> dict:
     if current_user.is_verified:
         raise bad_request("ALREADY_VERIFIED", "User is already verified")
-    if await get_redis() is None:
+    r = await get_redis()
+    if r is None:
         return {"message": "Verification email sent"}
-    await redis_tokens.set_email_verify_token(current_user.id)
+    # Rate limit: block if a token was set in the last 60 seconds
+    from app.infrastructure.redis.keys import email_verify_rate
+    rate_key = email_verify_rate(current_user.id)
+    if await r.get(rate_key):
+        raise bad_request("RATE_LIMITED", "Please wait before requesting another verification email")
+    await r.set(rate_key, "1", ex=60)
+    token = await redis_tokens.set_email_verify_token(current_user.id)
+    try:
+        await send_verification_email(current_user.email, token)
+    except Exception:
+        logger.exception("resend verification email failed for %s", current_user.email)
     return {"message": "Verification email sent"}
 
 
 @router.post("/forgot-password")
 async def forgot_password(body: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)) -> dict:
     user = await UserRepository(db).get_by_email(body.email)
-    if user and await get_redis() is not None:
+    if user and user.is_active and await get_redis() is not None:
         try:
-            await redis_tokens.set_pw_reset_token(user.id)
+            token = await redis_tokens.set_pw_reset_token(user.id)
+            await send_password_reset_email(user.email, token)
         except Exception:
-            logger.exception("pw reset token")
+            logger.exception("pw reset email failed for %s", body.email)
     return {"message": "If that email exists, a reset link has been sent"}
 
 
@@ -224,6 +238,13 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(
     user.password_hash = hash_password(body.new_password)
     await redis_tokens.delete_pw_reset_token(body.token)
     await db.commit()
+    # Invalidate all active sessions so old tokens can't be reused
+    r = await get_redis()
+    if r is not None:
+        from app.infrastructure.redis.keys import user_sessions_pattern
+        pattern = user_sessions_pattern(user.id)
+        async for key in r.scan_iter(match=pattern):
+            await r.delete(key)
     return {"message": "Password updated successfully"}
 
 

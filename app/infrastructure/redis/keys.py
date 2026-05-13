@@ -30,3 +30,17 @@ def pipeline_cancel(run_id: str) -> str:
 
 def rate_limit(ip: str, endpoint: str) -> str:
     return f"rate_limit:{ip}:{endpoint}"
+
+
+def email_verify_rate(user_id) -> str:
+    """Rate limit key for resend-verification — TTL 60s."""
+    return f"email_verify_rate:{user_id}"
+
+
+def user_sessions_pattern(user_id) -> str:
+    """Glob pattern to match all refresh tokens for a user.
+    NOTE: refresh tokens are stored as refresh:{sha256(raw)} — we can't
+    reverse-lookup by user_id without a secondary index. This key tracks
+    them explicitly. See tokens.py set_refresh_token for how it's written.
+    """
+    return f"user_sessions:{user_id}:*"

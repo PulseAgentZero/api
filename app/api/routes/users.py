@@ -19,9 +19,11 @@ from app.api.schemas.user import (
     UserResponse,
 )
 from app.infrastructure.database.models.invitation import Invitation
+from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.session import get_db
+from app.infrastructure.email import send_invitation_email
 from app.infrastructure.redis import tokens as redis_tokens
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -127,6 +129,18 @@ async def invite_user(
     db.add(inv)
     await db.commit()
     await db.refresh(inv)
+    org = await db.get(Organization, current_user.org_id)
+    try:
+        await send_invitation_email(
+            to=inv.email,
+            token=token,
+            invited_by=current_user.full_name or current_user.email,
+            org_name=org.name if org else "your organization",
+            role=inv.role,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("invitation email failed for %s", inv.email)
     return InviteUserResponse(
         invitation_id=inv.id,
         email=inv.email,

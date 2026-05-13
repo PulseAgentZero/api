@@ -27,6 +27,9 @@ async def set_refresh_token(user_id: UUID, org_id: UUID, role: str) -> str:
     key = keys.refresh(raw)
     payload = json.dumps({"user_id": str(user_id), "org_id": str(org_id), "role": role})
     await r.set(key, payload, ex=REFRESH_TTL_SEC)
+    # Secondary index so we can invalidate all sessions for a user on password reset
+    session_key = f"user_sessions:{user_id}:{key}"
+    await r.set(session_key, key, ex=REFRESH_TTL_SEC)
     return raw
 
 
