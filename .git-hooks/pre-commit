@@ -1,7 +1,6 @@
 #!/usr/bin/env sh
 set -eu
 
-# Try active conda env, then project conda env datathon, then PATH
 if [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
     PYTHON="$CONDA_PREFIX/bin/python"
 else
