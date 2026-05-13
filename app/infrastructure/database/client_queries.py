@@ -39,10 +39,17 @@ def _to_async_url(dsn: str) -> str:
     return dsn
 
 
-def _connect_args(url: str) -> dict:
+def _connect_args(url: str, sslmode: str | None = None) -> dict:
+    args: dict = {}
     if url.startswith("mysql+aiomysql://"):
-        return {"connect_timeout": 10}
-    return {"timeout": 10}
+        args["connect_timeout"] = 10
+        if sslmode and sslmode != "prefer":
+            args["ssl"] = {"ssl": True}
+    else:
+        args["timeout"] = 10
+        if sslmode and sslmode != "prefer":
+            args["ssl"] = sslmode
+    return args
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -100,7 +107,7 @@ async def _get_client_engine(db: AsyncSession, org_id) -> tuple[AsyncEngine, Con
         raise ClientDBError("No connection configured for this organization")
     dsn = decrypt_dsn(conn.encrypted_dsn)
     url = _to_async_url(dsn)
-    engine = create_async_engine(url, connect_args=_connect_args(url))
+    engine = create_async_engine(url, connect_args=_connect_args(url, conn.sslmode))
     return engine, conn
 
 

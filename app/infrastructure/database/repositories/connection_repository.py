@@ -28,6 +28,7 @@ class ConnectionRepository:
         database_name: str,
         username: str,
         encrypted_dsn: str,
+        sslmode: str = "prefer",
     ) -> Connection:
         conn = Connection(
             org_id=org_id,
@@ -37,6 +38,7 @@ class ConnectionRepository:
             database_name=database_name,
             username=username,
             encrypted_dsn=encrypted_dsn,
+            sslmode=sslmode,
         )
         self.db.add(conn)
         await self.db.flush()

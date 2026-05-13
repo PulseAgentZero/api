@@ -29,6 +29,7 @@ class Connection(Base, UUIDMixin, TimestampMixin):
     database_name: Mapped[str | None] = mapped_column(String(255))
     username: Mapped[str | None] = mapped_column(String(255))
     encrypted_dsn: Mapped[str | None] = mapped_column(Text)
+    sslmode: Mapped[str] = mapped_column(String(20), default="prefer", server_default="prefer")
     status: Mapped[str] = mapped_column(String(20), default="untested", server_default="untested")
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

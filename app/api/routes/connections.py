@@ -43,6 +43,7 @@ def _make_dsn(
     database_name: str,
     username: str,
     password: str,
+    sslmode: str | None = None,
 ) -> str:
     scheme = "mysql" if db_type == "mysql" else "postgresql"
     return (
@@ -65,6 +66,7 @@ def _connection_to_response(conn) -> ConnectionResponse:
         port=conn.port,
         database_name=conn.database_name,
         username=conn.username,
+        sslmode=conn.sslmode,
         status=conn.status,
         last_tested_at=conn.last_tested_at,
         created_at=conn.created_at,
@@ -80,7 +82,7 @@ async def _get_current_connection(db: AsyncSession, org_id) -> object:
 
 async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
     dsn = decrypt_dsn(conn.encrypted_dsn)
-    success, message, db_version = await test_connection(dsn)
+    success, message, db_version = await test_connection(dsn, conn.sslmode)
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     return success, message, db_version
@@ -168,6 +170,7 @@ async def create_connection(
         database_name=body.database_name,
         username=body.username,
         encrypted_dsn=encrypted,
+        sslmode=body.sslmode,
     )
     success, message, _db_version = await _test_and_mark_connection(conn)
     await db.commit()
@@ -212,6 +215,7 @@ async def _update_connection_record(
         "port": payload.get("port", conn.port),
         "database_name": payload.get("database_name", conn.database_name),
         "username": payload.get("username", conn.username),
+        "sslmode": payload.get("sslmode", conn.sslmode),
     }
 
     for key, value in payload.items():
@@ -277,5 +281,5 @@ async def introspect_db_schema(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
 
     dsn = decrypt_dsn(conn.encrypted_dsn)
-    tables = await introspect_schema(dsn)
+    tables = await introspect_schema(dsn, conn.sslmode)
     return IntrospectResponse(tables=tables)
