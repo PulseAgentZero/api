@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${remote_ref:-}" ] && continue
+
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+      echo "Push rejected: deleting 'main' is not allowed." >&2
+      exit 1
+    fi
+
+    set -- $(git rev-list --parents -n 1 "$local_sha")
+    parent_count=$(($# - 1))
+
+    if [ "$parent_count" -lt 2 ]; then
+      echo "Push rejected: pushes to 'main' are only allowed for merge commits." >&2
+      echo "Tip: merge your feature branch into main first, then push main." >&2
+      exit 1
+    fi
+  fi
+done
+
+echo "Running API tests before push (excluding eval suite)..."
+python -m pytest -q -m "not eval"

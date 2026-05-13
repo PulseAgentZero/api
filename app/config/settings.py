@@ -16,8 +16,8 @@ load_dotenv(project_root / ".env")
 
 logger = logging.getLogger(__name__)
 
-CLAUDE_MODEL_SONNET_4_6 = "claude-sonnet-4-6-20250827"  # general default
-CLAUDE_MODEL_OPUS_4_6 = "claude-opus-4-6-20250826"  # highest capability
+CLAUDE_MODEL_SONNET_4_6 = "claude-sonnet-4-6"  # general default
+CLAUDE_MODEL_OPUS_4_6 = "claude-opus-4-6"  # highest capability
 CLAUDE_MODEL_HAIKU_4_5 = "claude-haiku-4-5-20251001"  # fast/cheap tier
 
 GROQ_MODEL_HEAVY = "openai/gpt-oss-120b"  # analytical/schema-heavy work
@@ -191,7 +191,7 @@ class Settings:
     # ------------------------------------------------------------------
     # RAG tuning (env-overridable; per-org overrides can be layered later)
     # ------------------------------------------------------------------
-    VOYAGE_RERANK_MODEL: str = os.getenv("VOYAGE_RERANK_MODEL", "rerank-2-lite")
+    VOYAGE_RERANK_MODEL: str = os.getenv("VOYAGE_RERANK_MODEL", "rerank-2.5")
     RAG_PREFETCH_K: int = int(os.getenv("RAG_PREFETCH_K", "20"))
     RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "3"))
     RAG_SCORE_THRESHOLD: float = float(os.getenv("RAG_SCORE_THRESHOLD", "0.6"))

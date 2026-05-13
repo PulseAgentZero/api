@@ -22,7 +22,11 @@ from app.agents.state import PipelineState
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
-from app.infrastructure.external_services.rag import enrich_entities_with_similar
+from app.infrastructure.database.client_queries import get_schema_mapping
+from app.infrastructure.external_services.rag import (
+    RagConfig,
+    enrich_entities_with_similar,
+)
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -100,6 +104,13 @@ class RecommendationAgent(BaseAgent):
         # without re-querying Pulse DB per entity.
         past_recs_by_entity = await _load_past_recs_by_entity(db, org_id)
 
+        # Resolve per-org RAG config once and reuse across batches.
+        try:
+            _mapping = await get_schema_mapping(db, org_id)
+            _rag_config = RagConfig.resolve(getattr(_mapping, "rag_config", None))
+        except Exception:
+            _rag_config = RagConfig.from_defaults()
+
         all_recs: list[dict] = []
         batch_size = 20
 
@@ -109,6 +120,7 @@ class RecommendationAgent(BaseAgent):
                 batch = await enrich_entities_with_similar(
                     str(org_id),
                     batch,
+                    config=_rag_config,
                     past_recs_by_entity=past_recs_by_entity,
                 )
                 batch_recs = await self._generate_batch(prompt, state, batch)

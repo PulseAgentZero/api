@@ -22,6 +22,7 @@ from app.agents.prompts.risk_scoring import RISK_SCORING_PROMPT
 from app.agents.state import PipelineState
 from app.infrastructure.database.client_queries import compute_risk, fetch_entities, get_schema_mapping
 from app.infrastructure.external_services.rag import (
+    RagConfig,
     enrich_entities_with_similar,
     update_entity_metadata,
 )
@@ -206,8 +207,17 @@ class RiskScoringAgent(BaseAgent):
                     p["scoring_method"] = "ml"
 
             # RAG: attach similar past-profile entities so narratives can reference
-            # precedent. Helper degrades gracefully when Voyage/Qdrant is unavailable.
-            payload = await enrich_entities_with_similar(str(org_id), payload)
+            # precedent. Per-org overrides come from schema_mapping.rag_config.
+            try:
+                _mapping = await get_schema_mapping(db, org_id)
+                _rag_overrides = getattr(_mapping, "rag_config", None)
+            except Exception:
+                _rag_overrides = None
+            payload = await enrich_entities_with_similar(
+                str(org_id),
+                payload,
+                config=RagConfig.resolve(_rag_overrides),
+            )
 
             try:
                 narratives = await self._generate_narratives(state, payload)

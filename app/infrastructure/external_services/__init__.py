@@ -1,6 +1,7 @@
 from app.infrastructure.external_services.embeddings import EmbeddingService, embedding_service
 from app.infrastructure.external_services.qdrant import QdrantService, SearchResult
 from app.infrastructure.external_services.rag import (
+    RagConfig,
     embed_and_store_profiles,
     enrich_entities_with_similar,
     update_entity_metadata,
@@ -16,6 +17,7 @@ __all__ = [
     "embed_and_store_profiles",
     "enrich_entities_with_similar",
     "update_entity_metadata",
+    "RagConfig",
     "VoyageReranker",
     "voyage_reranker",
     "rewrite_entity_query",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,6 +25,54 @@ from app.infrastructure.external_services.reranker import (
 from app.infrastructure.external_services.query_rewrite import rewrite_entity_query
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RagConfig:
+    """Effective RAG tuning for one request. Built by `RagConfig.resolve`."""
+
+    top_k: int
+    prefetch_limit: int
+    score_threshold: float
+    freshness_days: int
+    enable_rerank: bool
+    enable_hybrid: bool
+    enable_query_rewrite: bool
+    rerank_model: str | None = None
+
+    @classmethod
+    def from_defaults(cls) -> "RagConfig":
+        return cls(
+            top_k=settings.RAG_TOP_K,
+            prefetch_limit=settings.RAG_PREFETCH_K,
+            score_threshold=settings.RAG_SCORE_THRESHOLD,
+            freshness_days=settings.RAG_FRESHNESS_WINDOW_DAYS,
+            enable_rerank=settings.RAG_ENABLE_RERANK,
+            enable_hybrid=settings.RAG_ENABLE_HYBRID,
+            enable_query_rewrite=settings.RAG_ENABLE_QUERY_REWRITE,
+            rerank_model=None,
+        )
+
+    @classmethod
+    def resolve(cls, overrides: dict[str, Any] | None) -> "RagConfig":
+        """Layer per-org JSONB overrides on top of settings defaults."""
+        base = cls.from_defaults()
+        if not overrides:
+            return base
+        return cls(
+            top_k=int(overrides.get("top_k", base.top_k)),
+            prefetch_limit=int(overrides.get("prefetch_limit", base.prefetch_limit)),
+            score_threshold=float(
+                overrides.get("score_threshold", base.score_threshold)
+            ),
+            freshness_days=int(overrides.get("freshness_days", base.freshness_days)),
+            enable_rerank=bool(overrides.get("enable_rerank", base.enable_rerank)),
+            enable_hybrid=bool(overrides.get("enable_hybrid", base.enable_hybrid)),
+            enable_query_rewrite=bool(
+                overrides.get("enable_query_rewrite", base.enable_query_rewrite)
+            ),
+            rerank_model=overrides.get("rerank_model") or base.rerank_model,
+        )
 
 
 def _profile_to_text(profile: dict) -> str:
@@ -168,25 +217,25 @@ async def _retrieve_candidates(
     rewritten_query: str,
     qdrant: QdrantService,
     svc: EmbeddingService,
-    prefetch_limit: int,
+    config: RagConfig,
     filter_condition: qmodels.Filter | None,
 ) -> list[SearchResult]:
     """Dense or hybrid retrieval of over-fetched candidates."""
     vector = await svc.embed_query(rewritten_query or query_text)
-    if settings.RAG_ENABLE_HYBRID:
+    if config.enable_hybrid:
         return await qdrant.hybrid_search(
             org_id,
             vector,
             text_query=rewritten_query or query_text,
-            limit=prefetch_limit,
-            prefetch_limit=prefetch_limit,
+            limit=config.prefetch_limit,
+            prefetch_limit=config.prefetch_limit,
             filter_condition=filter_condition,
         )
     return await qdrant.search_similar(
         org_id,
         vector,
-        limit=prefetch_limit,
-        score_threshold=settings.RAG_SCORE_THRESHOLD,
+        limit=config.prefetch_limit,
+        score_threshold=config.score_threshold,
         filter_condition=filter_condition,
     )
 
@@ -198,6 +247,7 @@ async def enrich_entities_with_similar(
     embedding_svc: EmbeddingService | None = None,
     qdrant: QdrantService | None = None,
     reranker: VoyageReranker | None = None,
+    config: RagConfig | None = None,
     limit: int | None = None,
     prefetch_limit: int | None = None,
     score_threshold: float | None = None,
@@ -212,19 +262,36 @@ async def enrich_entities_with_similar(
       3. Embed query with Voyage
       4. (optional) Hybrid dense+keyword retrieval with RRF, over-fetched
       5. Apply metadata filter (risk_tier hint, freshness window)
-      6. (optional) Voyage rerank-2-lite to top-K
+      6. (optional) Voyage rerank to top-K
       7. Self-exclude and attach past recommendations if provided
+
+    `config` carries effective tuning (per-org overrides resolved by caller).
+    `limit`/`prefetch_limit`/`score_threshold` remain as ad-hoc overrides for
+    tests and one-off callers.
     """
     if not entities or not settings.is_voyage_configured():
         return entities
 
     svc = embedding_svc or embedding_service
     qd = qdrant or QdrantService()
-    rerank = reranker or voyage_reranker
-    top_k = limit if limit is not None else settings.RAG_TOP_K
-    over_k = prefetch_limit if prefetch_limit is not None else settings.RAG_PREFETCH_K
-    threshold = (
-        score_threshold if score_threshold is not None else settings.RAG_SCORE_THRESHOLD
+    cfg = config or RagConfig.from_defaults()
+    if limit is not None or prefetch_limit is not None or score_threshold is not None:
+        cfg = RagConfig(
+            top_k=limit if limit is not None else cfg.top_k,
+            prefetch_limit=(
+                prefetch_limit if prefetch_limit is not None else cfg.prefetch_limit
+            ),
+            score_threshold=(
+                score_threshold if score_threshold is not None else cfg.score_threshold
+            ),
+            freshness_days=cfg.freshness_days,
+            enable_rerank=cfg.enable_rerank,
+            enable_hybrid=cfg.enable_hybrid,
+            enable_query_rewrite=cfg.enable_query_rewrite,
+            rerank_model=cfg.rerank_model,
+        )
+    rerank = reranker or (
+        VoyageReranker(model=cfg.rerank_model) if cfg.rerank_model else voyage_reranker
     )
 
     try:
@@ -235,7 +302,7 @@ async def enrich_entities_with_similar(
 
     filter_condition = _build_filter(
         risk_tier=tier_filter,
-        freshness_days=settings.RAG_FRESHNESS_WINDOW_DAYS,
+        freshness_days=cfg.freshness_days,
     )
 
     enriched: list[dict] = []
@@ -246,10 +313,13 @@ async def enrich_entities_with_similar(
             enriched.append(entity)
             continue
 
-        try:
-            rewritten = await rewrite_entity_query(entity, raw_query)
-        except Exception as exc:
-            logger.debug("[RAG] query rewrite failed (using raw): %s", exc)
+        if cfg.enable_query_rewrite:
+            try:
+                rewritten = await rewrite_entity_query(entity, raw_query)
+            except Exception as exc:
+                logger.debug("[RAG] query rewrite failed (using raw): %s", exc)
+                rewritten = raw_query
+        else:
             rewritten = raw_query
 
         try:
@@ -259,7 +329,16 @@ async def enrich_entities_with_similar(
                 rewritten_query=rewritten,
                 qdrant=qd,
                 svc=svc,
-                prefetch_limit=max(over_k, top_k + 1),
+                config=RagConfig(
+                    top_k=cfg.top_k,
+                    prefetch_limit=max(cfg.prefetch_limit, cfg.top_k + 1),
+                    score_threshold=cfg.score_threshold,
+                    freshness_days=cfg.freshness_days,
+                    enable_rerank=cfg.enable_rerank,
+                    enable_hybrid=cfg.enable_hybrid,
+                    enable_query_rewrite=cfg.enable_query_rewrite,
+                    rerank_model=cfg.rerank_model,
+                ),
                 filter_condition=filter_condition,
             )
         except Exception as exc:
@@ -271,14 +350,16 @@ async def enrich_entities_with_similar(
         candidates = [c for c in candidates if str(c.entity_id) != str(eid)]
 
         # Distance threshold (post-filter; hybrid path doesn't take it natively)
-        filtered = [c for c in candidates if c.score is None or c.score >= threshold]
+        filtered = [
+            c for c in candidates if c.score is None or c.score >= cfg.score_threshold
+        ]
         if not filtered and candidates:
             # Keep the top dense candidate if everything got filtered — better
             # than nothing if the threshold is too aggressive.
-            filtered = candidates[: max(top_k, 1)]
+            filtered = candidates[: max(cfg.top_k, 1)]
 
-        # Rerank with Voyage rerank-2-lite over the over-fetched set
-        if settings.RAG_ENABLE_RERANK and len(filtered) > top_k:
+        # Rerank with Voyage rerank model over the over-fetched set
+        if cfg.enable_rerank and len(filtered) > cfg.top_k:
             try:
                 docs = [
                     c.payload.get("profile_summary") or _profile_to_text(c.payload)
@@ -287,14 +368,14 @@ async def enrich_entities_with_similar(
                 order = await rerank.rerank(
                     query=rewritten,
                     documents=docs,
-                    top_n=top_k,
+                    top_n=cfg.top_k,
                 )
                 filtered = [filtered[i] for i, _ in order]
             except Exception as exc:
                 logger.debug("[RAG] rerank failed (keeping dense order): %s", exc)
-                filtered = filtered[:top_k]
+                filtered = filtered[: cfg.top_k]
         else:
-            filtered = filtered[:top_k]
+            filtered = filtered[: cfg.top_k]
 
         similar: list[dict] = []
         for r in filtered:

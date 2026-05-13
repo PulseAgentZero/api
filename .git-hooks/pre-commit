@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+set -eu
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+REGEX='^(((feature|fix|eng|chore|bugfix|hotfix)/[A-Za-z0-9._-]+)|dev|main)$'
+
+if ! printf '%s' "$BRANCH" | grep -Eq "$REGEX"; then
+  echo "Commit rejected: branch '$BRANCH' does not match '$REGEX'" >&2
+  exit 1
+fi
+
+STAGED_PY_FILES="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.py$' || true)"
+
+if [ -n "$STAGED_PY_FILES" ]; then
+  echo "Running Python syntax checks on staged files..."
+  printf '%s\n' "$STAGED_PY_FILES" | while IFS= read -r file; do
+    [ -f "$file" ] && python -m py_compile "$file"
+  done
+fi
+
+echo "Running unit tests..."
+python -m pytest -q tests/unit
