@@ -17,7 +17,7 @@ from app.services.entity_reads import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/entities", tags=["entities"])
+router = APIRouter(prefix="/entities", tags=["Entities"])
 
 
 @router.get("")

@@ -1,3 +1,4 @@
+from app.infrastructure.database.models.analytics_export import AnalyticsExport
 from app.infrastructure.database.models.agent_conversation import AgentConversation
 from app.infrastructure.database.models.agent_memory import AgentMemory
 from app.infrastructure.database.models.alert_event import AlertEvent
@@ -22,6 +23,7 @@ from app.infrastructure.database.models.user import User
 from app.infrastructure.database.models.webhook_delivery import WebhookDelivery
 
 __all__ = [
+    "AnalyticsExport",
     "AgentConversation",
     "AgentMemory",
     "AlertEvent",

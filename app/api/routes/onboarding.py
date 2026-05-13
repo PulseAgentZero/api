@@ -38,7 +38,7 @@ from app.api.routes.connections import _assert_live, _connection_to_response, _m
 from app.api.routes.schema_mappings import _mapping_to_response, _validate_mapping_payload
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/onboarding", tags=["onboarding"])
+router = APIRouter(prefix="/onboarding", tags=["Onboarding"])
 
 
 @router.put("/context")

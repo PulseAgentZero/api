@@ -26,7 +26,7 @@ from app.infrastructure.database.session import get_db
 from app.services.pipeline_trigger import claim_and_trigger_pipeline, serialize_pipeline_run
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/pipeline", tags=["pipeline"])
+router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
 
 
 class TriggerBody(BaseModel):
@@ -164,13 +164,30 @@ async def stream_pipeline_run(
     if run is None or run.org_id != current_user.org_id:
         raise not_found("Pipeline run not found")
 
+    terminal = ("succeeded", "failed", "cancelled")
+
     async def gen():
-        if run.status in ("succeeded", "failed", "cancelled"):
-            yield f"event: done\ndata: {json.dumps({'status': run.status})}\n\n"
-            return
-        yield 'event: stage_start\ndata: {"stage":"wait","message":"Progress stream placeholder"}\n\n'
-        await asyncio.sleep(0.5)
-        yield f"event: done\ndata: {json.dumps({'status': run.status})}\n\n"
+        last_sig: tuple[str | None, int] | None = None
+        while True:
+            await asyncio.sleep(0.75)
+            await db.expire_all()
+            fresh = await db.get(PipelineRun, rid)
+            if fresh is None or fresh.org_id != current_user.org_id:
+                yield f"event: error\ndata: {json.dumps({'error': 'run_not_found'})}\n\n"
+                return
+            if fresh.status in terminal:
+                yield f"event: done\ndata: {json.dumps({'status': fresh.status, 'current_step': fresh.current_step})}\n\n"
+                return
+            sm = fresh.step_metrics or []
+            sig = (fresh.current_step, len(sm))
+            if sig != last_sig:
+                last_sig = sig
+                payload = {
+                    "current_step": fresh.current_step,
+                    "step_count": len(sm),
+                    "last_step": sm[-1] if sm else None,
+                }
+                yield f"event: progress\ndata: {json.dumps(payload)}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

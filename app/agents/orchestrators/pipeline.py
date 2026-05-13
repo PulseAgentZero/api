@@ -277,6 +277,19 @@ class PipelineOrchestrator:
             state=state,
         )
 
+        if not state.get("error"):
+            try:
+                from app.services.alert_evaluation import evaluate_alerts_after_pipeline
+
+                await evaluate_alerts_after_pipeline(self._session, org_id, run.id)
+                await self._session.commit()
+            except Exception as e:
+                logger.warning("[Pipeline] Alert evaluation failed: %s", e)
+                try:
+                    await self._session.rollback()
+                except Exception:
+                    pass
+
         risk_summary = state.get("risk_summary", {})
         rec_stats = state.get("recommendation_stats", {})
         logger.info(

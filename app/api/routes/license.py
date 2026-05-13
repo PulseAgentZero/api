@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 import jwt
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
@@ -25,6 +26,17 @@ from app.services.self_hosted_license import resolve_self_hosted_entitlements
 router = APIRouter(prefix="/license", tags=["License"])
 
 
+async def _active_seat_count(db: AsyncSession, org_id: UUID) -> int:
+    return int(
+        await db.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(User.org_id == org_id, User.is_active.is_(True))
+        )
+        or 0
+    )
+
+
 def _cloud_404() -> None:
     if settings.DEPLOYMENT_MODE != "self_hosted":
         raise not_found("Not found")
@@ -39,6 +51,7 @@ async def get_license(
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
     ent = await resolve_self_hosted_entitlements(db, current_user.org_id)
+    seat_used = await _active_seat_count(db, current_user.org_id)
     if row is None:
         return {
             "plan": "free",
@@ -47,6 +60,7 @@ async def get_license(
             "locked": False,
             "lock_reason": None,
             "validation_cached_until": None,
+            "seat_used": seat_used,
         }
     return {
         "plan": row.plan,
@@ -54,7 +68,7 @@ async def get_license(
         "effective_plan": ent.plan,
         "effective_features": ent.features,
         "seat_limit": row.seat_limit,
-        "seat_used": 0,
+        "seat_used": seat_used,
         "expires_at": row.expires_at.isoformat() if row.expires_at else None,
         "last_validated_at": row.last_validated_at.isoformat() if row.last_validated_at else None,
         "validation_cached_until": row.validation_cached_until.isoformat()
@@ -157,6 +171,17 @@ async def activate_license(
     org = await db.get(Organization, current_user.org_id)
     if org:
         org.plan = str(plan or "pro")
+    from app.infrastructure.audit import log_audit
+
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="license.activated",
+        resource="license_key",
+        resource_id=row.id,
+        metadata={"plan": str(plan or "pro")},
+    )
     await db.commit()
     return {
         "plan": plan,

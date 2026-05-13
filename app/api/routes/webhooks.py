@@ -68,4 +68,10 @@ async def retry_delivery(
         from app.api.errors import bad_request
 
         raise bad_request("BAD_REQUEST", "Delivery is not in failed status")
-    return {"message": "Retry queued"}
+    from app.services.webhook_dispatch import execute_pending_delivery
+
+    d.status = "pending"
+    d.next_retry_at = None
+    await execute_pending_delivery(db, d)
+    await db.commit()
+    return {"message": "Retry completed", "status": d.status, "attempts": d.attempts}

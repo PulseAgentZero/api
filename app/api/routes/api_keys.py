@@ -16,6 +16,7 @@ from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.dependencies.plan_gate import require_feature
 from app.api.errors import not_found
+from app.infrastructure.audit import log_audit
 from app.infrastructure.database.models.api_key import ApiKey
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.session import get_db
@@ -79,6 +80,16 @@ async def create_api_key(
         expires_at=body.expires_at,
     )
     db.add(row)
+    await db.flush()
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="api_key.created",
+        resource="api_key",
+        resource_id=row.id,
+        metadata={"name": body.name, "scope": body.scope},
+    )
     await db.commit()
     await db.refresh(row)
     return {
@@ -103,4 +114,13 @@ async def revoke_api_key(
     if not row or row.org_id != current_user.org_id:
         raise not_found()
     row.revoked_at = datetime.now(timezone.utc)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="api_key.revoked",
+        resource="api_key",
+        resource_id=key_id,
+        metadata={"name": row.name},
+    )
     await db.commit()

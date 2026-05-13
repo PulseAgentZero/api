@@ -140,6 +140,7 @@ _internal_tags = [
     {"name": "Schema Mappings", "description": "Map entity tables, signal columns, and risk config"},
     {"name": "Onboarding",      "description": "Step-by-step setup wizard"},
     {"name": "Pipeline",        "description": "Trigger and monitor AI intelligence pipeline runs"},
+    {"name": "Agent",           "description": "Dashboard conversational AI over org intelligence"},
     {"name": "Dashboard",       "description": "High-level org overview and KPIs"},
     {"name": "Entities",        "description": "Browse and inspect profiled entities"},
     {"name": "Recommendations", "description": "AI-generated recommendations and actions"},
@@ -151,6 +152,7 @@ _internal_tags = [
     {"name": "License",         "description": "Self-hosted license activation (self-hosted only)"},
     {"name": "Settings",        "description": "LLM key management (self-hosted only)"},
     {"name": "Audit Logs",      "description": "Immutable audit trail (Pro only)"},
+    {"name": "System",          "description": "Service health and readiness"},
 ]
 
 app = FastAPI(

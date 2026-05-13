@@ -14,7 +14,7 @@ from app.infrastructure.database.repositories.recommendation_repository import (
 from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
 @router.get("/overview")

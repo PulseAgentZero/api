@@ -19,7 +19,7 @@ from app.infrastructure.database.session import get_db
 from app.services.agent_service import run as run_agent
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/agent", tags=["agent"])
+router = APIRouter(prefix="/agent", tags=["Agent"])
 
 
 def _parse_uuid(value: str, field_name: str) -> UUID:

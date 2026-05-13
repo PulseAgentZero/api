@@ -18,7 +18,7 @@ from app.infrastructure.database.repositories.recommendation_repository import (
 from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/recommendations", tags=["recommendations"])
+router = APIRouter(prefix="/recommendations", tags=["Recommendations"])
 
 
 def _parse_uuid(value: str, field_name: str) -> UUID:

@@ -30,7 +30,7 @@ from app.infrastructure.database.repositories.schema_mapping_repository import S
 from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/connections", tags=["connections"])
+router = APIRouter(prefix="/connections", tags=["Connections"])
 
 
 def _parse_uuid(value: str, field_name: str) -> UUID:

@@ -18,6 +18,7 @@ from app.api.schemas.user import (
     UpdateUserRoleRequest,
     UserResponse,
 )
+from app.infrastructure.audit import log_audit
 from app.infrastructure.database.models.invitation import Invitation
 from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.user import User
@@ -26,7 +27,7 @@ from app.infrastructure.database.session import get_db
 from app.infrastructure.email import send_invitation_email
 from app.infrastructure.redis import tokens as redis_tokens
 
-router = APIRouter(prefix="/users", tags=["users"])
+router = APIRouter(prefix="/users", tags=["Users"])
 
 
 def _parse_uuid(value: str, field_name: str) -> UUID:
@@ -127,6 +128,16 @@ async def invite_user(
         expires_at=exp,
     )
     db.add(inv)
+    await db.flush()
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="user.invited",
+        resource="invitation",
+        resource_id=inv.id,
+        metadata={"email": inv.email, "role": inv.role},
+    )
     await db.commit()
     await db.refresh(inv)
     org = await db.get(Organization, current_user.org_id)

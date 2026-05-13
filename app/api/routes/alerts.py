@@ -228,10 +228,15 @@ async def test_channel(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    row = await db.get(NotificationChannel, channel_id)
-    if not row or row.org_id != current_user.org_id:
-        raise not_found()
-    return {"success": True, "message": "Test notification sent"}
+    from app.api.errors import bad_request, not_found
+    from app.services.webhook_dispatch import send_channel_test
+
+    ok, msg = await send_channel_test(db, org_id=current_user.org_id, channel_id=channel_id)
+    if not ok:
+        if "not found" in msg.lower():
+            raise not_found()
+        raise bad_request("WEBHOOK_TEST_FAILED", msg)
+    return {"success": True, "message": msg}
 
 
 @router.get("/events")
