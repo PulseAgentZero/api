@@ -1,7 +1,15 @@
 #!/usr/bin/env sh
 set -eu
 
-PYTHON="/opt/anaconda3/envs/datathon/bin/python"
+# Try active conda env, then project conda env datathon, then PATH
+if [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    PYTHON="$CONDA_PREFIX/bin/python"
+else
+    for dir in /opt/anaconda3 /opt/homebrew/anaconda3 ~/anaconda3 ~/miniconda3 ~/miniforge3; do
+        [ -x "$dir/envs/datathon/bin/python" ] && { PYTHON="$dir/envs/datathon/bin/python"; break; }
+    done
+fi
+PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 REGEX='^(((feature|fix|eng|chore|bugfix|hotfix)/[A-Za-z0-9._-]+)|dev|main)$'
