@@ -33,6 +33,13 @@ class PipelineState(TypedDict, total=False):
     entity_profiles: list[dict]     # per-entity behavioural profiles
     profile_stats: dict             # aggregate stats across all entities
 
+    # Model Training Agent output
+    target_column: Optional[str]        # discovered or mapped target variable
+    ml_available: bool                  # whether ML scoring is available
+    model_metrics: dict                 # accuracy, f1, auc_roc, etc.
+    feature_importances: list[dict]     # [{feature, importance}] sorted desc
+    ml_scored_entities: list[dict]      # entities scored by ML model
+
     # Risk Scoring Agent output
     scored_entities: list[dict]     # entities with risk_score, risk_tier, risk_narrative
     risk_summary: dict              # tier breakdown, key findings

@@ -130,6 +130,7 @@ async def save_schema_mapping(
         timestamp_col=body.timestamp_col,
         risk_config=body.risk_config,
         raw_schema=body.raw_schema,
+        target_column=body.target_column,
     )
     await db.commit()
     return OnboardingSchemaMappingResponse(schema_mapping=_mapping_to_response(mapping))

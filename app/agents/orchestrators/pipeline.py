@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.agents.state import PipelineState
 from app.agents.workflows.schema_intelligence_agent import SchemaIntelligenceAgent
 from app.agents.workflows.profiling_agent import ProfilingAgent
+from app.agents.workflows.model_training_agent import ModelTrainingAgent
 from app.agents.workflows.risk_scoring_agent import RiskScoringAgent
 from app.agents.workflows.recommendation_agent import RecommendationAgent
 from app.infrastructure.crypto import decrypt_dsn
@@ -41,7 +42,7 @@ from app.infrastructure.database.repositories.pipeline_run_repository import (
 logger = logging.getLogger(__name__)
 
 # Steps that can fail without aborting the entire pipeline
-_NON_FATAL_STEPS = {"schema_intelligence"}
+_NON_FATAL_STEPS = {"schema_intelligence", "model_training"}
 
 # Max retry attempts per step
 _STEP_MAX_RETRIES = 2
@@ -128,6 +129,7 @@ class PipelineOrchestrator:
         pipeline = [
             ("schema_intelligence", SchemaIntelligenceAgent()),
             ("profiling", ProfilingAgent()),
+            ("model_training", ModelTrainingAgent()),
             ("risk_scoring", RiskScoringAgent()),
             ("recommendation", RecommendationAgent()),
         ]
@@ -439,6 +441,13 @@ class PipelineOrchestrator:
             "risk_summary": {},
             "recommendations": [],
             "recommendation_stats": {},
+            # Model Training Agent defaults
+            "target_column": getattr(mapping, "target_column", None),
+            "ml_available": False,
+            "model_metrics": {},
+            "feature_importances": [],
+            "ml_scored_entities": [],
+            # Control flow
             "current_step": "initializing",
             "error": None,
             "reasoning_log": [],

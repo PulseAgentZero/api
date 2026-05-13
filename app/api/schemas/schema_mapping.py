@@ -13,6 +13,7 @@ class CreateSchemaMappingRequest(BaseModel):
     timestamp_col: str | None = None
     risk_config: dict | None = None
     raw_schema: dict | None = None
+    target_column: str | None = None
 
 
 class UpdateSchemaMappingRequest(BaseModel):
@@ -23,6 +24,7 @@ class UpdateSchemaMappingRequest(BaseModel):
     timestamp_col: str | None = None
     risk_config: dict | None = None
     raw_schema: dict | None = None
+    target_column: str | None = None
 
 
 class SchemaMappingResponse(BaseModel):
@@ -36,4 +38,5 @@ class SchemaMappingResponse(BaseModel):
     timestamp_col: str | None
     risk_config: dict | None
     raw_schema: dict | None
+    target_column: str | None
     created_at: datetime

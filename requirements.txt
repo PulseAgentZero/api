@@ -23,3 +23,5 @@ qdrant-client==1.15.1
 aiohttp==3.13.2
 anthropic==0.101.0
 apscheduler==3.11.2
+pandas>=2.2.0
+scikit-learn==1.7.2

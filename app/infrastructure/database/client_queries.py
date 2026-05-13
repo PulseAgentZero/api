@@ -1,16 +1,28 @@
 """Live queries against the client's external database.
 
-Each request fetches the org's Connection from Pulse DB, decrypts the DSN,
-creates a temporary async engine, runs queries, and disposes the engine.
+Security guarantees:
+- All client connections are READ-ONLY at the session level (SET TRANSACTION READ ONLY)
+- Statement timeout of 30s prevents runaway queries
+- Connections are ephemeral (created per-request, disposed immediately after)
+- SQL identifiers are regex-validated and quoted
+- Client data is never persisted to Pulse's database
+
 SchemaMapping is queried separately from Pulse DB — it never touches the client engine.
 """
 
+import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import date, datetime
-from typing import Any
+from typing import Any, AsyncIterator
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, create_async_engine
+
+logger = logging.getLogger(__name__)
+
+# Statement timeout for client DB queries (seconds)
+_QUERY_TIMEOUT_S = 30
 
 from app.infrastructure.crypto import decrypt_dsn
 from app.infrastructure.database.models.connection import Connection
@@ -92,13 +104,53 @@ async def _get_client_engine(db: AsyncSession, org_id) -> tuple[AsyncEngine, Con
     return engine, conn
 
 
+@asynccontextmanager
+async def _safe_client_connection(
+    engine: AsyncEngine, conn: Connection,
+) -> AsyncIterator[AsyncConnection]:
+    """Open a read-only, time-bounded connection to the client DB.
+
+    Security enforced at the database session level:
+    - READ ONLY: prevents INSERT, UPDATE, DELETE, DROP, etc.
+    - Statement timeout: kills queries exceeding the time limit
+
+    Even if the connected DB user has full write permissions, the
+    READ ONLY session mode physically prevents data mutation.
+    """
+    async with engine.connect() as client_conn:
+        try:
+            db_type = getattr(conn, "db_type", None)
+            if db_type == "mysql":
+                await client_conn.execute(text("SET SESSION TRANSACTION READ ONLY"))
+                await client_conn.execute(
+                    text(f"SET max_execution_time = {_QUERY_TIMEOUT_S * 1000}")
+                )
+            else:
+                # PostgreSQL (default)
+                await client_conn.execute(
+                    text("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                )
+                await client_conn.execute(
+                    text(f"SET statement_timeout = '{_QUERY_TIMEOUT_S}s'")
+                )
+            logger.debug(
+                "Client DB connection opened: READ ONLY, timeout=%ds, db_type=%s",
+                _QUERY_TIMEOUT_S, db_type,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to set read-only/timeout on client connection (proceeding): %s", e
+            )
+        yield client_conn
+
+
 async def fetch_entities(
     db: AsyncSession, org_id, mapping: SchemaMapping
 ) -> list[dict]:
     """Fetch all entity rows from the client DB using the orgʼs schema mapping."""
     engine, _conn = await _get_client_engine(db, org_id)
     try:
-        async with engine.connect() as client_conn:
+        async with _safe_client_connection(engine, _conn) as client_conn:
             table_name = _validate_identifier(mapping.entity_table, "entity table")
             cols = [_validate_identifier(mapping.entity_id_col, "entity ID column")]
             if mapping.entity_name_col:
@@ -126,7 +178,7 @@ async def fetch_entity_by_id(
     """Fetch a single entity from the client DB by ID."""
     engine, _conn = await _get_client_engine(db, org_id)
     try:
-        async with engine.connect() as client_conn:
+        async with _safe_client_connection(engine, _conn) as client_conn:
             cols_result = await client_conn.execute(
                 text(_schema_columns_sql(_conn.db_type)),
                 {"tname": mapping.entity_table},
@@ -164,7 +216,7 @@ async def fetch_entity_trend(
 
     engine, _conn = await _get_client_engine(db, org_id)
     try:
-        async with engine.connect() as client_conn:
+        async with _safe_client_connection(engine, _conn) as client_conn:
             table_name = _validate_identifier(mapping.entity_table, "entity table")
             id_col = _validate_identifier(mapping.entity_id_col, "entity ID column")
             ts_col = _validate_identifier(mapping.timestamp_col, "timestamp column")

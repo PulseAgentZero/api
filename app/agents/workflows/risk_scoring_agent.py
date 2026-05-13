@@ -43,41 +43,130 @@ class RiskScoringAgent(BaseAgent):
     async def run(
         self, state: PipelineState, db: AsyncSession
     ) -> PipelineState:
-        """Execute risk scoring with deterministic scores and LLM narratives."""
+        """Execute risk scoring with ML predictions or deterministic fallback."""
 
         org_id = UUID(state["org_id"])
+        use_ml = state.get("ml_available") and state.get("ml_scored_entities")
 
-        # Step 1: Get deterministic risk scores from the existing compute_risk engine
-        try:
-            mapping = await get_schema_mapping(db, org_id)
-            entities = await fetch_entities(db, org_id, mapping)
-            scored = compute_risk(entities, mapping.signal_columns, mapping.risk_config)
-        except Exception as e:
-            logger.error("[RiskScoringAgent] Failed to compute risk: %s", e)
-            state["scored_entities"] = []
-            state["risk_summary"] = {"error": str(e)}
-            state["error"] = f"Risk scoring failed: {e}"
-            state["reasoning_log"].extend(self._reasoning_entries)
-            return state
+        if use_ml:
+            # ── ML-first path: use predictions from Model Training Agent ──
+            logger.info("[RiskScoringAgent] Using ML-predicted risk scores")
+            ml_scored = state["ml_scored_entities"]
 
-        # Step 2: Build scored entity list with signal values
-        id_col = mapping.entity_id_col
-        name_col = mapping.entity_name_col
-        scored_entities = []
-        for entity in scored:
-            scored_entities.append({
-                "entity_id": str(entity[id_col]),
-                "entity_name": str(entity.get(name_col)) if name_col and entity.get(name_col) else None,
-                "risk_score": entity["risk_score"],
-                "risk_tier": entity["risk_tier"],
-                "signal_values": entity.get("signals", {}),
-                "risk_narrative": None,
-            })
+            # ── Validate ML scores before using them ──
+            invalid_scores = [
+                e for e in ml_scored
+                if not isinstance(e.get("risk_score"), (int, float))
+                or e["risk_score"] < 0.0 or e["risk_score"] > 1.0
+            ]
+            if invalid_scores:
+                logger.warning(
+                    "[RiskScoringAgent] %d ML scores outside [0,1] range — "
+                    "falling back to rule-based scoring",
+                    len(invalid_scores),
+                )
+                use_ml = False
 
-        # Step 3: Sort by risk score descending
+        if use_ml:
+            ml_scored = state["ml_scored_entities"]
+
+            # Fetch entity names and signal values for display/narratives
+            try:
+                mapping = await get_schema_mapping(db, org_id)
+                entities = await fetch_entities(db, org_id, mapping)
+                id_col = mapping.entity_id_col
+                name_col = mapping.entity_name_col
+                name_lookup = {
+                    str(e[id_col]): str(e.get(name_col)) if name_col and e.get(name_col) else None
+                    for e in entities
+                }
+                signal_lookup = {}
+                for e in entities:
+                    eid = str(e[id_col])
+                    signal_lookup[eid] = {
+                        sig_label: e.get(col_name)
+                        for sig_label, col_name in (mapping.signal_columns or {}).items()
+                        if col_name in e
+                    }
+            except Exception as e:
+                logger.warning("[RiskScoringAgent] Failed to fetch entity names: %s", e)
+                name_lookup = {}
+                signal_lookup = {}
+
+            # ── Validate entity coverage ──
+            if entities:
+                coverage = len(ml_scored) / len(entities)
+                if coverage < 0.5:
+                    logger.warning(
+                        "[RiskScoringAgent] ML scored only %d of %d entities (%.1f%%) — "
+                        "falling back to rule-based scoring for better coverage",
+                        len(ml_scored), len(entities), coverage * 100,
+                    )
+                    use_ml = False
+
+        if use_ml:
+            scored_entities = []
+            for ml_entity in ml_scored:
+                eid = str(ml_entity["entity_id"])
+                score = float(ml_entity["risk_score"])
+                # Clamp score and RE-DERIVE tier (single source of truth)
+                score = max(0.0, min(1.0, score))
+
+                if score >= 0.8:
+                    tier = "critical"
+                elif score >= 0.6:
+                    tier = "high"
+                elif score >= 0.4:
+                    tier = "medium"
+                else:
+                    tier = "low"
+
+                scored_entities.append({
+                    "entity_id": eid,
+                    "entity_name": name_lookup.get(eid),
+                    "risk_score": round(score, 4),
+                    "risk_tier": tier,
+                    "signal_values": signal_lookup.get(eid, {}),
+                    "risk_narrative": None,
+                    "scoring_method": "ml",
+                })
+        else:
+            # ── Deterministic fallback: use compute_risk() ──
+            if state.get("ml_available"):
+                logger.info("[RiskScoringAgent] ML validation failed — falling back to rule-based scoring")
+            else:
+                logger.info("[RiskScoringAgent] Using deterministic rule-based scoring")
+
+            try:
+                mapping = await get_schema_mapping(db, org_id)
+                entities = await fetch_entities(db, org_id, mapping)
+                scored = compute_risk(entities, mapping.signal_columns, mapping.risk_config)
+            except Exception as e:
+                logger.error("[RiskScoringAgent] Failed to compute risk: %s", e)
+                state["scored_entities"] = []
+                state["risk_summary"] = {"error": str(e)}
+                state["error"] = f"Risk scoring failed: {e}"
+                state["reasoning_log"].extend(self._reasoning_entries)
+                return state
+
+            id_col = mapping.entity_id_col
+            name_col = mapping.entity_name_col
+            scored_entities = []
+            for entity in scored:
+                scored_entities.append({
+                    "entity_id": str(entity[id_col]),
+                    "entity_name": str(entity.get(name_col)) if name_col and entity.get(name_col) else None,
+                    "risk_score": entity["risk_score"],
+                    "risk_tier": entity["risk_tier"],
+                    "signal_values": entity.get("signals", {}),
+                    "risk_narrative": None,
+                    "scoring_method": "rule_based",
+                })
+
+        # Sort by risk score descending
         scored_entities.sort(key=lambda e: e["risk_score"], reverse=True)
 
-        # Step 4: Generate LLM narratives for elevated entities (risk_score >= 0.6)
+        # Generate LLM narratives for elevated entities (risk_score >= 0.6)
         elevated = [e for e in scored_entities if e["risk_score"] >= 0.6]
 
         narrative_cap = 50
@@ -105,6 +194,13 @@ class RiskScoringAgent(BaseAgent):
                 _augment_with_profile(e, profile_index.get(e["entity_id"]))
                 for e in narratives_target
             ]
+
+            # When ML is active, enrich narrative context with feature importances
+            if use_ml and state.get("feature_importances"):
+                for p in payload:
+                    p["ml_feature_importances"] = state["feature_importances"][:10]
+                    p["scoring_method"] = "ml"
+
             try:
                 narratives = await self._generate_narratives(state, payload)
                 narrative_map = {n["entity_id"]: n.get("risk_narrative", "") for n in narratives}
@@ -115,18 +211,24 @@ class RiskScoringAgent(BaseAgent):
                 logger.warning("[RiskScoringAgent] Narrative generation failed (non-fatal): %s", e)
                 # Non-fatal — scores are still valid without narratives
 
-        # Step 5: Build risk summary
+        # Build risk summary
         tier_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for entity in scored_entities:
             tier_counts[entity["risk_tier"]] += 1
 
         # Find most common risk drivers across elevated entities
-        signal_freq: dict[str, int] = {}
-        for entity in elevated:
-            for signal, value in entity.get("signal_values", {}).items():
-                if isinstance(value, (int, float)) and value > 0:
-                    signal_freq[signal] = signal_freq.get(signal, 0) + 1
-        top_signals = sorted(signal_freq, key=lambda k: signal_freq[k], reverse=True)[:5]
+        if use_ml and state.get("feature_importances"):
+            top_signals = [fi["feature"] for fi in state["feature_importances"][:5]]
+        else:
+            signal_freq: dict[str, int] = {}
+            for entity in elevated:
+                for signal, value in entity.get("signal_values", {}).items():
+                    if isinstance(value, (int, float)) and value > 0:
+                        signal_freq[signal] = signal_freq.get(signal, 0) + 1
+            top_signals = sorted(signal_freq, key=lambda k: signal_freq[k], reverse=True)[:5]
+
+        scoring_method = "ml" if use_ml else "rule_based"
+        model_accuracy = state.get("model_metrics", {}).get("accuracy")
 
         state["scored_entities"] = scored_entities
         state["risk_summary"] = {
@@ -136,17 +238,20 @@ class RiskScoringAgent(BaseAgent):
             "medium_count": tier_counts["medium"],
             "low_count": tier_counts["low"],
             "top_risk_signals": top_signals,
+            "scoring_method": scoring_method,
+            "model_accuracy": model_accuracy,
             "key_findings": (
                 f"{tier_counts['critical']} critical and {tier_counts['high']} high-risk "
-                f"{state.get('entity_label', 'entities')} identified. "
+                f"{state.get('entity_label', 'entities')} identified"
+                f"{f' using ML model (accuracy: {model_accuracy:.1%})' if model_accuracy else ' using rule-based scoring'}. "
                 f"Top risk drivers: {', '.join(top_signals[:3]) if top_signals else 'N/A'}."
             ),
         }
         state["reasoning_log"].extend(self._reasoning_entries)
 
         logger.info(
-            "[RiskScoringAgent] Complete: %d scored, %d critical, %d high",
-            len(scored_entities), tier_counts["critical"], tier_counts["high"],
+            "[RiskScoringAgent] Complete (%s): %d scored, %d critical, %d high",
+            scoring_method, len(scored_entities), tier_counts["critical"], tier_counts["high"],
         )
         return state
 
