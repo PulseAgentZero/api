@@ -1,11 +1,14 @@
 """Live queries against the client's external database.
 
-Security guarantees:
-- All client connections are READ-ONLY at the session level (SET TRANSACTION READ ONLY)
+Security guarantees (when the client database cooperates):
+- Session is READ-ONLY where supported (SET TRANSACTION READ ONLY / MySQL equivalent)
 - Statement timeout of 30s prevents runaway queries
 - Connections are ephemeral (created per-request, disposed immediately after)
 - SQL identifiers are regex-validated and quoted
 - Client data is never persisted to Pulse's database
+
+If read-only or timeout session variables cannot be applied, the connection is
+refused with :class:`ClientDBError` rather than proceeding without those guards.
 
 SchemaMapping is queried separately from Pulse DB — it never touches the client engine.
 """
@@ -16,7 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Any, AsyncIterator
 
-from sqlalchemy import select, text
+from sqlalchemy import case, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, create_async_engine
 
 logger = logging.getLogger(__name__)
@@ -24,32 +27,25 @@ logger = logging.getLogger(__name__)
 # Statement timeout for client DB queries (seconds)
 _QUERY_TIMEOUT_S = 30
 
+# Hard cap on rows returned from a single entity-table scan (pipeline / services).
+_MAX_ENTITY_FETCH_ROWS = 50_000
+
 from app.infrastructure.crypto import decrypt_dsn
+from app.infrastructure.connectors.payload import parse_pulse_api_payload
 from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.models.schema_mapping import SchemaMapping
+from app.infrastructure.database.sql_connect import (
+    connect_args_for_async_url,
+    sync_dsn_to_async_sqlalchemy_url,
+)
 
 
 def _to_async_url(dsn: str) -> str:
-    if dsn.startswith("postgresql://"):
-        return dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if dsn.startswith("postgres://"):
-        return dsn.replace("postgres://", "postgresql+asyncpg://", 1)
-    if dsn.startswith("mysql://"):
-        return dsn.replace("mysql://", "mysql+aiomysql://", 1)
-    return dsn
+    return sync_dsn_to_async_sqlalchemy_url(dsn)
 
 
 def _connect_args(url: str, sslmode: str | None = None) -> dict:
-    args: dict = {}
-    if url.startswith("mysql+aiomysql://"):
-        args["connect_timeout"] = 10
-        if sslmode and sslmode != "prefer":
-            args["ssl"] = {"ssl": True}
-    else:
-        args["timeout"] = 10
-        if sslmode and sslmode != "prefer":
-            args["ssl"] = sslmode
-    return args
+    return connect_args_for_async_url(url, sslmode)
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -61,23 +57,43 @@ def _validate_identifier(value: str | None, label: str) -> str:
     return value
 
 
+def _norm_client_db_type(db_type: str | None) -> str | None:
+    if db_type == "postgres":
+        return "postgresql"
+    return db_type
+
+
 def _quote_identifier(value: str, db_type: str | None) -> str:
     value = _validate_identifier(value, "SQL identifier")
-    if db_type == "mysql":
+    dt = _norm_client_db_type(db_type)
+    if dt == "mysql":
         return f"`{value}`"
+    if dt == "mssql":
+        return f"[{value}]"
     return f'"{value}"'
 
 
 def _schema_columns_sql(db_type: str | None) -> str:
-    if db_type == "mysql":
+    dt = _norm_client_db_type(db_type)
+    if dt == "mysql":
         return (
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = DATABASE() AND table_name = :tname "
             "ORDER BY ordinal_position"
         )
+    if dt == "sqlite":
+        return (
+            "SELECT name AS column_name FROM pragma_table_info(:tname) ORDER BY cid"
+        )
+    if dt == "mssql":
+        return (
+            "SELECT COLUMN_NAME AS column_name FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = SCHEMA_NAME() AND TABLE_NAME = :tname "
+            "ORDER BY ORDINAL_POSITION"
+        )
     return (
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = :tname "
+        "WHERE table_schema = current_schema() AND table_name = :tname "
         "ORDER BY ordinal_position"
     )
 
@@ -98,14 +114,31 @@ async def get_schema_mapping(db: AsyncSession, org_id) -> SchemaMapping:
 
 
 async def _get_client_engine(db: AsyncSession, org_id) -> tuple[AsyncEngine, Connection]:
-    """Create a temporary async engine pointed at the org's client DB."""
+    """Create a temporary async engine pointed at the org's client DB.
+
+    When multiple connections exist, prefer a non-deleted row with ``status ==
+    "active"``, then the most recently updated.
+    """
     result = await db.execute(
-        select(Connection).where(Connection.org_id == org_id).limit(1)
+        select(Connection)
+        .where(Connection.org_id == org_id, Connection.deleted_at.is_(None))
+        .order_by(
+            case((Connection.status == "active", 0), else_=1),
+            Connection.updated_at.desc(),
+            Connection.created_at.desc(),
+        )
+        .limit(1)
     )
     conn = result.scalar_one_or_none()
     if not conn:
         raise ClientDBError("No connection configured for this organization")
     dsn = decrypt_dsn(conn.encrypted_dsn)
+    if parse_pulse_api_payload(dsn) is not None:
+        raise ClientDBError(
+            "This org connection is an API or object-store connector. "
+            "Use a SQL database (Postgres, MySQL, SQLite, SQL Server, Redshift) for live SQL entity mapping, "
+            "or upload CSV for file-based workflows."
+        )
     url = _to_async_url(dsn)
     engine = create_async_engine(url, connect_args=_connect_args(url, conn.sslmode))
     return engine, conn
@@ -126,14 +159,23 @@ async def _safe_client_connection(
     """
     async with engine.connect() as client_conn:
         try:
-            db_type = getattr(conn, "db_type", None)
+            db_type = _norm_client_db_type(getattr(conn, "db_type", None)) or "postgresql"
             if db_type == "mysql":
                 await client_conn.execute(text("SET SESSION TRANSACTION READ ONLY"))
                 await client_conn.execute(
                     text(f"SET max_execution_time = {_QUERY_TIMEOUT_S * 1000}")
                 )
+            elif db_type == "mssql":
+                await client_conn.execute(
+                    text(f"SET LOCK_TIMEOUT {int(_QUERY_TIMEOUT_S * 1000)}")
+                )
+            elif db_type == "sqlite":
+                await client_conn.execute(text("PRAGMA query_only = ON"))
+                await client_conn.execute(
+                    text(f"PRAGMA busy_timeout = {int(_QUERY_TIMEOUT_S * 1000)}")
+                )
             else:
-                # PostgreSQL (default)
+                # PostgreSQL, Redshift, and other Postgres-compatible engines
                 await client_conn.execute(
                     text("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
                 )
@@ -145,16 +187,23 @@ async def _safe_client_connection(
                 _QUERY_TIMEOUT_S, db_type,
             )
         except Exception as e:
-            logger.warning(
-                "Failed to set read-only/timeout on client connection (proceeding): %s", e
+            logger.error(
+                "Refusing client DB session: could not enforce read-only or statement timeout: %s",
+                e,
             )
+            raise ClientDBError(
+                "Could not enforce read-only session or statement timeout on the client database"
+            ) from e
         yield client_conn
 
 
 async def fetch_entities(
     db: AsyncSession, org_id, mapping: SchemaMapping
 ) -> list[dict]:
-    """Fetch all entity rows from the client DB using the orgʼs schema mapping."""
+    """Fetch entity rows from the client DB using the org's schema mapping.
+
+    At most :data:`_MAX_ENTITY_FETCH_ROWS` rows are returned per call.
+    """
     engine, _conn = await _get_client_engine(db, org_id)
     try:
         async with _safe_client_connection(engine, _conn) as client_conn:
@@ -168,11 +217,13 @@ async def fetch_entities(
                     cols.append(col_name)
 
             quoted_cols = [_quote_identifier(c, _conn.db_type) for c in cols]
-            sql = (
-                f"SELECT {', '.join(quoted_cols)} "
-                f"FROM {_quote_identifier(table_name, _conn.db_type)}"
-            )
-            result = await client_conn.execute(text(sql))
+            q_table = _quote_identifier(table_name, _conn.db_type)
+            col_list = ", ".join(quoted_cols)
+            if _norm_client_db_type(_conn.db_type) == "mssql":
+                sql = f"SELECT TOP (:lim) {col_list} FROM {q_table}"
+            else:
+                sql = f"SELECT {col_list} FROM {q_table} LIMIT :lim"
+            result = await client_conn.execute(text(sql), {"lim": _MAX_ENTITY_FETCH_ROWS})
             rows = result.all()
             return [dict(zip(cols, row)) for row in rows]
     finally:
@@ -234,13 +285,20 @@ async def fetch_entity_trend(
                     cols.append(col_name)
 
             quoted_cols = [_quote_identifier(c, _conn.db_type) for c in cols]
-            sql = (
-                f"SELECT {', '.join(quoted_cols)} "
-                f"FROM {_quote_identifier(table_name, _conn.db_type)} "
-                f"WHERE {_quote_identifier(id_col, _conn.db_type)} = :eid "
-                f"ORDER BY {_quote_identifier(ts_col, _conn.db_type)} DESC "
-                "LIMIT :limit"
-            )
+            q_table = _quote_identifier(table_name, _conn.db_type)
+            q_id = _quote_identifier(id_col, _conn.db_type)
+            q_ts = _quote_identifier(ts_col, _conn.db_type)
+            col_list = ", ".join(quoted_cols)
+            if _norm_client_db_type(_conn.db_type) == "mssql":
+                sql = (
+                    f"SELECT {col_list} FROM {q_table} WHERE {q_id} = :eid "
+                    f"ORDER BY {q_ts} DESC OFFSET 0 ROWS FETCH NEXT :limit ROWS ONLY"
+                )
+            else:
+                sql = (
+                    f"SELECT {col_list} FROM {q_table} WHERE {q_id} = :eid "
+                    f"ORDER BY {q_ts} DESC LIMIT :limit"
+                )
             result = await client_conn.execute(text(sql), {"eid": entity_id, "limit": limit})
             rows = result.all()
             points = []

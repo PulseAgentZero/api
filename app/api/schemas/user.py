@@ -12,6 +12,7 @@ class UserResponse(BaseModel):
     org_id: UUID
     email: str
     full_name: str
+    profile_image_url: str | None = None
     role: str
     is_active: bool
     is_verified: bool

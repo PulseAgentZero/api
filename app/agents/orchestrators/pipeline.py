@@ -29,9 +29,15 @@ from app.agents.workflows.model_training_agent import ModelTrainingAgent
 from app.agents.workflows.risk_scoring_agent import RiskScoringAgent
 from app.agents.workflows.recommendation_agent import RecommendationAgent
 from app.infrastructure.crypto import decrypt_dsn
+from app.infrastructure.connectors.payload import parse_pulse_api_payload
 from app.infrastructure.database.client_queries import get_schema_mapping
 from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.models.pipeline_run import PipelineRun
+from app.infrastructure.database.sql_connect import (
+    connect_args_for_async_url,
+    is_likely_async_sqlalchemy_url,
+    sync_dsn_to_async_sqlalchemy_url,
+)
 from app.infrastructure.database.repositories.organization_repository import (
     OrganizationRepository,
 )
@@ -52,16 +58,6 @@ _STEP_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_STEP_TIMEOUT_SECONDS", "600"))
 
 # Client DB preflight timeout (must be short to fail fast)
 _PREFLIGHT_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_PREFLIGHT_TIMEOUT_SECONDS", "10"))
-
-
-def _to_async_url(dsn: str) -> str:
-    if dsn.startswith("postgresql://"):
-        return dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if dsn.startswith("postgres://"):
-        return dsn.replace("postgres://", "postgresql+asyncpg://", 1)
-    if dsn.startswith("mysql://"):
-        return dsn.replace("mysql://", "mysql+aiomysql://", 1)
-    return dsn
 
 
 class PipelineOrchestrator:
@@ -413,16 +409,21 @@ class PipelineOrchestrator:
             if not conn:
                 return "No connection configured for this organisation"
             dsn = decrypt_dsn(conn.encrypted_dsn)
+            if parse_pulse_api_payload(dsn) is not None:
+                return (
+                    "Connection is an API or object-store connector; "
+                    "the agent pipeline requires a SQL database connection"
+                )
         except Exception as e:
             return f"Could not load connection: {e}"
 
-        url = _to_async_url(dsn)
-        connect_args = (
-            {"connect_timeout": _PREFLIGHT_TIMEOUT_SECONDS}
-            if url.startswith("mysql+aiomysql://")
-            else {"timeout": _PREFLIGHT_TIMEOUT_SECONDS}
+        url = sync_dsn_to_async_sqlalchemy_url(dsn)
+        if not is_likely_async_sqlalchemy_url(url):
+            return "Connection URL is not supported for SQL pipeline preflight"
+        engine = create_async_engine(
+            url,
+            connect_args=connect_args_for_async_url(url, conn.sslmode),
         )
-        engine = create_async_engine(url, connect_args=connect_args)
         try:
             async with engine.connect() as client_conn:
                 await asyncio.wait_for(

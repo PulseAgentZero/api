@@ -37,6 +37,10 @@ def email_verify_rate(user_id) -> str:
     return f"email_verify_rate:{user_id}"
 
 
+def oauth_google_state(state: str) -> str:
+    return f"oauth_google_state:{state}"
+
+
 def user_sessions_pattern(user_id) -> str:
     """Glob pattern to match all refresh tokens for a user.
     NOTE: refresh tokens are stored as refresh:{sha256(raw)} — we can't

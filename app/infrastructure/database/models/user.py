@@ -29,6 +29,7 @@ class User(Base, UUIDMixin, TimestampMixin):
     role: Mapped[str] = mapped_column(String(50), default="analyst", server_default="analyst")
 
     full_name: Mapped[str] = mapped_column(Text, default="", server_default="")
+    profile_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     auth_provider: Mapped[str] = mapped_column(Text, default="email", server_default="email")

@@ -1,7 +1,8 @@
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UpdateOrgRequest(BaseModel):
@@ -12,6 +13,7 @@ class UpdateOrgRequest(BaseModel):
     goal_label: str | None = None
     timezone: str | None = None
     logo_url: str | None = None
+    tour_guide: dict[str, Any] | None = None
 
 
 class OrgProfileResponse(BaseModel):
@@ -25,6 +27,13 @@ class OrgProfileResponse(BaseModel):
     plan: str | None
     timezone: str | None
     logo_url: str | None
+    tour_guide: dict[str, Any] = Field(default_factory=dict)
     onboarding_done: bool
     created_at: datetime
     updated_at: datetime
+
+
+class AssetUploadResponse(BaseModel):
+    url: str
+    category: str
+    object_key: str | None = None

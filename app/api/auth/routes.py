@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import secrets
+import urllib.parse
 from datetime import datetime, timezone
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
@@ -16,6 +19,8 @@ from app.api.auth.jwt_utils import (
     create_access_token,
     create_refresh_token,
     decode_access_token,
+    parse_uuid_loose,
+    parse_uuid_sub,
 )
 from app.api.auth.passwords import hash_password, verify_password
 from app.api.errors import bad_request, conflict, not_found, unauthorized
@@ -41,6 +46,7 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.session import get_db
 from app.infrastructure.email import send_password_reset_email, send_verification_email
+from app.infrastructure.redis import keys as redis_keys
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis import tokens as redis_tokens
 
@@ -49,6 +55,12 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 async def _issue_tokens(user: User, org_id: UUID) -> tuple[str, str]:
+    """Mint access + refresh tokens.
+
+    When Redis is available, refresh tokens are opaque server-side values
+    (one-time rotation on /auth/refresh). When Redis is unavailable, refresh
+    tokens are signed JWTs (stateless, reusable until expiry) — see CLAUDE.md.
+    """
     access = create_access_token(user.id, org_id, user.role, user.email)
     r = await get_redis()
     if r is not None:
@@ -65,7 +77,9 @@ def _user_dict(u: User) -> dict:
         "full_name": u.full_name,
         "role": u.role,
         "is_verified": u.is_verified,
+        "is_active": u.is_active,
         "org_id": str(u.org_id),
+        "profile_image_url": u.profile_image_url,
     }
 
 
@@ -74,7 +88,11 @@ def _org_dict(o) -> dict:
         "id": str(o.id),
         "name": o.name,
         "slug": o.slug,
+        "industry": o.industry,
+        "plan": o.plan,
         "onboarding_done": o.onboarding_done,
+        "logo_url": o.logo_url,
+        "tour_guide": getattr(o, "tour_guide", None) or {},
     }
 
 
@@ -142,25 +160,46 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> T
         data = await redis_tokens.get_refresh_token(body.refresh_token)
         if not data:
             raise unauthorized("INVALID_TOKEN", "Invalid or expired refresh token")
-        user = await UserRepository(db).get_by_id(UUID(data["user_id"]))
+        uid = parse_uuid_loose(data.get("user_id"))
+        if uid is None:
+            raise unauthorized("INVALID_TOKEN", "Invalid or expired refresh token")
+        user = await UserRepository(db).get_by_id(uid)
         if not user or not user.is_active:
             raise HTTPException(
                 status_code=403,
                 detail={"code": "ACCOUNT_DEACTIVATED", "message": "Account deactivated"},
             )
+        oid = parse_uuid_loose(data.get("org_id"))
+        if oid is not None and oid != user.org_id:
+            raise unauthorized("INVALID_TOKEN", "Refresh token organization mismatch")
         await redis_tokens.delete_refresh_token(body.refresh_token)
         access, new_refresh = await _issue_tokens(user, user.org_id)
-        return TokenResponse(access_token=access, refresh_token=new_refresh)
+        org = await OrganizationRepository(db).get_by_id(user.org_id)
+        return TokenResponse(
+            access_token=access,
+            refresh_token=new_refresh,
+            user=_user_dict(user),
+            org=_org_dict(org) if org else None,
+        )
 
     payload = decode_access_token(body.refresh_token)
     if payload is None or payload.get("type") != "refresh":
         raise unauthorized("INVALID_TOKEN", "Invalid or expired refresh token")
-    user = await UserRepository(db).get_by_id(UUID(payload["sub"]))
+    uid = parse_uuid_sub(payload)
+    if uid is None:
+        raise unauthorized("INVALID_TOKEN", "Invalid or expired refresh token")
+    user = await UserRepository(db).get_by_id(uid)
     if not user:
         raise unauthorized("INVALID_TOKEN", "User not found")
     access = create_access_token(user.id, user.org_id, user.role, user.email)
     new_refresh = create_refresh_token(user.id)
-    return TokenResponse(access_token=access, refresh_token=new_refresh)
+    org = await OrganizationRepository(db).get_by_id(user.org_id)
+    return TokenResponse(
+        access_token=access,
+        refresh_token=new_refresh,
+        user=_user_dict(user),
+        org=_org_dict(org) if org else None,
+    )
 
 
 @router.post("/logout", status_code=204)
@@ -181,7 +220,10 @@ async def verify_email(token: str = Query(...), db: AsyncSession = Depends(get_d
     uid = await redis_tokens.get_email_verify_token(token)
     if not uid:
         raise bad_request("INVALID_TOKEN", "Token expired or not found")
-    user = await UserRepository(db).get_by_id(UUID(uid))
+    user_id = parse_uuid_loose(uid)
+    if user_id is None:
+        raise bad_request("INVALID_TOKEN", "Invalid token")
+    user = await UserRepository(db).get_by_id(user_id)
     if not user:
         raise bad_request("INVALID_TOKEN", "Invalid token")
     if user.is_verified:
@@ -198,7 +240,10 @@ async def resend_verification(current_user: User = Depends(get_current_user)) ->
         raise bad_request("ALREADY_VERIFIED", "User is already verified")
     r = await get_redis()
     if r is None:
-        return {"message": "Verification email sent"}
+        return {
+            "message": "Email verification requires Redis; it is not configured. "
+            "Configure REDIS_URL to send verification emails.",
+        }
     # Rate limit: block if a token was set in the last 60 seconds
     from app.infrastructure.redis.keys import email_verify_rate
     rate_key = email_verify_rate(current_user.id)
@@ -232,7 +277,10 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(
     uid = await redis_tokens.get_pw_reset_token(body.token)
     if not uid:
         raise bad_request("INVALID_TOKEN", "Token expired or not found")
-    user = await UserRepository(db).get_by_id(UUID(uid))
+    user_id = parse_uuid_loose(uid)
+    if user_id is None:
+        raise bad_request("INVALID_TOKEN", "Invalid token")
+    user = await UserRepository(db).get_by_id(user_id)
     if not user:
         raise bad_request("INVALID_TOKEN", "Invalid token")
     user.password_hash = hash_password(body.new_password)
@@ -249,19 +297,133 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(
 
 
 @router.get("/oauth/google")
-async def oauth_google_start(redirect_uri: str | None = None) -> RedirectResponse:
+async def oauth_google_start(redirect_uri: str | None = Query(None)) -> RedirectResponse:
     if not settings.is_google_oauth_configured():
-        raise HTTPException(status_code=501, detail={"code": "NOT_CONFIGURED", "message": "Google OAuth not configured"})
-    raise HTTPException(status_code=501, detail={"code": "NOT_CONFIGURED", "message": "Not implemented"})
+        raise HTTPException(
+            status_code=501,
+            detail={"code": "NOT_CONFIGURED", "message": "Google OAuth not configured"},
+        )
+    r = await get_redis()
+    if r is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "REDIS_REQUIRED", "message": "Redis is required for Google OAuth state"},
+        )
+    state = secrets.token_urlsafe(32)
+    dest = (redirect_uri or settings.FRONTEND_URL).strip() or settings.FRONTEND_URL
+    await r.set(redis_keys.oauth_google_state(state), dest, ex=600)
+    cid = settings.get_google_client_id()
+    redir = settings.GOOGLE_REDIRECT_URI
+    params = urllib.parse.urlencode(
+        {
+            "client_id": cid,
+            "redirect_uri": redir,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+    )
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
 
 
 @router.get("/oauth/google/callback")
-async def oauth_google_callback(code: str = Query(...), state: str | None = None) -> RedirectResponse:
-    raise HTTPException(status_code=501, detail={"code": "NOT_CONFIGURED", "message": "Not implemented"})
+async def oauth_google_callback(
+    code: str = Query(...),
+    state: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> RedirectResponse:
+    if not settings.is_google_oauth_configured():
+        raise HTTPException(status_code=501, detail={"code": "NOT_CONFIGURED", "message": "Google OAuth not configured"})
+    r = await get_redis()
+    if r is None or not state:
+        raise HTTPException(status_code=400, detail={"code": "BAD_REQUEST", "message": "Missing OAuth state"})
+    dest = await r.get(redis_keys.oauth_google_state(state))
+    if not dest:
+        raise bad_request("INVALID_STATE", "OAuth state expired or invalid")
+    await r.delete(redis_keys.oauth_google_state(state))
+    dest = dest.decode() if isinstance(dest, bytes) else str(dest)
+
+    token_url = "https://oauth2.googleapis.com/token"
+    cid = settings.get_google_client_id()
+    sec = settings.get_google_client_secret()
+    redir = settings.GOOGLE_REDIRECT_URI
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        tr = await client.post(
+            token_url,
+            data={
+                "code": code,
+                "client_id": cid,
+                "client_secret": sec,
+                "redirect_uri": redir,
+                "grant_type": "authorization_code",
+            },
+        )
+        if tr.status_code != 200:
+            logger.warning("Google token exchange failed: %s %s", tr.status_code, tr.text[:300])
+            raise bad_request("OAUTH_TOKEN", "Google token exchange failed")
+        tokens = tr.json()
+        g_access = tokens.get("access_token")
+        if not g_access:
+            raise bad_request("OAUTH_TOKEN", "No access token from Google")
+        ui = await client.get(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {g_access}"},
+        )
+        if ui.status_code != 200:
+            raise bad_request("OAUTH_PROFILE", "Failed to load Google profile")
+        info = ui.json()
+    email = (info.get("email") or "").strip().lower()
+    if not email:
+        raise bad_request("OAUTH_EMAIL", "Google did not return an email")
+    sub = str(info.get("sub") or "")
+    picture = (info.get("picture") or "").strip() or None
+    name = (info.get("name") or email.split("@")[0]).strip()
+
+    user = await UserRepository(db).get_by_email(email)
+    if user:
+        user.profile_image_url = picture or user.profile_image_url
+        user.auth_provider = "google"
+        if sub:
+            user.auth_provider_id = sub
+        user.last_login_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(user)
+        access_jwt, refresh_jwt = await _issue_tokens(user, user.org_id)
+    else:
+        org = await OrganizationRepository(db).create(f"{name}'s workspace")
+        user = await UserRepository(db).create(
+            org_id=org.id,
+            email=email,
+            password_hash=None,
+            role="admin",
+        )
+        user.full_name = name
+        user.profile_image_url = picture
+        user.auth_provider = "google"
+        user.auth_provider_id = sub or None
+        user.is_verified = True
+        user.last_login_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(user)
+        await db.refresh(org)
+        access_jwt, refresh_jwt = await _issue_tokens(user, org.id)
+
+    q = urllib.parse.urlencode(
+        {
+            "access_token": access_jwt,
+            "refresh_token": refresh_jwt,
+            "token_type": "bearer",
+        }
+    )
+    join = "&" if "?" in dest else "?"
+    return RedirectResponse(f"{dest}{join}{q}", status_code=status.HTTP_302_FOUND)
 
 
 @router.post("/accept-invite", response_model=TokenResponse)
 async def accept_invite(body: AcceptInviteRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+    """Create user on ``Invitation.org_id`` with the role stored on the invitation row."""
     result = await db.execute(select(Invitation).where(Invitation.token == body.token))
     inv = result.scalar_one_or_none()
     if not inv or inv.accepted_at is not None:
@@ -310,6 +472,8 @@ async def me(
             is_active=current_user.is_active,
             last_login_at=current_user.last_login_at.isoformat() if current_user.last_login_at else None,
             created_at=current_user.created_at.isoformat(),
+            org_id=current_user.org_id,
+            profile_image_url=current_user.profile_image_url,
         ),
         org=OrgOut(
             id=org.id,
@@ -319,5 +483,7 @@ async def me(
             plan=org.plan,
             onboarding_done=org.onboarding_done,
             created_at=org.created_at.isoformat(),
+            logo_url=org.logo_url,
+            tour_guide=getattr(org, "tour_guide", None) or {},
         ),
     )

@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -56,6 +57,7 @@ class UserOut(BaseModel):
     last_login_at: str | None = None
     created_at: str
     org_id: UUID | None = None
+    profile_image_url: str | None = None
 
 
 class OrgOut(BaseModel):
@@ -66,6 +68,8 @@ class OrgOut(BaseModel):
     plan: str | None = None
     onboarding_done: bool
     created_at: str | None = None
+    logo_url: str | None = None
+    tour_guide: dict[str, Any] = Field(default_factory=dict)
 
 
 class MeResponse(BaseModel):

@@ -119,6 +119,8 @@ agent
 tests
 .kube/
 skills-lock.json
+.postman
+postman
 
 BACKEND_ROUTES.md
 LICENSE_SYSTEM.md

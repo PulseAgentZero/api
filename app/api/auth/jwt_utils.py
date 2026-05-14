@@ -1,10 +1,35 @@
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import jwt
 
 from app.config.settings import settings
+
+
+def parse_uuid_sub(payload: dict[str, Any] | None) -> uuid.UUID | None:
+    """Return user id from JWT payload ``sub`` if it is a valid UUID string."""
+    if not payload:
+        return None
+    sub = payload.get("sub")
+    if not isinstance(sub, str):
+        return None
+    try:
+        return uuid.UUID(sub)
+    except ValueError:
+        return None
+
+
+def parse_uuid_loose(value: Any) -> uuid.UUID | None:
+    """Parse a UUID from common wire formats (string or UUID)."""
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 def create_access_token(user_id: uuid.UUID, org_id: uuid.UUID, role: str, email: str) -> str:

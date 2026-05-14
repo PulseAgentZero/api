@@ -88,6 +88,22 @@ def plan_limit(message: str) -> PulseHTTPException:
     )
 
 
+def rate_limited(message: str) -> PulseHTTPException:
+    return PulseHTTPException(
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        code="RATE_LIMITED",
+        message=message,
+    )
+
+
+def payload_too_large(message: str) -> PulseHTTPException:
+    return PulseHTTPException(
+        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        code="PAYLOAD_TOO_LARGE",
+        message=message,
+    )
+
+
 def validation_error(message: str, fields: dict[str, str]) -> PulseHTTPException:
     return PulseHTTPException(
         status.HTTP_422_UNPROCESSABLE_ENTITY,

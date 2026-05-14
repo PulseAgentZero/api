@@ -43,6 +43,7 @@ def _to_response(user: User) -> UserResponse:
         org_id=user.org_id,
         email=user.email,
         full_name=user.full_name,
+        profile_image_url=user.profile_image_url,
         role=user.role,
         is_active=user.is_active,
         is_verified=user.is_verified,
@@ -64,6 +65,8 @@ async def update_me(
 ) -> UserResponse:
     if body.full_name is not None:
         current_user.full_name = body.full_name
+    if body.avatar_url is not None:
+        current_user.profile_image_url = body.avatar_url
     await db.commit()
     await db.refresh(current_user)
     return _to_response(current_user)

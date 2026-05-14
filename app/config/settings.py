@@ -147,7 +147,9 @@ class Settings:
         return url
 
     # ------------------------------------------------------------------
-    # Redis (short-term working memory mirror for chat)
+    # Redis: refresh-token rotation, email/pw reset tokens, email-verify
+    # rate limit, public API per-key rate limits. If unset, refresh tokens
+    # fall back to stateless JWTs (see app.api.auth.routes._issue_tokens).
     # ------------------------------------------------------------------
     REDIS_URL: Optional[str] = os.getenv("REDIS_URL", "").strip() or None
 
@@ -255,7 +257,7 @@ class Settings:
     GOOGLE_CLIENT_ID: Optional[str] = os.getenv("GOOGLE_CLIENT_ID")
     GOOGLE_CLIENT_SECRET: Optional[str] = os.getenv("GOOGLE_CLIENT_SECRET")
     GOOGLE_REDIRECT_URI: str = os.getenv(
-        "GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/auth/google/callback"
+        "GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/auth/oauth/google/callback"
     )
     JWT_SECRET: str = os.getenv("JWT_SECRET", "pulse-dev-secret-change-me")
     JWT_ALGORITHM: str = "HS256"
@@ -301,6 +303,14 @@ class Settings:
     @classmethod
     def is_email_configured(cls) -> bool:
         return bool(cls.get_resend_api_key())
+
+    # ------------------------------------------------------------------
+    # S3 asset uploads (avatars, logos, CSVs)
+    # ------------------------------------------------------------------
+    ASSETS_S3_BUCKET: Optional[str] = os.getenv("ASSETS_S3_BUCKET")
+    ASSETS_S3_PREFIX: str = os.getenv("ASSETS_S3_PREFIX", "pulse/assets")
+    ASSETS_PUBLIC_BASE_URL: Optional[str] = os.getenv("ASSETS_PUBLIC_BASE_URL")
+    AWS_REGION: Optional[str] = os.getenv("AWS_REGION")
 
     # ------------------------------------------------------------------
     # Application

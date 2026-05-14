@@ -2,14 +2,21 @@ import logging
 import os
 import uuid as uuid_mod
 from datetime import datetime, timezone
-from urllib.parse import quote, urlsplit, unquote
+from urllib.parse import urlsplit, unquote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.dependencies.plan_gate import max_cloud_free_connections
+from app.api.errors import (
+    PulseHTTPException,
+    bad_request,
+    not_found,
+    payload_too_large,
+    validation_error,
+)
 from app.api.schemas.connection import (
     ConnectionResponse,
     CreateConnectionRequest,
@@ -19,6 +26,8 @@ from app.api.schemas.connection import (
     UpdateConnectionRequest,
 )
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
+from app.infrastructure.connectors.factory import _make_sql_dsn, build_encrypted_secret_and_row_fields
+from app.infrastructure.connectors.payload import parse_pulse_api_payload
 from app.infrastructure.database.connection_tester import (
     introspect_schema,
     preview_table_rows,
@@ -37,27 +46,14 @@ def _parse_uuid(value: str, field_name: str) -> UUID:
     try:
         return UUID(value)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid {field_name}") from exc
-
-
-def _make_dsn(
-    db_type: str,
-    host: str,
-    port: int,
-    database_name: str,
-    username: str,
-    password: str,
-    sslmode: str | None = None,
-) -> str:
-    scheme = "mysql" if db_type == "mysql" else "postgresql"
-    return (
-        f"{scheme}://{quote(username, safe='')}:{quote(password, safe='')}"
-        f"@{host}:{port}/{quote(database_name, safe='')}"
-    )
+        raise bad_request("BAD_REQUEST", f"Invalid {field_name}") from exc
 
 
 def _password_from_dsn(encrypted_dsn: str) -> str:
-    parsed = urlsplit(decrypt_dsn(encrypted_dsn))
+    raw = decrypt_dsn(encrypted_dsn)
+    if parse_pulse_api_payload(raw) is not None:
+        return ""
+    parsed = urlsplit(raw)
     return unquote(parsed.password or "")
 
 
@@ -76,37 +72,42 @@ def _connection_to_response(conn) -> ConnectionResponse:
         status=conn.status,
         last_tested_at=conn.last_tested_at,
         last_test_error=conn.last_test_error,
+        config=getattr(conn, "config", None) or {},
+        metadata_=getattr(conn, "metadata_", None) or {},
+        connection_meta=getattr(conn, "connection_meta", None) or {},
         created_at=conn.created_at,
     )
 
 
 def _connection_dsn(conn) -> str:
     if not conn.encrypted_dsn:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This connection has no database URL (e.g. file/CSV connectors).",
+        raise bad_request(
+            "BAD_REQUEST",
+            "This connection has no database URL (e.g. file/CSV connectors).",
         )
     return decrypt_dsn(conn.encrypted_dsn)
 
 
 def _assert_live(conn) -> None:
     if conn.deleted_at is not None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
 
 
 async def _get_current_connection(db: AsyncSession, org_id) -> object:
     conns = await ConnectionRepository(db).list_by_org(org_id)
     if not conns:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     return conns[-1]
 
 
 async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
     try:
         dsn = _connection_dsn(conn)
-    except HTTPException as exc:
-        return False, str(exc.detail), None
-    success, message, db_version = await test_connection(dsn)
+    except PulseHTTPException as exc:
+        detail = exc.detail
+        msg = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
+        return False, msg, None
+    success, message, db_version = await test_connection(dsn, sslmode=conn.sslmode)
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     conn.last_test_error = None if success else message
@@ -143,9 +144,9 @@ async def upload_connection_file(
                     break
                 size += len(chunk)
                 if size > max_bytes:
-                    raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File too large")
+                    raise payload_too_large("File too large")
                 out.write(chunk)
-    except HTTPException:
+    except PulseHTTPException:
         if os.path.isfile(dest_path):
             os.remove(dest_path)
         raise
@@ -178,9 +179,11 @@ async def test_current_connection(
     await db.flush()
     await db.commit()
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=TestConnectionResponse(success=False, message=message).model_dump(),
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="TEST_CONNECTION_FAILED",
+            message=message,
+            fields={"success": "false"},
         )
     return TestConnectionResponse(success=True, message=message, db_version=db_version)
 
@@ -216,10 +219,10 @@ async def list_connection_tables(
 ) -> IntrospectResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
     dsn = _connection_dsn(conn)
-    tables = await introspect_schema(dsn)
+    tables = await introspect_schema(dsn, sslmode=conn.sslmode)
     return IntrospectResponse(tables=tables)
 
 
@@ -233,13 +236,13 @@ async def preview_connection_table(
 ) -> TablePreviewResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
     dsn = _connection_dsn(conn)
     try:
-        rows = await preview_table_rows(dsn, table_name, limit=limit)
+        rows = await preview_table_rows(dsn, table_name, limit=limit, sslmode=conn.sslmode)
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise bad_request("BAD_REQUEST", str(exc)) from exc
     return TablePreviewResponse(table=table_name, rows=rows, limit=limit)
 
 
@@ -251,7 +254,7 @@ async def get_connection(
 ) -> ConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
     return _connection_to_response(conn)
 
@@ -264,35 +267,31 @@ async def create_connection(
 ) -> ConnectionResponse:
     repo = ConnectionRepository(db)
     await max_cloud_free_connections(db, current_user.org_id, await repo.count_active(current_user.org_id))
-    dsn = _make_dsn(
-        body.db_type,
-        body.host,
-        body.port,
-        body.database_name,
-        body.username,
-        body.password,
-    )
-    encrypted = encrypt_dsn(dsn)
-    # Normalise "postgresql" → "postgres" so _make_dsn and downstream checks are consistent
-    _ALIASES = {"postgresql": "postgres"}
-    ct = _ALIASES.get(body.connector_type or body.db_type or "", body.connector_type or body.db_type)
+    built = build_encrypted_secret_and_row_fields(body)
+    plaintext = built.pop("plaintext_secret")
+    meta = built.pop("connection_meta", None) or {}
+    encrypted = encrypt_dsn(plaintext)
     conn = await repo.create(
         org_id=current_user.org_id,
-        db_type=body.db_type,
-        host=body.host,
-        port=body.port,
-        database_name=body.database_name,
-        username=body.username,
         encrypted_dsn=encrypted,
-        name=body.name,
-        connector_type=ct,
+        name=body.name or "My Connection",
+        sslmode=body.sslmode,
+        db_type=built.get("db_type"),
+        host=built.get("host"),
+        port=built.get("port"),
+        database_name=built.get("database_name"),
+        username=built.get("username"),
+        connector_type=built.get("connector_type"),
+        connection_meta=meta,
     )
     success, message, _db_version = await _test_and_mark_connection(conn)
     await db.commit()
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=TestConnectionResponse(success=False, message=message).model_dump(),
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="TEST_CONNECTION_FAILED",
+            message=message,
+            fields={"success": "false", "connection_id": str(conn.id)},
         )
     return _connection_to_response(conn)
 
@@ -306,7 +305,7 @@ async def update_connection(
 ) -> ConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
 
     return await _update_connection_record(conn, body, db)
@@ -319,44 +318,113 @@ async def _update_connection_record(
 ) -> ConnectionResponse:
     payload = body.model_dump(exclude_none=True)
     if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="At least one field must be provided",
+        raise validation_error(
+            "At least one field must be provided",
+            fields={"body": "Provide at least one field to update"},
         )
     if not conn.encrypted_dsn:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot update this connection type via this endpoint",
+        raise bad_request(
+            "BAD_REQUEST",
+            "Cannot update this connection type via this endpoint",
         )
 
+    decrypted = decrypt_dsn(conn.encrypted_dsn)
+    api_blob = parse_pulse_api_payload(decrypted)
+
+    if api_blob is not None:
+        disallowed = {
+            k
+            for k in (
+                "host",
+                "port",
+                "database_name",
+                "username",
+                "db_type",
+                "password",
+                "connection_url",
+            )
+            if k in payload
+        }
+        if disallowed:
+            raise bad_request(
+                "BAD_REQUEST",
+                "API and object-store connectors cannot change credentials via PATCH; "
+                "delete the connection and create a new one.",
+            )
+        if "name" in payload:
+            conn.name = payload["name"]
+        if "sslmode" in payload:
+            conn.sslmode = payload["sslmode"]
+        success, message, _db_version = await _test_and_mark_connection(conn)
+        await db.flush()
+        await db.commit()
+        if not success:
+            raise PulseHTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                code="TEST_CONNECTION_FAILED",
+                message=message,
+                fields={"success": "false"},
+            )
+        return _connection_to_response(conn)
+
     password = payload.pop("password", None) or _password_from_dsn(conn.encrypted_dsn)
-    effective = {
-        "db_type": payload.get("db_type", conn.db_type),
-        "host": payload.get("host", conn.host),
-        "port": payload.get("port", conn.port),
-        "database_name": payload.get("database_name", conn.database_name),
-        "username": payload.get("username", conn.username),
-        "sslmode": payload.get("sslmode", conn.sslmode),
-    }
 
     for key, value in payload.items():
-        setattr(conn, key, value)
-    conn.encrypted_dsn = encrypt_dsn(_make_dsn(
-        effective["db_type"],
-        effective["host"],
-        effective["port"],
-        effective["database_name"],
-        effective["username"],
-        password,
-    ))
+        if key == "connection_url":
+            continue
+        if hasattr(conn, key):
+            setattr(conn, key, value)
+
+    ct = (conn.connector_type or "postgres").lower()
+    dt = (conn.db_type or "postgresql").lower()
+    if dt == "postgres":
+        dt = "postgresql"
+
+    if ct in ("snowflake", "bigquery", "databricks") or dt in ("snowflake", "bigquery", "databricks"):
+        url = (body.connection_url or decrypted).strip()
+        if not url:
+            raise bad_request("BAD_REQUEST", "connection_url is required to update this connector")
+        conn.encrypted_dsn = encrypt_dsn(url)
+    elif ct == "sqlite" or dt == "sqlite":
+        path = (conn.database_name or "").strip()
+        if not path:
+            raise bad_request("BAD_REQUEST", "SQLite connection is missing database file path")
+        conn.encrypted_dsn = encrypt_dsn(f"sqlite:///{path}")
+    else:
+        if conn.host is None or conn.port is None:
+            raise bad_request("BAD_REQUEST", "host and port are required for this SQL connection")
+        if not conn.database_name or not conn.username:
+            raise bad_request("BAD_REQUEST", "database_name and username are required")
+        db_for_dsn = dt
+        if db_for_dsn == "mssql" or ct == "mssql":
+            db_for_dsn = "mssql"
+        elif db_for_dsn == "mysql" or ct == "mysql":
+            db_for_dsn = "mysql"
+        elif db_for_dsn == "redshift" or ct == "redshift":
+            db_for_dsn = "redshift"
+        else:
+            db_for_dsn = "postgresql"
+        conn.encrypted_dsn = encrypt_dsn(
+            _make_sql_dsn(
+                db_for_dsn,
+                conn.host,
+                int(conn.port),
+                conn.database_name,
+                conn.username,
+                password,
+                sslmode=conn.sslmode,
+            )
+        )
 
     success, message, _db_version = await _test_and_mark_connection(conn)
     await db.flush()
     await db.commit()
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=TestConnectionResponse(success=False, message=message).model_dump(),
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="TEST_CONNECTION_FAILED",
+            message=message,
+            fields={"success": "false"},
         )
     return _connection_to_response(conn)
 
@@ -370,7 +438,7 @@ async def delete_connection(
     connection_uuid = _parse_uuid(connection_id, "connection_id")
     conn = await ConnectionRepository(db).get_by_id(connection_uuid)
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
     await ConnectionRepository(db).soft_delete(connection_uuid)
     await SchemaMappingRepository(db).deactivate_for_connection(connection_uuid)
@@ -385,16 +453,18 @@ async def test_db_connection(
 ) -> TestConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
 
     success, message, db_version = await _test_and_mark_connection(conn)
     await db.flush()
     await db.commit()
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=TestConnectionResponse(success=False, message=message).model_dump(),
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="TEST_CONNECTION_FAILED",
+            message=message,
+            fields={"success": "false"},
         )
 
     return TestConnectionResponse(success=True, message=message, db_version=db_version)
@@ -408,9 +478,9 @@ async def introspect_db_schema(
 ) -> IntrospectResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+        raise not_found("Connection not found")
     _assert_live(conn)
 
     dsn = _connection_dsn(conn)
-    tables = await introspect_schema(dsn)
+    tables = await introspect_schema(dsn, sslmode=conn.sslmode)
     return IntrospectResponse(tables=tables)

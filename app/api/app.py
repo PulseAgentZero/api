@@ -158,7 +158,7 @@ public_app = FastAPI(
         "Public API for external developers and integrations.\n\n"
         "**Auth:** `X-API-Key: <your_api_key>` (generate keys in Settings → API Keys)\n\n"
         "**Scopes:** `read` — GET endpoints only. `write` — GET + POST/PATCH.\n\n"
-        "**Rate limits:** 30 req/min (read key), 10 req/min (write key)\n\n"
+        "**Rate limits:** When `REDIS_URL` is set: 30 req/min (read-scoped keys), 10 req/min (write-scoped keys), per API key. Without Redis, limits are not enforced.\n\n"
         "**Errors:** `{ \"error\": { \"code\": \"string\", \"message\": \"string\" } }`\n\n"
         "**Response envelope:** All responses wrap data in `{ \"data\": { ... }, \"meta\": { \"org_id\": \"...\" } }`"
     ),

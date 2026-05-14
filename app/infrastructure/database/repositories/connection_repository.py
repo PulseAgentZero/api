@@ -45,6 +45,8 @@ class ConnectionRepository:
         username: str | None = None,
         name: str | None = None,
         connector_type: str | None = None,
+        sslmode: str | None = None,
+        connection_meta: dict | None = None,
     ) -> Connection:
         conn = Connection(
             org_id=org_id,
@@ -54,8 +56,10 @@ class ConnectionRepository:
             database_name=database_name,
             username=username,
             encrypted_dsn=encrypted_dsn,
+            sslmode=sslmode or "prefer",
             name=name or "My Connection",
             connector_type=connector_type or (db_type or "postgres"),
+            connection_meta=connection_meta or {},
         )
         self.db.add(conn)
         await self.db.flush()

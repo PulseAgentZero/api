@@ -16,8 +16,10 @@ from app.api.schemas.onboarding import (
     OnboardingSchemaMappingResponse,
 )
 from app.api.schemas.schema_mapping import CreateSchemaMappingRequest
+from app.infrastructure.connectors.factory import build_encrypted_secret_and_row_fields
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
 from app.infrastructure.database.connection_tester import introspect_schema, test_connection
+from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.connection_repository import (
@@ -34,11 +36,21 @@ from app.services.recommendation_service import (
     ClientDBError,
     generate_recommendations_for_org,
 )
-from app.api.routes.connections import _assert_live, _connection_to_response, _make_dsn
+from app.api.routes.connections import _assert_live, _connection_to_response
 from app.api.routes.schema_mappings import _mapping_to_response, _validate_mapping_payload
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/onboarding", tags=["Onboarding"])
+
+
+def _pick_primary_connection_for_introspect(conns: list[Connection]) -> Connection | None:
+    """Prefer active DB connections with a DSN, then most recently updated."""
+    live = [c for c in conns if c.deleted_at is None and c.encrypted_dsn]
+    if not live:
+        return None
+    active = [c for c in live if c.status == "active"]
+    pool = active if active else live
+    return max(pool, key=lambda c: (c.updated_at or c.created_at))
 
 
 @router.put("/context")
@@ -50,10 +62,17 @@ async def save_context(
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     if not org:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    org.industry = body.industry
-    org.business_context = body.business_context
-    org.entity_label = body.entity_label
-    org.goal_label = body.goal_label
+    updates = body.model_dump(exclude_unset=True)
+    if not updates:
+        return {"message": "No fields to update"}
+    if "industry" in updates:
+        org.industry = updates["industry"]
+    if "business_context" in updates:
+        org.business_context = updates["business_context"]
+    if "entity_label" in updates:
+        org.entity_label = updates["entity_label"]
+    if "goal_label" in updates:
+        org.goal_label = updates["goal_label"]
     await db.flush()
     await db.commit()
     return {"message": "Business context saved"}
@@ -67,26 +86,23 @@ async def save_and_test_connection(
 ) -> OnboardingConnectionResponse:
     repo = ConnectionRepository(db)
     await max_cloud_free_connections(db, current_user.org_id, await repo.count_active(current_user.org_id))
-    dsn = _make_dsn(
-        body.db_type,
-        body.host,
-        body.port,
-        body.database_name,
-        body.username,
-        body.password,
-    )
+    built = build_encrypted_secret_and_row_fields(body)
+    plaintext = built.pop("plaintext_secret")
+    meta = built.pop("connection_meta", None) or {}
     conn = await repo.create(
         org_id=current_user.org_id,
-        db_type=body.db_type,
-        host=body.host,
-        port=body.port,
-        database_name=body.database_name,
-        username=body.username,
-        encrypted_dsn=encrypt_dsn(dsn),
-        name=body.name,
-        connector_type=body.connector_type or body.db_type,
+        encrypted_dsn=encrypt_dsn(plaintext),
+        name=body.name or "My Connection",
+        sslmode=body.sslmode,
+        db_type=built.get("db_type"),
+        host=built.get("host"),
+        port=built.get("port"),
+        database_name=built.get("database_name"),
+        username=built.get("username"),
+        connector_type=built.get("connector_type"),
+        connection_meta=meta,
     )
-    success, message, db_version = await test_connection(dsn, body.sslmode)
+    success, message, db_version = await test_connection(plaintext, body.sslmode)
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     await db.commit()
@@ -111,13 +127,13 @@ async def get_connection_schema(
     conns = await ConnectionRepository(db).list_by_org(current_user.org_id)
     if not conns:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
-    conn = conns[-1]
-    if not conn.encrypted_dsn:
+    conn = _pick_primary_connection_for_introspect(conns)
+    if conn is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "BAD_REQUEST", "message": "This connector type does not support schema introspection"},
         )
-    tables = await introspect_schema(decrypt_dsn(conn.encrypted_dsn))
+    tables = await introspect_schema(decrypt_dsn(conn.encrypted_dsn), sslmode=conn.sslmode)
     return IntrospectResponse(tables=tables)
 
 
@@ -165,56 +181,57 @@ async def complete_onboarding(
 
     conns = await ConnectionRepository(db).list_by_org(current_user.org_id)
     active_conn = next((c for c in conns if c.deleted_at is None and c.status == "active"), None)
-    if active_conn is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="An active database connection is required before completing onboarding",
-        )
-    mappings = await SchemaMappingRepository(db).list_by_org(current_user.org_id)
-    active_map = next(
-        (m for m in mappings if m.is_active and m.connection_id == active_conn.id),
-        None,
-    )
-    if active_map is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="An active schema mapping for this connection is required",
+    active_map = None
+    if active_conn is not None:
+        mappings = await SchemaMappingRepository(db).list_by_org(current_user.org_id)
+        active_map = next(
+            (m for m in mappings if m.is_active and m.connection_id == active_conn.id),
+            None,
         )
 
-    sch_r = await db.execute(
-        select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
-    )
-    if sch_r.scalar_one_or_none() is None:
-        now = datetime.now(timezone.utc)
-        tz = org.timezone or "UTC"
-        nxt = croniter("0 */6 * * *", now).get_next(datetime)
-        db.add(
-            PipelineSchedule(
-                org_id=current_user.org_id,
-                mapping_id=active_map.id,
-                cron_expression="0 */6 * * *",
-                timezone=tz,
-                is_active=True,
-                next_run_at=nxt,
+    generated = 0
+    msg = "Onboarding complete"
+    if active_conn is not None and active_map is not None:
+        sch_r = await db.execute(
+            select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
+        )
+        if sch_r.scalar_one_or_none() is None:
+            now = datetime.now(timezone.utc)
+            tz = org.timezone or "UTC"
+            nxt = croniter("0 */6 * * *", now).get_next(datetime)
+            db.add(
+                PipelineSchedule(
+                    org_id=current_user.org_id,
+                    mapping_id=active_map.id,
+                    cron_expression="0 */6 * * *",
+                    timezone=tz,
+                    is_active=True,
+                    next_run_at=nxt,
+                )
             )
-        )
-        await db.flush()
+            await db.flush()
 
-    try:
-        generated = await generate_recommendations_for_org(db, current_user.org_id)
-    except ClientDBError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        try:
+            generated = await generate_recommendations_for_org(db, current_user.org_id)
+        except ClientDBError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    else:
+        msg = (
+            "Onboarding complete. Add an active connection and schema mapping under Connections "
+            "when you are ready to run the pipeline and generate recommendations."
+        )
+
     org.onboarding_done = True
     await db.commit()
 
-    # Schedule recurring pipeline runs and trigger the first autonomous run
-    from app.services.schedulers.pipeline_scheduler import schedule_org, trigger_pipeline_now
+    if active_conn is not None and active_map is not None:
+        from app.services.schedulers.pipeline_scheduler import schedule_org, trigger_pipeline_now
 
-    schedule_org(current_user.org_id, org.name)
-    await trigger_pipeline_now(current_user.org_id, trigger_source="onboarding")
+        schedule_org(current_user.org_id, org.name)
+        await trigger_pipeline_now(current_user.org_id, trigger_source="onboarding")
 
     return CompleteOnboardingResponse(
-        message="Onboarding complete",
+        message=msg,
         onboarding_done=True,
         generated_recommendations=generated,
     )

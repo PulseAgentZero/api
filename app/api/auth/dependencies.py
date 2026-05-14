@@ -1,5 +1,4 @@
 import hashlib
-import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -8,7 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth.jwt_utils import decode_access_token
+from app.api.auth.jwt_utils import decode_access_token, parse_uuid_sub
 from app.infrastructure.database.models.api_key import ApiKey
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.session import get_db
@@ -48,7 +47,10 @@ async def get_current_user_optional(
         return None
     if payload.get("type") == "refresh":
         return None
-    user = await UserRepository(db).get_by_id(uuid.UUID(payload["sub"]))
+    uid = parse_uuid_sub(payload)
+    if uid is None:
+        return None
+    user = await UserRepository(db).get_by_id(uid)
     return user
 
 
@@ -86,7 +88,13 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "INVALID_TOKEN", "message": "Refresh token cannot be used for this endpoint"},
         )
-    user = await UserRepository(db).get_by_id(uuid.UUID(payload["sub"]))
+    uid = parse_uuid_sub(payload)
+    if uid is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "INVALID_TOKEN", "message": "Invalid or expired token"},
+        )
+    user = await UserRepository(db).get_by_id(uid)
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Boolean, DateTime, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infrastructure.database.base import Base, TimestampMixin, UUIDMixin, utcnow
@@ -33,6 +34,7 @@ class Organization(Base, UUIDMixin, TimestampMixin):
     deployment_mode: Mapped[str] = mapped_column(Text, default="cloud", server_default="cloud")
     timezone: Mapped[str] = mapped_column(Text, default="UTC", server_default="UTC")
     logo_url: Mapped[str | None] = mapped_column(Text)
+    tour_guide: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=func.now(), onupdate=utcnow
     )

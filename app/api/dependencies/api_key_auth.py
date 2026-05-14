@@ -6,7 +6,9 @@ from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import forbidden, unauthorized
+from app.api.public.rate_limit import enforce_public_api_rate_limit
 from app.infrastructure.database.session import get_db
+from app.infrastructure.redis.client import get_redis
 
 
 @dataclass
@@ -47,6 +49,9 @@ def require_api_key(required_scope: str = "read"):
                 "INSUFFICIENT_SCOPE",
                 "This action requires a write-scoped API key",
             )
+
+        r = await get_redis()
+        await enforce_public_api_rate_limit(r, scope=api_key.scope, api_key_id=str(api_key.id))
 
         await repo.touch_last_used(api_key.id)
 
