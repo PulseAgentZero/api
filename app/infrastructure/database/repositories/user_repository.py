@@ -29,7 +29,13 @@ class UserRepository:
         )
         return int(result.scalar() or 0)
 
-    async def create(self, org_id: UUID, email: str, password_hash: str, role: str = "ops_manager") -> User:
+    async def create(
+        self,
+        org_id: UUID,
+        email: str,
+        password_hash: str | None,
+        role: str = "analyst",
+    ) -> User:
         user = User(
             org_id=org_id,
             email=email,

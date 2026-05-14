@@ -139,7 +139,7 @@ class RecommendationAgent(BaseAgent):
         try:
             async with db.begin_nested():
                 repo = RecommendationRepository(db)
-                existing = await repo.list_by_org(org_id, status="active")
+                existing = await repo.list_by_org(org_id, status="open")
                 for rec in existing:
                     rec.status = "superseded"
                 superseded = len(existing)
@@ -154,7 +154,7 @@ class RecommendationAgent(BaseAgent):
                         title=rec_data.get("title", "Risk intervention required"),
                         reasoning=rec_data.get("reasoning", ""),
                         suggested_action=rec_data.get("suggested_action", ""),
-                        status="active",
+                        status="open",
                     )
                     created += 1
 

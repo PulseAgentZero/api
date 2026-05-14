@@ -45,7 +45,7 @@ async def generate_recommendations_for_org(
     ][:limit]
 
     repo = RecommendationRepository(db)
-    existing = await repo.list_by_org(org_id, status="active")
+    existing = await repo.list_by_org(org_id, status="open")
     existing_entity_ids = {rec.entity_id for rec in existing}
 
     created = 0
@@ -79,7 +79,7 @@ async def generate_recommendations_for_org(
                 "Review this entity's live profile and take the highest-fit "
                 "retention action based on the mapped risk signals."
             ),
-            status="active",
+            status="open",
         )
         created += 1
 

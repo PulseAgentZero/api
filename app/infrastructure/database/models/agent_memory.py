@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -15,16 +15,9 @@ if TYPE_CHECKING:  # noqa: F401
 
 
 class AgentMemory(Base, UUIDMixin, TimestampMixin):
-    """Cached output for an autonomous agent keyed by (org, agent_name).
-
-    The fingerprint is a hash of the relevant inputs (e.g. raw_schema) so
-    callers can skip re-running the agent when nothing material has changed.
-    """
+    """Cached output for an autonomous agent keyed by org scope."""
 
     __tablename__ = "agent_memory"
-    __table_args__ = (
-        UniqueConstraint("org_id", "agent_name", name="uq_agent_memory_org_agent"),
-    )
 
     org_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -35,6 +28,11 @@ class AgentMemory(Base, UUIDMixin, TimestampMixin):
     agent_name: Mapped[str] = mapped_column(String(100), nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     data: Mapped[dict | None] = mapped_column(JSONB)
+
+    scope: Mapped[str] = mapped_column(String(20), default="org", server_default="org")
+    scope_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    key: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

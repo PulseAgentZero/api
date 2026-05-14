@@ -20,7 +20,7 @@ from app.infrastructure.database.repositories.schema_mapping_repository import (
 from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/schema-mappings", tags=["schema-mappings"])
+router = APIRouter(prefix="/schema-mappings", tags=["Schema Mappings"])
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

@@ -51,43 +51,9 @@ async def _claim_run_slot(org_id: UUID, trigger_source: str) -> UUID | None:
 async def _run_pipeline_for_org(
     org_id_str: str, trigger_source: str = "scheduled"
 ) -> None:
-    """Execute the autonomous pipeline for one organisation.
-
-    Claims a run slot (dedup) before doing real work. If the slot is taken
-    by another active run, this no-ops.
-    """
-    from app.agents.orchestrators.pipeline import PipelineOrchestrator
-
+    """Enqueue or start the pipeline for one organisation (dedup via trigger_pipeline_now)."""
     org_id = UUID(org_id_str)
-    run_id = await _claim_run_slot(org_id, trigger_source)
-    if run_id is None:
-        return
-
-    logger.info(
-        "Pipeline run %s starting for org %s (trigger=%s)",
-        run_id, org_id, trigger_source,
-    )
-
-    try:
-        async with async_session_factory() as session:
-            orchestrator = PipelineOrchestrator(session)
-            state = await orchestrator.execute(
-                org_id, trigger_source=trigger_source, run_id=run_id,
-            )
-
-            if state.get("error"):
-                logger.error(
-                    "Pipeline run %s for org %s completed with error: %s",
-                    run_id, org_id, state["error"],
-                )
-            else:
-                logger.info(
-                    "Pipeline run %s for org %s completed: %d recommendations",
-                    run_id, org_id,
-                    state.get("recommendation_stats", {}).get("total_generated", 0),
-                )
-    except Exception as e:
-        logger.exception("Pipeline run %s for org %s failed: %s", run_id, org_id, e)
+    await trigger_pipeline_now(org_id, trigger_source=trigger_source)
 
 
 async def _discover_and_schedule_orgs(scheduler: AsyncIOScheduler) -> None:
@@ -160,6 +126,15 @@ async def trigger_pipeline_now(
     if run_id is None:
         return None
 
+    from app.services.pipeline_queue import enqueue_pipeline_job
+
+    if await enqueue_pipeline_job(run_id=run_id, org_id=org_id, trigger_source=trigger_source):
+        logger.info(
+            "Queued pipeline run %s for org %s (trigger=%s) on Redis",
+            run_id, org_id, trigger_source,
+        )
+        return run_id
+
     async def _execute() -> None:
         from app.agents.orchestrators.pipeline import PipelineOrchestrator
 
@@ -226,3 +201,23 @@ def shutdown_scheduler() -> None:
         _scheduler.shutdown(wait=False)
         logger.info("Pipeline scheduler shut down")
         _scheduler = None
+
+
+if __name__ == "__main__":
+    import signal
+
+    async def _main() -> None:
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+
+        await start_pipeline_scheduler()
+        logger.info("Scheduler running — waiting for stop signal")
+        await stop.wait()
+        shutdown_scheduler()
+        logger.info("Scheduler stopped")
+
+    asyncio.run(_main())
+
