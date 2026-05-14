@@ -28,7 +28,7 @@ Runs the full stack locally — api, worker, agent, scheduler, redis, and postgr
 
 ```bash
 # Copy env and fill in values
-cp docker/compose/cloud/.env.example docker/compose/cloud/.env
+cp .env.example docker/compose/cloud/.env
 
 # Build and start
 docker compose -f docker/compose/cloud/docker-compose.yml up --build
