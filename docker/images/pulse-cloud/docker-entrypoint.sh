@@ -31,7 +31,7 @@ case "$SERVICE" in
     ;;
 
   agent)
-    exec uvicorn app.agent.app:app \
+    exec uvicorn app.conversational.app:app \
       --host 0.0.0.0 \
       --port "${AGENT_PORT:-8001}" \
       --workers "${AGENT_WORKERS:-1}" \

@@ -1,14 +1,12 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.auth import auth_router
-from app.api.errors import error_payload
+from app.api.exception_handlers import attach_exception_handlers
 from app.api.middleware import LoggingMiddleware
 from app.api.routes import (
     agent_router,
@@ -51,8 +49,6 @@ from app.services.schedulers.pipeline_scheduler import (
 
 configure_logging()
 
-logger = __import__("logging").getLogger(__name__)
-
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
@@ -64,66 +60,6 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         shutdown_scheduler()
         shutdown_license_scheduler()
         await close_redis()
-
-
-def _make_exception_handlers(app: FastAPI) -> None:
-    """Attach the standard error envelope handlers to any FastAPI instance."""
-
-    @app.exception_handler(RequestValidationError)
-    async def request_validation_handler(
-        request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
-        fields: dict[str, str] = {}
-        for err in exc.errors():
-            loc_parts = [str(x) for x in err.get("loc", ()) if x not in ("body", "query", "path")]
-            key = ".".join(loc_parts) if loc_parts else "request"
-            fields[key] = err.get("msg", "Invalid value")
-        logger.warning(
-            "422 validation error %s %s fields=%s",
-            request.method,
-            request.url.path,
-            fields,
-        )
-        return JSONResponse(
-            status_code=422,
-            content=error_payload("VALIDATION_ERROR", "Request validation failed", fields=fields),
-        )
-
-    @app.exception_handler(HTTPException)
-    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-        # Log 5xx as errors, 4xx as warnings (expected client errors), skip 401/404 noise
-        if exc.status_code >= 500:
-            logger.error(
-                "%s %s -> %s %s",
-                request.method, request.url.path, exc.status_code, exc.detail,
-            )
-        elif exc.status_code not in (401, 404):
-            logger.warning(
-                "%s %s -> %s %s",
-                request.method, request.url.path, exc.status_code, exc.detail,
-            )
-
-        detail = exc.detail
-        if isinstance(detail, dict) and "code" in detail and "message" in detail:
-            err = {str(k): detail[k] for k in detail}
-            return JSONResponse(status_code=exc.status_code, content={"error": err})
-        msg = detail if isinstance(detail, str) else str(detail)
-        code = "TOKEN_EXPIRED" if exc.status_code == 401 else "BAD_REQUEST"
-        return JSONResponse(status_code=exc.status_code, content=error_payload(code, msg))
-
-    @app.exception_handler(Exception)
-    async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        logger.exception(
-            "500 unhandled %s %s — %s: %s",
-            request.method,
-            request.url.path,
-            type(exc).__name__,
-            exc,
-        )
-        return JSONResponse(
-            status_code=500,
-            content=error_payload("INTERNAL_ERROR", "Internal server error"),
-        )
 
 
 # ── Internal API ──────────────────────────────────────────────────────────────
@@ -181,7 +117,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_make_exception_handlers(app)
+attach_exception_handlers(app)
 
 app.include_router(auth_router,            prefix="/api/v1")
 app.include_router(org_router,             prefix="/api/v1")
@@ -234,7 +170,7 @@ public_app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-_make_exception_handlers(public_app)
+attach_exception_handlers(public_app)
 
 public_app.include_router(public_entities_router,        prefix="/v1")
 public_app.include_router(public_recommendations_router, prefix="/v1")
