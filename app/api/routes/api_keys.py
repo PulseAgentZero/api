@@ -108,7 +108,7 @@ async def revoke_api_key(
     key_id: UUID,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> None:
+):
     await require_feature(db, current_user.org_id, "api_keys")
     row = await db.get(ApiKey, key_id)
     if not row or row.org_id != current_user.org_id:
