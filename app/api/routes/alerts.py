@@ -123,7 +123,7 @@ async def delete_rule(
     rule_id: UUID,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> None:
+):
     row = await db.get(AlertRule, rule_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()
@@ -214,7 +214,7 @@ async def delete_channel(
     channel_id: UUID,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> None:
+):
     row = await db.get(NotificationChannel, channel_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()

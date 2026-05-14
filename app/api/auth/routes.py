@@ -167,7 +167,7 @@ async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> T
 async def logout(
     body: LogoutRequest,
     current_user: User = Depends(get_current_user),
-) -> None:
+):
     r = await get_redis()
     if r is not None:
         await redis_tokens.delete_refresh_token(body.refresh_token)

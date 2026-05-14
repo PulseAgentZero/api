@@ -194,7 +194,7 @@ async def revoke_invitation(
     invitation_id: UUID,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> None:
+):
     inv = await db.get(Invitation, invitation_id)
     if not inv or inv.org_id != current_user.org_id or inv.accepted_at is not None:
         raise not_found("Invitation not found or already accepted")
@@ -228,7 +228,7 @@ async def deactivate_user(
     user_id: str,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> None:
+):
     repo = UserRepository(db)
     target = await repo.get_by_id(_parse_uuid(user_id, "user_id"))
     if not target or target.org_id != current_user.org_id:

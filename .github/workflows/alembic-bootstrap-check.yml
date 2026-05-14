@@ -1,0 +1,65 @@
+name: Alembic Bootstrap Check
+
+on:
+  pull_request:
+    paths:
+      - "app/infrastructure/database/alembic/**"
+      - "alembic.ini"
+      - "requirements.txt"
+  push:
+    branches:
+      - main
+    paths:
+      - "app/infrastructure/database/alembic/**"
+      - "alembic.ini"
+      - "requirements.txt"
+
+jobs:
+  fresh-db-upgrade:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: oracle
+          POSTGRES_DB: pulse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pulse"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://postgres:oracle@localhost:5432/pulse
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Alembic upgrade on fresh database
+        run: alembic upgrade head
+
+      - name: Verify current revision equals head
+        run: |
+          HEAD_REVISION=$(alembic heads | awk 'NR==1 {print $1}')
+          CURRENT_REVISION=$(alembic current | tail -n 1 | awk '{print $1}')
+          if [ "$HEAD_REVISION" != "$CURRENT_REVISION" ]; then
+            echo "Expected current revision to match head."
+            echo "head=$HEAD_REVISION current=$CURRENT_REVISION"
+            exit 1
+          fi

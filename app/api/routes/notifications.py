@@ -68,7 +68,7 @@ async def mark_notification_read(
     notification_id: UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> None:
+):
     await db.execute(
         update(OrgNotification)
         .where(
