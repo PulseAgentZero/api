@@ -1,12 +1,29 @@
 """Conversational agent service with live-data tools."""
 
 import json
+import logging
 import re
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator
 from uuid import UUID
 
 from anthropic import AsyncAnthropic
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+# Conversational memory configuration
+_MEM_AGENT_NAME = "conversational"
+_MEM_SCOPE = "user"
+_MEM_KEY = "profile"
+_MEM_TOP_N = 5
+_MEM_MAX_ENTITIES = 50
+_MEM_MAX_TOPICS = 30
+_MEM_ENTITY_RE = re.compile(r"\b[A-Z]{2,}-?\d{2,}\b")
+_MEM_TOPIC_KEYWORDS = (
+    "recommendation", "critical", "high risk", "churn", "overview",
+    "draft", "similar", "metrics", "trend", "anomaly", "summary",
+)
 
 from app.config.settings import settings
 from app.infrastructure.database.client_queries import (
@@ -17,6 +34,9 @@ from app.infrastructure.database.client_queries import (
     get_schema_mapping,
 )
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.repositories.agent_memory_repository import (
+    AgentMemoryRepository,
+)
 from app.infrastructure.database.repositories.organization_repository import (
     OrganizationRepository,
 )
@@ -262,6 +282,32 @@ async def _find_similar(
     }
 
 
+_ACTION_DRAFT_SYSTEM = (
+    "You write short, professional action drafts for an operations team to use with at-risk "
+    "customers / entities. Be specific to the entity's signals and recommendations — never use "
+    "generic boilerplate. Output ONLY the draft text. No preamble, no markdown headers, no JSON."
+)
+
+
+def _action_draft_fallback(detail: dict, entity_id: str, action_type: str) -> dict:
+    """Template draft used when the LLM is unconfigured or the call fails."""
+    label = detail.get("entity_label") or entity_id
+    signals = detail.get("signals") or {}
+    numeric_signals = {k: v for k, v in signals.items() if isinstance(v, (int, float))}
+    top_signal = max(numeric_signals, key=lambda key: numeric_signals[key]) if numeric_signals else None
+    if action_type == "message":
+        draft = (
+            f"Hi {label}, we noticed changes in your account experience and want to help. "
+            "Our team can review your current plan and offer the most relevant support option today."
+        )
+    else:
+        draft = (
+            f"Action plan for {label}: review the live profile, prioritize the {top_signal or 'highest'} "
+            "risk signal, contact the entity, and mark the recommendation as actioned after intervention."
+        )
+    return {"entity_id": entity_id, "action_type": action_type, "draft": draft}
+
+
 async def _action_draft(
     db: AsyncSession,
     org_id: UUID,
@@ -271,21 +317,58 @@ async def _action_draft(
     detail = await _entity_detail(db, org_id, entity_id)
     if detail.get("error"):
         return detail
+
+    if not settings.is_anthropic_configured():
+        return _action_draft_fallback(detail, entity_id, action_type)
+
+    org = await OrganizationRepository(db).get_by_id(org_id)
+    org_name = org.name if org else "the team"
+    entity_label_name = org.entity_label if org and org.entity_label else "entity"
+    goal_label = org.goal_label if org and org.goal_label else "improve outcomes"
+    business_context = (org.business_context if org else "") or ""
+
     label = detail.get("entity_label") or entity_id
-    top_signal = None
     signals = detail.get("signals") or {}
-    if signals:
-        top_signal = max(signals, key=lambda key: signals[key])
-    draft = (
-        f"Hi {label}, we noticed changes in your account experience and want to help. "
-        "Our team can review your current plan and offer the most relevant support option today."
+    numeric = [(k, v) for k, v in signals.items() if isinstance(v, (int, float))]
+    top_signals = sorted(numeric, key=lambda kv: abs(kv[1]), reverse=True)[:5]
+    recs = detail.get("active_recommendations") or []
+
+    parts = [
+        f"Org: {org_name}. Entity type: {entity_label_name}. Goal: {goal_label}.",
+    ]
+    if business_context.strip():
+        parts.append(f"Business context: {business_context[:300]}")
+    parts.append(f"Entity: {label} (id={entity_id})")
+    parts.append(
+        f"Risk: tier={detail.get('risk_tier')}, score={detail.get('risk_score')}"
     )
-    if action_type != "message":
-        draft = (
-            f"Action plan for {label}: review the live profile, prioritize the {top_signal or 'highest'} "
-            "risk signal, contact the entity, and mark the recommendation as actioned after intervention."
+    if top_signals:
+        parts.append("Top signals: " + ", ".join(f"{k}={v}" for k, v in top_signals))
+    if recs:
+        first = recs[0]
+        parts.append(
+            f"Top recommendation: {first.get('title')} — {(first.get('reasoning') or '')[:200]}"
         )
-    return {"entity_id": entity_id, "action_type": action_type, "draft": draft}
+    parts.append(
+        f"\nDraft a {action_type} (under 100 words, professional, specific to the signals above)."
+    )
+    user_msg = "\n".join(parts)
+
+    try:
+        client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
+        resp = await client.messages.create(
+            model=settings.ANTHROPIC_LLM_MODEL,
+            max_tokens=400,
+            system=_ACTION_DRAFT_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        draft = "".join(b.text for b in resp.content if b.type == "text").strip()
+        if not draft:
+            return _action_draft_fallback(detail, entity_id, action_type)
+        return {"entity_id": entity_id, "action_type": action_type, "draft": draft}
+    except Exception as exc:
+        logger.warning("[action_draft] LLM call failed, using template: %s", exc)
+        return _action_draft_fallback(detail, entity_id, action_type)
 
 
 async def _run_tool(
@@ -333,6 +416,89 @@ async def _run_tool(
     return {"error": f"Unknown tool: {name}"}
 
 
+async def _load_user_memory(db: AsyncSession, current_user: User) -> dict:
+    """Read this user's accumulated chat profile from agent_memory (best-effort)."""
+    try:
+        repo = AgentMemoryRepository(db)
+        record = await repo.get_scoped(
+            current_user.org_id, _MEM_SCOPE, current_user.id, _MEM_AGENT_NAME, key=_MEM_KEY,
+        )
+        return (record.data if record else {}) or {}
+    except Exception as exc:
+        logger.debug("[memory] load failed (non-fatal): %s", exc)
+        return {}
+
+
+def _format_memory_for_prompt(memory: dict) -> str:
+    if not memory:
+        return ""
+    parts: list[str] = []
+    freq_entities = memory.get("frequent_entities") or {}
+    if freq_entities:
+        top = sorted(freq_entities.items(), key=lambda kv: kv[1], reverse=True)[:_MEM_TOP_N]
+        parts.append(
+            "Entities the user has asked about most: "
+            + ", ".join(f"{eid} ({n}x)" for eid, n in top)
+        )
+    freq_topics = memory.get("frequent_topics") or {}
+    if freq_topics:
+        top = sorted(freq_topics.items(), key=lambda kv: kv[1], reverse=True)[:_MEM_TOP_N]
+        parts.append(
+            "Recurring topics in the user's questions: "
+            + ", ".join(f"{kw} ({n}x)" for kw, n in top)
+        )
+    if memory.get("total_turns"):
+        parts.append(f"Total prior turns with this user: {memory['total_turns']}.")
+    if not parts:
+        return ""
+    return "User memory (use to bias recommendations and pre-load relevant context):\n- " + "\n- ".join(parts) + "\n"
+
+
+async def update_user_memory_from_message(
+    db: AsyncSession, current_user: User, user_message: str
+) -> None:
+    """Heuristic per-turn update: count entity IDs and topic keywords mentioned by the user."""
+    if not user_message:
+        return
+    repo = AgentMemoryRepository(db)
+    try:
+        record = await repo.get_scoped(
+            current_user.org_id, _MEM_SCOPE, current_user.id, _MEM_AGENT_NAME, key=_MEM_KEY,
+        )
+        data = (record.data if record else {}) or {}
+
+        freq_entities: dict[str, int] = dict(data.get("frequent_entities") or {})
+        for match in _MEM_ENTITY_RE.findall(user_message):
+            freq_entities[match] = freq_entities.get(match, 0) + 1
+        if len(freq_entities) > _MEM_MAX_ENTITIES:
+            freq_entities = dict(
+                sorted(freq_entities.items(), key=lambda kv: kv[1], reverse=True)[:_MEM_MAX_ENTITIES]
+            )
+
+        freq_topics: dict[str, int] = dict(data.get("frequent_topics") or {})
+        lowered = user_message.lower()
+        for kw in _MEM_TOPIC_KEYWORDS:
+            if kw in lowered:
+                freq_topics[kw] = freq_topics.get(kw, 0) + 1
+        if len(freq_topics) > _MEM_MAX_TOPICS:
+            freq_topics = dict(
+                sorted(freq_topics.items(), key=lambda kv: kv[1], reverse=True)[:_MEM_MAX_TOPICS]
+            )
+
+        new_data = {
+            "frequent_entities": freq_entities,
+            "frequent_topics": freq_topics,
+            "total_turns": int(data.get("total_turns") or 0) + 1,
+            "last_active": datetime.now(timezone.utc).isoformat(),
+        }
+        await repo.upsert_scoped(
+            current_user.org_id, _MEM_SCOPE, current_user.id, _MEM_AGENT_NAME,
+            data=new_data, key=_MEM_KEY,
+        )
+    except Exception as exc:
+        logger.debug("[memory] upsert failed (non-fatal): %s", exc)
+
+
 async def _system_prompt(db: AsyncSession, current_user: User) -> str:
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     org_name = org.name if org else "this organization"
@@ -341,12 +507,15 @@ async def _system_prompt(db: AsyncSession, current_user: User) -> str:
     context = org.business_context if org and org.business_context else "No business context configured."
 
     pipeline_block = await _pipeline_context_block(db, current_user.org_id)
+    memory = await _load_user_memory(db, current_user)
+    memory_block = _format_memory_for_prompt(memory)
 
     return (
         f"You are Pulse, an operational intelligence agent for {org_name}. "
         f"The organization models {entity_label} and the goal is to {goal_label}. "
         f"Business context: {context}\n"
         f"{pipeline_block}"
+        f"{memory_block}"
         "Answer data-dependent questions only after using the provided tools. "
         "Be concise, operational, and avoid guessing."
     )
@@ -503,3 +672,71 @@ async def run(
         return "I could not complete the tool workflow in time. Try narrowing the question."
     except Exception:
         return await _fallback_reply(db, current_user, conversation_messages)
+
+
+async def run_stream(
+    db: AsyncSession,
+    current_user: User,
+    conversation_messages: list[dict],
+) -> AsyncIterator[str]:
+    """Stream the agent's reply incrementally. Yields text chunks; tool execution pauses the stream."""
+
+    if not settings.is_anthropic_configured():
+        # No streaming path when Anthropic is not configured — yield the full fallback at once.
+        yield await _fallback_reply(db, current_user, conversation_messages)
+        return
+
+    client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
+    messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in conversation_messages
+        if msg.get("role") in {"user", "assistant"} and msg.get("content")
+    ]
+    system_prompt = await _system_prompt(db, current_user)
+
+    try:
+        for _ in range(4):
+            tool_uses: list = []
+            async with client.messages.stream(
+                model=settings.ANTHROPIC_LLM_MODEL,
+                max_tokens=900,
+                system=system_prompt,
+                tools=TOOLS,
+                messages=messages,
+            ) as stream:
+                async for text_chunk in stream.text_stream:
+                    if text_chunk:
+                        yield text_chunk
+                final_message = await stream.get_final_message()
+
+            tool_uses = [b for b in final_message.content if b.type == "tool_use"]
+            if not tool_uses:
+                return
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [b.model_dump() for b in final_message.content],
+                }
+            )
+            tool_results = []
+            for tool_use in tool_uses:
+                result = await _run_tool(
+                    tool_use.name,
+                    dict(tool_use.input or {}),
+                    db,
+                    current_user.org_id,
+                )
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": json.dumps(_json_ready(result), ensure_ascii=False),
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
+
+        yield "\n\n[Reached tool-loop limit — narrow the question.]"
+    except Exception as exc:
+        logger.warning("[agent_service] stream failed, falling back: %s", exc)
+        yield await _fallback_reply(db, current_user, conversation_messages)

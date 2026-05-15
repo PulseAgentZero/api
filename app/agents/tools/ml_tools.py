@@ -519,7 +519,7 @@ def build_ml_tools() -> list[Tool]:
                 "Cleans data, converts datetimes to numeric, removes zero-variance columns, "
                 "encodes categoricals (one-hot for ≤50 unique, label-encode otherwise), "
                 "handles missing values, drops high-null columns. "
-                "Returns feature matrix stats and serialised data for train_model. "
+                "Returns: {features_json, target_json, feature_names, target_classes, feature_count, target_dist, ...} on success, or {error: str} if the target has <2 or >20 classes / no usable features remain. "
                 "IMPORTANT: Pass ALL entity rows as raw_data, including the target column."
             ),
             parameters=[
@@ -537,12 +537,9 @@ def build_ml_tools() -> list[Tool]:
         Tool(
             name="train_model",
             description=(
-                "Train a Random Forest classifier on prepared feature data. "
-                "Uses 5-fold stratified cross-validation for reliable metrics. "
-                "Returns CV metrics (accuracy ± std, F1, AUC-ROC), confusion matrix, "
-                "feature importances, and a model_id for scoring. "
-                "If CV accuracy < 55%, the model does not meet quality threshold — "
-                "set ml_available=false and fall back to rule-based scoring."
+                "Train a Random Forest classifier on prepared feature data with 5-fold stratified cross-validation. "
+                "Returns: {model_id, accuracy_mean, accuracy_std, f1, auc_roc, confusion_matrix, feature_importances (top 20), meets_quality_threshold, quality_note} on success, or {error: str} if data is insufficient / single-class / shape mismatch. "
+                "If meets_quality_threshold is false (CV accuracy < 55%), set ml_available=false and fall back to rule-based scoring."
             ),
             parameters=[
                 ToolParam("features_json", "string", "JSON string of 2D feature matrix (from prepare_features 'features_json' field)", required=True),
@@ -558,10 +555,9 @@ def build_ml_tools() -> list[Tool]:
             name="score_entities",
             description=(
                 "Score ALL entities using a trained ML model. "
-                "Returns risk scores (0.0-1.0) and risk tiers (critical/high/medium/low). "
+                "Returns: {scored_entities: list[{entity_id, risk_score (0.0-1.0), risk_tier ∈ {critical,high,medium,low}}], total_scored, tier_counts, positive_class, score_range} on success, or {error: str} if the model_id is unknown or the row/id counts mismatch. "
                 "You MUST pass the SAME features_json used for training (but for ALL entities). "
-                "The output scored_entities list MUST be used EXACTLY as-is in your final JSON — "
-                "do NOT modify, filter, or fabricate scores."
+                "The scored_entities list MUST be used EXACTLY as-is in your final JSON — do NOT modify, filter, or fabricate scores."
             ),
             parameters=[
                 ToolParam("features_json", "string", "JSON string of 2D feature matrix for ALL entities (same features as training)", required=True),

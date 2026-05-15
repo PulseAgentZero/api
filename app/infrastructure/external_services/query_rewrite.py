@@ -1,7 +1,7 @@
-"""Pre-retrieval: rewrite an entity record into a focused retrieval query.
+"""Pre-retrieval query augmentation: rewrite, decompose, and expand queries.
 
-Uses Groq's fast model. Skipping is safe: callers fall back to raw query text
-when this returns None or raises.
+All public functions degrade gracefully — callers fall back to the raw query
+when these return None or raise. Uses Groq's fast model for low latency.
 """
 
 from __future__ import annotations
@@ -22,6 +22,26 @@ _REWRITE_SYSTEM = (
     "The query will be used to find behaviourally similar entities in a vector "
     "store. Emphasize: dominant risk signal, magnitude, and direction (rising / "
     "falling / zero). Drop boilerplate. 25 words max. Output the query line only."
+)
+
+_DECOMPOSE_SYSTEM = (
+    "You decompose a complex user question about business entities into 2-4 simple, "
+    "focused sub-queries. Each sub-query should target ONE specific aspect and work well "
+    "as a standalone vector search query. Output ONLY a JSON array of strings, e.g. "
+    '["sub-query 1", "sub-query 2"]. No explanation, no markdown.'
+)
+
+_EXPAND_SYSTEM = (
+    "You generate 3 semantically related variants of a search query to improve recall. "
+    "Variants should use different phrasing, synonyms, or related concepts while preserving "
+    "the original intent. Output ONLY a JSON array of 3 strings. No explanation, no markdown."
+)
+
+_VALIDATE_SYSTEM = (
+    "You evaluate whether entity profiles are relevant to a retrieval query about business risk. "
+    "Given a query and numbered candidate profiles, return a JSON array of the 1-based indices "
+    "of profiles that are genuinely relevant. If none are relevant, return []. "
+    "Output ONLY the JSON array. No explanation."
 )
 
 _CACHE: dict[str, str] = {}
@@ -52,6 +72,14 @@ def _cache_key(entity: dict) -> str:
     )
 
 
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip(" -*\t")
+        if stripped:
+            return stripped
+    return text.strip()
+
+
 async def rewrite_entity_query(entity: dict, fallback: str) -> str:
     """Return a compressed retrieval query, or the fallback on any failure."""
     if not settings.RAG_ENABLE_QUERY_REWRITE:
@@ -79,13 +107,7 @@ async def rewrite_entity_query(entity: dict, fallback: str) -> str:
             ),
             timeout=6.0,
         )
-        text = (response.choices[0].message.content or "").strip()
-        # Take only the first non-empty line in case the model adds preamble.
-        for line in text.splitlines():
-            stripped = line.strip(" -*\t")
-            if stripped:
-                text = stripped
-                break
+        text = _first_nonempty_line(response.choices[0].message.content or "")
         if not text:
             return fallback
         if len(_CACHE) >= _CACHE_MAX:
@@ -93,5 +115,127 @@ async def rewrite_entity_query(entity: dict, fallback: str) -> str:
         _CACHE[key] = text
         return text
     except Exception as exc:
-        logger.debug("[QueryRewrite] failed, using fallback: %s", exc)
+        logger.debug("[QueryRewrite] rewrite failed, using fallback: %s", exc)
         return fallback
+
+
+async def decompose_query(query: str, *, context: str = "") -> list[str]:
+    """Break a complex multi-faceted query into focused sub-queries.
+
+    Useful for conversational agent questions that span multiple dimensions
+    (e.g. "high-risk manufacturing customers with declining order frequency").
+    Returns the original query wrapped in a list on any failure.
+    """
+    if not settings.RAG_ENABLE_QUERY_DECOMPOSE:
+        return [query]
+    client = _get_client()
+    if client is None:
+        return [query]
+
+    user_parts = [f"Query: {query[:500]}"]
+    if context:
+        user_parts.append(f"Context: {context[:300]}")
+
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": _DECOMPOSE_SYSTEM},
+                    {"role": "user", "content": "\n".join(user_parts)},
+                ],
+                temperature=0.0,
+                max_tokens=200,
+            ),
+            timeout=8.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        sub_queries: list[str] = json.loads(raw)
+        if not isinstance(sub_queries, list) or not sub_queries:
+            return [query]
+        # Keep only non-empty strings, cap at 4
+        result = [str(q).strip() for q in sub_queries if str(q).strip()][:4]
+        logger.debug("[QueryRewrite] decomposed into %d sub-queries", len(result))
+        return result or [query]
+    except Exception as exc:
+        logger.debug("[QueryRewrite] decompose failed, using original: %s", exc)
+        return [query]
+
+
+async def expand_query(query: str) -> list[str]:
+    """Generate semantic variants of a query to improve retrieval recall.
+
+    Returns a list beginning with the original query followed by variants.
+    Falls back to [query] on any failure.
+    """
+    client = _get_client()
+    if client is None:
+        return [query]
+
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": _EXPAND_SYSTEM},
+                    {"role": "user", "content": f"Query: {query[:400]}"},
+                ],
+                temperature=0.3,
+                max_tokens=200,
+            ),
+            timeout=8.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        variants: list[str] = json.loads(raw)
+        if not isinstance(variants, list):
+            return [query]
+        result = [query] + [str(v).strip() for v in variants if str(v).strip()][:3]
+        logger.debug("[QueryRewrite] expanded to %d variants", len(result))
+        return result
+    except Exception as exc:
+        logger.debug("[QueryRewrite] expand failed, using original: %s", exc)
+        return [query]
+
+
+async def validate_retrieval_relevance(
+    query: str,
+    profile_summaries: list[str],
+) -> list[int] | None:
+    """Return 0-based indices of relevant profiles, or None if validation cannot run.
+
+    Caller should keep the pre-validation set when result is None or fewer than
+    RAG_VALIDATION_MIN_RELEVANT pass — this is a best-effort quality gate, not a hard filter.
+    """
+    if not profile_summaries:
+        return None
+    client = _get_client()
+    if client is None:
+        return None
+
+    numbered = "\n".join(f"{i + 1}. {s[:150]}" for i, s in enumerate(profile_summaries))
+    user_msg = f"Query: {query[:300]}\n\nCandidates:\n{numbered}"
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": _VALIDATE_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=80,
+            ),
+            timeout=5.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        indices_1based: list[Any] = json.loads(raw)
+        if not isinstance(indices_1based, list):
+            return None
+        return [
+            i - 1
+            for i in indices_1based
+            if isinstance(i, int) and 1 <= i <= len(profile_summaries)
+        ]
+    except Exception as exc:
+        logger.debug("[QueryRewrite] validate failed, keeping all: %s", exc)
+        return None

@@ -84,6 +84,7 @@ class PipelineRunRepository:
         provider_fallbacks: int,
         step_metrics: list | None,
         generation_caps: dict | None,
+        rag_metrics: dict | None = None,
     ) -> None:
         run.status = status
         run.error = error
@@ -100,4 +101,5 @@ class PipelineRunRepository:
         run.provider_fallbacks = provider_fallbacks
         run.step_metrics = step_metrics
         run.generation_caps = generation_caps
+        run.rag_metrics = rag_metrics
         await self.db.flush()

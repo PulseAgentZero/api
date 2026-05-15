@@ -53,6 +53,7 @@ class PipelineRun(Base, UUIDMixin, TimestampMixin):
 
     step_metrics: Mapped[list | None] = mapped_column(JSONB)
     generation_caps: Mapped[dict | None] = mapped_column(JSONB)
+    rag_metrics: Mapped[dict | None] = mapped_column(JSONB)
 
     mapping_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("schema_mappings.id", ondelete="SET NULL")
