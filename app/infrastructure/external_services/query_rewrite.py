@@ -37,6 +37,13 @@ _EXPAND_SYSTEM = (
     "the original intent. Output ONLY a JSON array of 3 strings. No explanation, no markdown."
 )
 
+_VALIDATE_SYSTEM = (
+    "You evaluate whether entity profiles are relevant to a retrieval query about business risk. "
+    "Given a query and numbered candidate profiles, return a JSON array of the 1-based indices "
+    "of profiles that are genuinely relevant. If none are relevant, return []. "
+    "Output ONLY the JSON array. No explanation."
+)
+
 _CACHE: dict[str, str] = {}
 _CACHE_MAX = 512
 
@@ -188,3 +195,47 @@ async def expand_query(query: str) -> list[str]:
     except Exception as exc:
         logger.debug("[QueryRewrite] expand failed, using original: %s", exc)
         return [query]
+
+
+async def validate_retrieval_relevance(
+    query: str,
+    profile_summaries: list[str],
+) -> list[int] | None:
+    """Return 0-based indices of relevant profiles, or None if validation cannot run.
+
+    Caller should keep the pre-validation set when result is None or fewer than
+    RAG_VALIDATION_MIN_RELEVANT pass — this is a best-effort quality gate, not a hard filter.
+    """
+    if not profile_summaries:
+        return None
+    client = _get_client()
+    if client is None:
+        return None
+
+    numbered = "\n".join(f"{i + 1}. {s[:150]}" for i, s in enumerate(profile_summaries))
+    user_msg = f"Query: {query[:300]}\n\nCandidates:\n{numbered}"
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": _VALIDATE_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=80,
+            ),
+            timeout=5.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        indices_1based: list[Any] = json.loads(raw)
+        if not isinstance(indices_1based, list):
+            return None
+        return [
+            i - 1
+            for i in indices_1based
+            if isinstance(i, int) and 1 <= i <= len(profile_summaries)
+        ]
+    except Exception as exc:
+        logger.debug("[QueryRewrite] validate failed, keeping all: %s", exc)
+        return None

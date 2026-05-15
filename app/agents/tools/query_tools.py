@@ -328,13 +328,13 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         Tool(
             name="query_entity_table",
             description=(
-                "Query the mapped entity table (READ-ONLY). "
-                "Returns rows from the org's primary entity table. "
-                "All queries run in a read-only transaction — writes are impossible."
+                "Read rows from the org's mapped entity table (READ-ONLY transaction). "
+                "Returns: {rows: list[dict], count: int, table: str}. "
+                "Limits: max 500 rows per call; WHERE clauses are SELECT-only (no DML/DDL/comments/semicolons)."
             ),
             parameters=[
                 ToolParam("columns", "string", "Comma-separated column names or '*' for all", required=False),
-                ToolParam("limit", "integer", "Max rows to return (max 500)", required=False),
+                ToolParam("limit", "integer", "Max rows to return (capped at 500)", required=False),
                 ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_entity_table,
@@ -342,13 +342,14 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         Tool(
             name="query_related_table",
             description=(
-                "Query any table in the client database for cross-table analysis (READ-ONLY). "
-                "All queries run in a read-only transaction — writes are impossible."
+                "Read rows from any table in the client database for cross-table analysis (READ-ONLY transaction). "
+                "Returns: {rows: list[dict], count: int, table: str} on success, or {error: str} if the table is not found. "
+                "Limits: max 500 rows per call; WHERE clauses are SELECT-only."
             ),
             parameters=[
                 ToolParam("table_name", "string", "Name of the table to query"),
                 ToolParam("columns", "string", "Comma-separated column names or '*'", required=False),
-                ToolParam("limit", "integer", "Max rows to return (max 500)", required=False),
+                ToolParam("limit", "integer", "Max rows to return (capped at 500)", required=False),
                 ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_related_table,
@@ -356,8 +357,9 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         Tool(
             name="query_aggregate",
             description=(
-                "Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on any table (READ-ONLY). "
-                "All queries run in a read-only transaction — writes are impossible."
+                "Run a single aggregate (COUNT/SUM/AVG/MIN/MAX) on any table, optionally grouped (READ-ONLY). "
+                "Returns: {results: list[dict], aggregate: str, column: str, table: str}, or {error: str} for an unsupported aggregate. "
+                "Limits: GROUP BY results capped at 50 rows (ordered by result DESC); WHERE clauses are SELECT-only."
             ),
             parameters=[
                 ToolParam("table_name", "string", "Table to aggregate"),
@@ -370,13 +372,21 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         ),
         Tool(
             name="list_tables",
-            description="List all tables in the client database with their column names (READ-ONLY).",
+            description=(
+                "List every table in the client database with its column names (READ-ONLY). "
+                "Returns: {tables: list[{name: str, columns: list[str]}], count: int}. "
+                "Use this once at the start of an exploration; do not call repeatedly."
+            ),
             parameters=[],
             execute=list_tables,
         ),
         Tool(
             name="get_row_count",
-            description="Get the total row count of a table (READ-ONLY).",
+            description=(
+                "Count all rows in a single table (READ-ONLY). "
+                "Returns: {table: str, row_count: int}. "
+                "May be slow on very large unindexed tables; do not use as a hot loop."
+            ),
             parameters=[
                 ToolParam("table_name", "string", "Name of the table"),
             ],
@@ -384,7 +394,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         ),
         Tool(
             name="validate_column_exists",
-            description="Check if a specific column exists in a table (READ-ONLY).",
+            description=(
+                "Check whether a specific column is present in a table (READ-ONLY). "
+                "Returns: {exists: bool, available_columns: list[str]}. "
+                "Use before referencing an unverified column in another tool call."
+            ),
             parameters=[
                 ToolParam("table_name", "string", "Table to check"),
                 ToolParam("column_name", "string", "Column name to validate"),

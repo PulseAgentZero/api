@@ -38,6 +38,16 @@ def _to_point_id(entity_id: str) -> str:
     return str(uuid.uuid5(_POINT_ID_NS, entity_id))
 
 
+# Suffixes appended to entity_id to generate per-chunk-type point IDs.
+# "" = summary (backward-compatible), ":bs" = behavioral_signals, ":an" = anomalies.
+_CHUNK_SUFFIXES = ("", ":bs", ":an")
+
+
+def _all_chunk_point_ids(entity_id: str) -> list[str]:
+    """Return point IDs for all hierarchical chunk variants of an entity."""
+    return [_to_point_id(entity_id + s) for s in _CHUNK_SUFFIXES]
+
+
 def _retry() -> AsyncRetrying:
     return AsyncRetrying(
         stop=stop_after_attempt(3),
@@ -88,7 +98,7 @@ class QdrantService:
                     lowercase=True,
                 ),
             )
-            for keyword_field in ("risk_tier", "status", "model_version", "chunk_type"):
+            for keyword_field in ("risk_tier", "status", "model_version", "chunk_type", "entity_id"):
                 await client.create_payload_index(
                     collection_name=collection_name,
                     field_name=keyword_field,
@@ -152,7 +162,7 @@ class QdrantService:
         entity_id: str,
         payload: dict[str, Any],
     ) -> None:
-        """Partial payload update for an existing point. No vector change."""
+        """Partial payload update for an entity. Applies to all chunk variants."""
         client = await self._get_client()
         collection_name = settings.get_org_collection_name(org_id)
         async for attempt in _retry():
@@ -160,7 +170,7 @@ class QdrantService:
                 await client.set_payload(
                     collection_name=collection_name,
                     payload=payload,
-                    points=[_to_point_id(entity_id)],
+                    points=_all_chunk_point_ids(entity_id),
                 )
 
     async def set_payload_batch(
@@ -208,7 +218,7 @@ class QdrantService:
         )
         return [
             SearchResult(
-                entity_id=(p.payload or {}).get("_entity_id", str(p.id)),
+                entity_id=(p.payload or {}).get("entity_id") or (p.payload or {}).get("_entity_id", str(p.id)),
                 score=p.score,
                 payload=p.payload or {},
             )
@@ -282,7 +292,7 @@ class QdrantService:
         )
         return [
             SearchResult(
-                entity_id=(p.payload or {}).get("_entity_id", str(p.id)),
+                entity_id=(p.payload or {}).get("entity_id") or (p.payload or {}).get("_entity_id", str(p.id)),
                 score=p.score,
                 payload=p.payload or {},
             )
@@ -357,7 +367,7 @@ class QdrantService:
         collection_name = settings.get_org_collection_name(org_id)
         await client.delete(
             collection_name=collection_name,
-            points_selector=[_to_point_id(entity_id)],
+            points_selector=models.PointIdsList(points=_all_chunk_point_ids(entity_id)),
         )
 
     async def delete_org_collection(self, org_id: str) -> None:

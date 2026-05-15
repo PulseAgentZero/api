@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -23,7 +24,11 @@ from app.infrastructure.external_services.reranker import (
     VoyageReranker,
     voyage_reranker,
 )
-from app.infrastructure.external_services.query_rewrite import rewrite_entity_query
+from app.infrastructure.external_services.query_rewrite import (
+    expand_query,
+    rewrite_entity_query,
+    validate_retrieval_relevance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,10 @@ class RagRunStats:
     total_rag_ms: float = 0.0
     rerank_applied_count: int = 0
     autocut_removed_count: int = 0
+    validation_applied_count: int = 0
+    validation_rejected_count: int = 0
+    expansion_applied_count: int = 0
+    expansion_extra_candidates: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -51,6 +60,8 @@ def _merge_rag_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
         "entities_enriched", "total_rewrite_ms", "total_embed_ms",
         "total_search_ms", "total_rerank_ms", "total_rag_ms",
         "rerank_applied_count", "autocut_removed_count",
+        "validation_applied_count", "validation_rejected_count",
+        "expansion_applied_count", "expansion_extra_candidates",
     )
     return {k: a.get(k, 0) + b.get(k, 0) for k in keys}
 
@@ -68,6 +79,9 @@ class RagConfig:
     enable_query_rewrite: bool
     enable_autocut: bool = True
     rerank_model: str | None = None
+    enable_hierarchical_chunks: bool = True
+    enable_retrieval_validation: bool = False
+    enable_query_expansion: bool = False
 
     @classmethod
     def from_defaults(cls) -> "RagConfig":
@@ -81,6 +95,9 @@ class RagConfig:
             enable_query_rewrite=settings.RAG_ENABLE_QUERY_REWRITE,
             enable_autocut=settings.RAG_ENABLE_AUTOCUT,
             rerank_model=None,
+            enable_hierarchical_chunks=settings.RAG_ENABLE_HIERARCHICAL_CHUNKS,
+            enable_retrieval_validation=settings.RAG_ENABLE_RETRIEVAL_VALIDATION,
+            enable_query_expansion=settings.RAG_ENABLE_QUERY_EXPANSION,
         )
 
     @classmethod
@@ -103,6 +120,15 @@ class RagConfig:
             ),
             enable_autocut=bool(overrides.get("enable_autocut", base.enable_autocut)),
             rerank_model=overrides.get("rerank_model") or base.rerank_model,
+            enable_hierarchical_chunks=bool(
+                overrides.get("enable_hierarchical_chunks", base.enable_hierarchical_chunks)
+            ),
+            enable_retrieval_validation=bool(
+                overrides.get("enable_retrieval_validation", base.enable_retrieval_validation)
+            ),
+            enable_query_expansion=bool(
+                overrides.get("enable_query_expansion", base.enable_query_expansion)
+            ),
         )
 
 
@@ -185,6 +211,54 @@ def _profile_to_summary_text(profile: dict) -> str:
     return " | ".join(parts)
 
 
+def _profile_to_signals_text(profile: dict) -> str:
+    """Focused embedding text for signal-specific retrieval (behavioral_signals chunk)."""
+    parts: list[str] = [f"Entity {profile.get('entity_id', 'unknown')} signals"]
+    metrics = profile.get("behavioural_metrics", {})
+    if metrics and isinstance(metrics, dict):
+        numeric = sorted(
+            ((k, v) for k, v in metrics.items() if isinstance(v, (int, float))),
+            key=lambda kv: abs(kv[1]),
+            reverse=True,
+        )[:15]
+        if numeric:
+            parts.append(", ".join(f"{k}={v}" for k, v in numeric))
+    risk_tier = profile.get("risk_tier") or (profile.get("base_attributes") or {}).get("risk_tier")
+    if risk_tier:
+        parts.append(f"tier={risk_tier}")
+    return " | ".join(parts)
+
+
+def _profile_to_anomalies_text(profile: dict) -> str:
+    """Focused embedding text for delta/outlier retrieval (anomalies chunk)."""
+    parts: list[str] = [f"Entity {profile.get('entity_id', 'unknown')} anomalies"]
+    metrics = profile.get("behavioural_metrics", {})
+    if metrics and isinstance(metrics, dict):
+        delta_pairs = [
+            (k, v) for k, v in metrics.items()
+            if isinstance(v, (int, float)) and any(
+                kw in k.lower()
+                for kw in ("delta", "change", "diff", "trend", "velocity", "rate", "shift")
+            )
+        ]
+        if delta_pairs:
+            delta_pairs.sort(key=lambda kv: abs(kv[1]), reverse=True)
+            parts.append("deltas: " + ", ".join(f"{k}={v}" for k, v in delta_pairs[:10]))
+        else:
+            # Proxy: top absolute-magnitude signals as outlier stand-ins
+            top = sorted(
+                ((k, v) for k, v in metrics.items() if isinstance(v, (int, float))),
+                key=lambda kv: abs(kv[1]),
+                reverse=True,
+            )[:5]
+            if top:
+                parts.append("outliers: " + ", ".join(f"{k}={v}" for k, v in top))
+    summary = str(profile.get("profile_summary", "")).strip()
+    if summary:
+        parts.append(summary[:100])
+    return " | ".join(parts)
+
+
 def _entity_to_query_text(entity: dict) -> str:
     """Concise dump of an entity's profile + signals for retrieval."""
     parts: list[str] = []
@@ -207,7 +281,12 @@ def _now_ts() -> float:
 
 
 async def embed_and_store_profiles(org_id: str, profiles: list[dict]) -> None:
-    """Embed entity profiles and batch-upsert with model + freshness metadata."""
+    """Embed entity profiles and batch-upsert with model + freshness metadata.
+
+    When RAG_ENABLE_HIERARCHICAL_CHUNKS is true, stores three chunk types per entity:
+    summary (broad), behavioral_signals (metrics-focused), anomalies (delta/outlier-focused).
+    All chunks share the same entity_id payload field for cross-chunk deduplication.
+    """
     if not profiles or not settings.is_voyage_configured():
         return
 
@@ -215,41 +294,52 @@ async def embed_and_store_profiles(org_id: str, profiles: list[dict]) -> None:
         qdrant = QdrantService()
         await qdrant.ensure_collection(org_id)
 
-        texts: list[str] = []
-        entity_ids: list[str] = []
+        use_hierarchical = settings.RAG_ENABLE_HIERARCHICAL_CHUNKS
+
+        # (point_key, embedding_text, real_entity_id, chunk_type)
+        chunk_specs: list[tuple[str, str, str, str]] = []
         for p in profiles:
             eid = p.get("entity_id")
             if eid is None:
                 continue
-            texts.append(_profile_to_summary_text(p))
-            entity_ids.append(str(eid))
+            eid_str = str(eid)
+            chunk_specs.append((eid_str, _profile_to_summary_text(p), eid_str, "summary"))
+            if use_hierarchical:
+                chunk_specs.append((f"{eid_str}:bs", _profile_to_signals_text(p), eid_str, "behavioral_signals"))
+                chunk_specs.append((f"{eid_str}:an", _profile_to_anomalies_text(p), eid_str, "anomalies"))
 
-        if not texts:
+        if not chunk_specs:
             return
 
         t0 = time.perf_counter()
-        vectors = await embedding_service.embed_batch(texts, input_type="document")
+        vectors = await embedding_service.embed_batch(
+            [cs[1] for cs in chunk_specs], input_type="document"
+        )
         embed_ms = (time.perf_counter() - t0) * 1000
 
         profile_by_id = {str(p.get("entity_id")): p for p in profiles}
         ts = _now_ts()
         items: list[tuple[str, list[float], dict[str, Any]]] = []
-        for entity_id, vector in zip(entity_ids, vectors):
+        for (point_key, _, entity_id, chunk_type), vector in zip(chunk_specs, vectors):
             profile = profile_by_id.get(entity_id, {})
             payload: dict[str, Any] = {
+                "entity_id": entity_id,
                 "profile_summary": str(profile.get("profile_summary", "")),
                 "behavioural_metrics": profile.get("behavioural_metrics", {}),
                 "base_attributes": profile.get("base_attributes", {}),
                 "model_version": embedding_service.model,
                 "embedded_at": ts,
-                "chunk_type": "summary",
+                "chunk_type": chunk_type,
             }
-            items.append((entity_id, vector, payload))
+            items.append((point_key, vector, payload))
 
         await qdrant.upsert_batch(org_id, items)
+        n_entities = sum(1 for cs in chunk_specs if cs[3] == "summary")
         logger.info(
-            "[RAG] upserted %d profiles for org=%s (embed=%.0fms model=%s)",
+            "[RAG] upserted %d chunks (%d entities, hierarchical=%s) for org=%s (embed=%.0fms model=%s)",
             len(items),
+            n_entities,
+            use_hierarchical,
             org_id,
             embed_ms,
             embedding_service.model,
@@ -336,6 +426,62 @@ async def _retrieve_candidates(
     )
 
 
+async def _retrieve_multi_query(
+    org_id: str,
+    *,
+    query_texts: list[str],
+    qdrant: QdrantService,
+    svc: EmbeddingService,
+    config: RagConfig,
+    filter_condition: qmodels.Filter | None,
+) -> tuple[list[SearchResult], int]:
+    """Batch-embed query variants, search per variant in parallel, merge by entity_id (max score).
+
+    Returns (merged_candidates, max_single_variant_count) so callers can compute the
+    expansion lift over the strongest single-query baseline.
+    """
+    vectors = await svc.embed_batch(query_texts, input_type="query")
+
+    async def _search_one(vec: list[float], txt: str) -> list[SearchResult]:
+        if config.enable_hybrid:
+            return await qdrant.hybrid_search(
+                org_id,
+                vec,
+                text_query=txt,
+                limit=config.prefetch_limit,
+                prefetch_limit=config.prefetch_limit,
+                filter_condition=filter_condition,
+            )
+        return await qdrant.search_similar(
+            org_id,
+            vec,
+            limit=config.prefetch_limit,
+            score_threshold=config.score_threshold,
+            filter_condition=filter_condition,
+        )
+
+    per_variant = await asyncio.gather(
+        *[_search_one(vec, txt) for vec, txt in zip(vectors, query_texts)],
+        return_exceptions=True,
+    )
+
+    merged: dict[str, SearchResult] = {}
+    max_single = 0
+    for results in per_variant:
+        if isinstance(results, BaseException):
+            continue
+        if len(results) > max_single:
+            max_single = len(results)
+        for r in results:
+            eid_str = str(r.entity_id)
+            existing = merged.get(eid_str)
+            if existing is None or (r.score or 0.0) > (existing.score or 0.0):
+                merged[eid_str] = r
+
+    candidates = sorted(merged.values(), key=lambda r: r.score or 0.0, reverse=True)
+    return candidates, max_single
+
+
 async def enrich_entities_with_similar(
     org_id: str,
     entities: list[dict],
@@ -388,6 +534,9 @@ async def enrich_entities_with_similar(
             enable_query_rewrite=cfg.enable_query_rewrite,
             enable_autocut=cfg.enable_autocut,
             rerank_model=cfg.rerank_model,
+            enable_hierarchical_chunks=cfg.enable_hierarchical_chunks,
+            enable_retrieval_validation=cfg.enable_retrieval_validation,
+            enable_query_expansion=cfg.enable_query_expansion,
         )
     rerank = reranker or (
         VoyageReranker(model=cfg.rerank_model) if cfg.rerank_model else voyage_reranker
@@ -426,27 +575,64 @@ async def enrich_entities_with_similar(
         else:
             rewritten = raw_query
 
+        # Build query variants. Skip expansion on short queries — variants drift
+        # too easily from already-terse text (Context Engineering, Query Augmentation).
+        variants: list[str] = [rewritten]
+        if cfg.enable_query_expansion and len(rewritten.split()) >= 5:
+            try:
+                expanded = await expand_query(rewritten)
+                # Dedup, preserve order, cap at 4 (original + up to 3 variants).
+                seen_v: set[str] = set()
+                variants = []
+                for v in expanded:
+                    v_norm = v.strip()
+                    if v_norm and v_norm.lower() not in seen_v:
+                        seen_v.add(v_norm.lower())
+                        variants.append(v_norm)
+                    if len(variants) >= 4:
+                        break
+                if not variants:
+                    variants = [rewritten]
+            except Exception as exc:
+                logger.debug("[RAG] query expansion failed (single query): %s", exc)
+                variants = [rewritten]
+
+        retrieval_cfg = RagConfig(
+            top_k=cfg.top_k,
+            prefetch_limit=max(cfg.prefetch_limit, cfg.top_k + 1),
+            score_threshold=cfg.score_threshold,
+            freshness_days=cfg.freshness_days,
+            enable_rerank=cfg.enable_rerank,
+            enable_hybrid=cfg.enable_hybrid,
+            enable_query_rewrite=cfg.enable_query_rewrite,
+            enable_autocut=cfg.enable_autocut,
+            rerank_model=cfg.rerank_model,
+        )
+
         t_search = time.perf_counter()
         try:
-            candidates = await _retrieve_candidates(
-                org_id,
-                query_text=raw_query,
-                rewritten_query=rewritten,
-                qdrant=qd,
-                svc=svc,
-                config=RagConfig(
-                    top_k=cfg.top_k,
-                    prefetch_limit=max(cfg.prefetch_limit, cfg.top_k + 1),
-                    score_threshold=cfg.score_threshold,
-                    freshness_days=cfg.freshness_days,
-                    enable_rerank=cfg.enable_rerank,
-                    enable_hybrid=cfg.enable_hybrid,
-                    enable_query_rewrite=cfg.enable_query_rewrite,
-                    enable_autocut=cfg.enable_autocut,
-                    rerank_model=cfg.rerank_model,
-                ),
-                filter_condition=filter_condition,
-            )
+            if len(variants) <= 1:
+                candidates = await _retrieve_candidates(
+                    org_id,
+                    query_text=raw_query,
+                    rewritten_query=variants[0],
+                    qdrant=qd,
+                    svc=svc,
+                    config=retrieval_cfg,
+                    filter_condition=filter_condition,
+                )
+            else:
+                candidates, max_single = await _retrieve_multi_query(
+                    org_id,
+                    query_texts=variants,
+                    qdrant=qd,
+                    svc=svc,
+                    config=retrieval_cfg,
+                    filter_condition=filter_condition,
+                )
+                if run_stats is not None:
+                    run_stats.expansion_applied_count += 1
+                    run_stats.expansion_extra_candidates += max(0, len(candidates) - max_single)
         except Exception as exc:
             logger.warning("[RAG] retrieval failed for entity %s: %s", eid, exc)
             enriched.append(entity)
@@ -456,6 +642,17 @@ async def enrich_entities_with_similar(
 
         # Self-exclusion
         candidates = [c for c in candidates if str(c.entity_id) != str(eid)]
+
+        # Dedup: hierarchical storage can return multiple chunks per entity;
+        # keep the highest-scoring chunk per entity_id.
+        if len(candidates) > 1:
+            seen: dict[str, SearchResult] = {}
+            for c in candidates:
+                c_eid = str(c.entity_id)
+                if c_eid not in seen or (c.score or 0.0) > (seen[c_eid].score or 0.0):
+                    seen[c_eid] = c
+            if len(seen) < len(candidates):
+                candidates = sorted(seen.values(), key=lambda r: r.score or 0.0, reverse=True)
 
         # Distance threshold (post-filter; hybrid path doesn't take it natively)
         filtered = [
@@ -527,6 +724,32 @@ async def enrich_entities_with_similar(
                 filtered = filtered[: cfg.top_k]
         else:
             filtered = filtered[: cfg.top_k]
+
+        # (optional) Post-rerank semantic relevance validation — quality gate before
+        # results enter LLM context. Degrades gracefully: if fewer than
+        # RAG_VALIDATION_MIN_RELEVANT pass, the pre-validation set is kept.
+        if cfg.enable_retrieval_validation and filtered:
+            try:
+                summaries = [
+                    r.payload.get("profile_summary") or _profile_to_text(r.payload)
+                    for r in filtered
+                ]
+                valid_indices = await validate_retrieval_relevance(rewritten, summaries)
+                if (
+                    valid_indices is not None
+                    and len(valid_indices) >= settings.RAG_VALIDATION_MIN_RELEVANT
+                ):
+                    rejected = len(filtered) - len(valid_indices)
+                    filtered = [filtered[i] for i in valid_indices]
+                    if run_stats is not None:
+                        run_stats.validation_applied_count += 1
+                        run_stats.validation_rejected_count += rejected
+                    logger.debug(
+                        "[RAG] entity=%s: validation kept %d, rejected %d",
+                        eid, len(filtered), rejected,
+                    )
+            except Exception as exc:
+                logger.debug("[RAG] validation step failed (keeping all): %s", exc)
 
         similar: list[dict] = []
         for r in filtered:

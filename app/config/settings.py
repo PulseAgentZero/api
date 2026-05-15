@@ -222,6 +222,10 @@ class Settings:
     RAG_EVAL_RECALL_THRESHOLD: float = float(os.getenv("RAG_EVAL_RECALL_THRESHOLD", "0.5"))
     RAG_THRESHOLD_FALLBACK_FACTOR: float = float(os.getenv("RAG_THRESHOLD_FALLBACK_FACTOR", "0.7"))
     RAG_ENABLE_QUERY_DECOMPOSE: bool = os.getenv("RAG_ENABLE_QUERY_DECOMPOSE", "false").lower() == "true"
+    RAG_ENABLE_HIERARCHICAL_CHUNKS: bool = os.getenv("RAG_ENABLE_HIERARCHICAL_CHUNKS", "true").lower() == "true"
+    RAG_ENABLE_QUERY_EXPANSION: bool = os.getenv("RAG_ENABLE_QUERY_EXPANSION", "false").lower() == "true"
+    RAG_ENABLE_RETRIEVAL_VALIDATION: bool = os.getenv("RAG_ENABLE_RETRIEVAL_VALIDATION", "false").lower() == "true"
+    RAG_VALIDATION_MIN_RELEVANT: int = int(os.getenv("RAG_VALIDATION_MIN_RELEVANT", "1"))
     AGENT_CONTEXT_COMPRESS_THRESHOLD: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_THRESHOLD", "60000"))
     AGENT_CONTEXT_COMPRESS_KEEP_RECENT: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_KEEP_RECENT", "6"))
 
