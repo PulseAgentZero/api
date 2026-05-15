@@ -1,7 +1,7 @@
 """migrate connection flat columns into connection_meta JSONB
 
-Revision ID: f1a2b3c4d5e6
-Revises: e8f9a0b1c2d3
+Revision ID: f9e8d7c6b5a4
+Revises: c7d8e9f0a1b2
 Create Date: 2026-05-15
 
 Drop db_type, host, port, database_name, username, sslmode as dedicated
@@ -16,7 +16,7 @@ from typing import Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "f1a2b3c4d5e6"
+revision: str = "f9e8d7c6b5a4"
 down_revision: Union[str, tuple[str, ...], None] = "c7d8e9f0a1b2"
 branch_labels = None
 depends_on = None
