@@ -38,27 +38,15 @@ class ConnectionRepository:
         org_id: UUID,
         *,
         encrypted_dsn: str | None = None,
-        db_type: str | None = None,
-        host: str | None = None,
-        port: int | None = None,
-        database_name: str | None = None,
-        username: str | None = None,
         name: str | None = None,
         connector_type: str | None = None,
-        sslmode: str | None = None,
         connection_meta: dict | None = None,
     ) -> Connection:
         conn = Connection(
             org_id=org_id,
-            db_type=db_type,
-            host=host,
-            port=port,
-            database_name=database_name,
-            username=username,
             encrypted_dsn=encrypted_dsn,
-            sslmode=sslmode or "prefer",
             name=name or "My Connection",
-            connector_type=connector_type or (db_type or "postgres"),
+            connector_type=connector_type or "postgresql",
             connection_meta=connection_meta or {},
         )
         self.db.add(conn)

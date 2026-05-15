@@ -178,7 +178,7 @@ async def save_and_test_connection(
     repo = ConnectionRepository(db)
     built = build_encrypted_secret_and_row_fields(body)
     plaintext = built.pop("plaintext_secret")
-    meta = built.pop("connection_meta", None) or {}
+    meta = built.get("connection_meta") or {}
 
     # Reuse the org's existing onboarding connection if one exists so we don't
     # create duplicates when the user goes back and resubmits this step.
@@ -190,12 +190,6 @@ async def save_and_test_connection(
             conn.id,
             encrypted_dsn=encrypt_dsn(plaintext),
             name=body.name or conn.name,
-            sslmode=body.sslmode or conn.sslmode,
-            db_type=built.get("db_type"),
-            host=built.get("host"),
-            port=built.get("port"),
-            database_name=built.get("database_name"),
-            username=built.get("username"),
             connector_type=built.get("connector_type"),
             connection_meta=meta,
         )
@@ -205,12 +199,6 @@ async def save_and_test_connection(
             org_id=current_user.org_id,
             encrypted_dsn=encrypt_dsn(plaintext),
             name=body.name or "My Connection",
-            sslmode=body.sslmode,
-            db_type=built.get("db_type"),
-            host=built.get("host"),
-            port=built.get("port"),
-            database_name=built.get("database_name"),
-            username=built.get("username"),
             connector_type=built.get("connector_type"),
             connection_meta=meta,
         )

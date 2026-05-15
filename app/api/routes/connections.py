@@ -152,14 +152,9 @@ async def upload_connection_file(
         raise
     conn = await ConnectionRepository(db).create(
         org_id=current_user.org_id,
-        encrypted_dsn=None,
-        db_type=None,
-        host=None,
-        port=None,
-        database_name=None,
-        username=None,
         name=file.filename or "Uploaded file",
         connector_type="csv",
+        connection_meta={"kind": "csv"},
     )
     conn.config = {"upload_path": dest_path, "original_filename": file.filename}
     conn.status = "pending"
@@ -269,20 +264,12 @@ async def create_connection(
     await max_cloud_free_connections(db, current_user.org_id, await repo.count_active(current_user.org_id))
     built = build_encrypted_secret_and_row_fields(body)
     plaintext = built.pop("plaintext_secret")
-    meta = built.pop("connection_meta", None) or {}
-    encrypted = encrypt_dsn(plaintext)
     conn = await repo.create(
         org_id=current_user.org_id,
-        encrypted_dsn=encrypted,
+        encrypted_dsn=encrypt_dsn(plaintext),
         name=body.name or "My Connection",
-        sslmode=body.sslmode,
-        db_type=built.get("db_type"),
-        host=built.get("host"),
-        port=built.get("port"),
-        database_name=built.get("database_name"),
-        username=built.get("username"),
         connector_type=built.get("connector_type"),
-        connection_meta=meta,
+        connection_meta=built.get("connection_meta") or {},
     )
     success, message, _db_version = await _test_and_mark_connection(conn)
     await db.commit()
@@ -333,16 +320,7 @@ async def _update_connection_record(
 
     if api_blob is not None:
         disallowed = {
-            k
-            for k in (
-                "host",
-                "port",
-                "database_name",
-                "username",
-                "db_type",
-                "password",
-                "connection_url",
-            )
+            k for k in ("host", "port", "database_name", "username", "db_type", "password", "connection_url")
             if k in payload
         }
         if disallowed:
@@ -369,13 +347,14 @@ async def _update_connection_record(
 
     password = payload.pop("password", None) or _password_from_dsn(conn.encrypted_dsn)
 
+    # Update simple top-level fields and meta fields via the model's property setters.
     for key, value in payload.items():
         if key == "connection_url":
             continue
         if hasattr(conn, key):
             setattr(conn, key, value)
 
-    ct = (conn.connector_type or "postgres").lower()
+    ct = (conn.connector_type or "postgresql").lower()
     dt = (conn.db_type or "postgresql").lower()
     if dt == "postgres":
         dt = "postgresql"
@@ -406,12 +385,8 @@ async def _update_connection_record(
             db_for_dsn = "postgresql"
         conn.encrypted_dsn = encrypt_dsn(
             _make_sql_dsn(
-                db_for_dsn,
-                conn.host,
-                int(conn.port),
-                conn.database_name,
-                conn.username,
-                password,
+                db_for_dsn, conn.host, int(conn.port),
+                conn.database_name, conn.username, password,
                 sslmode=conn.sslmode,
             )
         )

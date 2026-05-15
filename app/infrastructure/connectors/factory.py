@@ -19,7 +19,12 @@ def _norm_connector(ct: str | None, db: str | None) -> str:
 
 
 def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict:
-    """Return kwargs for ``ConnectionRepository.create`` (encrypted_dsn, db_type, host, …)."""
+    """Return kwargs for ``ConnectionRepository.create``.
+
+    All connector-specific fields go into ``connection_meta`` so the
+    connections table stays schema-agnostic. Callers only need to forward
+    ``plaintext_secret``, ``connector_type``, and ``connection_meta``.
+    """
     ct = _norm_connector(body.connector_type, body.db_type)
 
     if ct in ("postgresql", "mysql", "mssql", "redshift"):
@@ -35,39 +40,36 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         if ct == "redshift":
             db_t = "redshift"
         dsn = _make_sql_dsn(
-            db_t,
-            body.host,
-            body.port,
-            body.database_name,
-            body.username,
-            body.password or "",
-            sslmode=body.sslmode,
+            db_t, body.host, body.port, body.database_name, body.username,
+            body.password or "", sslmode=body.sslmode,
         )
         return {
             "plaintext_secret": dsn,
-            "db_type": db_t,
-            "host": body.host,
-            "port": body.port,
-            "database_name": body.database_name,
-            "username": body.username,
             "connector_type": "mysql" if ct == "mysql" else ("postgres" if ct == "postgresql" else ct),
-            "connection_meta": {"kind": "sql", "sslmode": body.sslmode},
+            "connection_meta": {
+                "kind": "sql",
+                "db_type": db_t,
+                "host": body.host,
+                "port": body.port,
+                "database_name": body.database_name,
+                "username": body.username,
+                "sslmode": body.sslmode or "prefer",
+            },
         }
 
     if ct == "sqlite":
         path = (body.database_name or "").strip()
         if not path:
             raise bad_request("BAD_REQUEST", "For SQLite, database_name must be the file path")
-        dsn = f"sqlite:///{path}"
         return {
-            "plaintext_secret": dsn,
-            "db_type": "sqlite",
-            "host": None,
-            "port": None,
-            "database_name": path,
-            "username": None,
+            "plaintext_secret": f"sqlite:///{path}",
             "connector_type": "sqlite",
-            "connection_meta": {"kind": "sqlite", "path": path},
+            "connection_meta": {
+                "kind": "sqlite",
+                "db_type": "sqlite",
+                "database_name": path,
+                "sslmode": "disable",
+            },
         }
 
     if ct in ("snowflake", "bigquery", "databricks"):
@@ -76,18 +78,14 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
             raise bad_request("BAD_REQUEST", "connection_url is required for this warehouse connector")
         return {
             "plaintext_secret": url,
-            "db_type": ct,
-            "host": None,
-            "port": None,
-            "database_name": None,
-            "username": None,
             "connector_type": ct,
-            "connection_meta": {"kind": "warehouse", "provider": ct},
+            "connection_meta": {"kind": "warehouse", "db_type": ct, "provider": ct},
         }
 
     if ct == "clickhouse":
         if body.connection_url and body.connection_url.strip().startswith("clickhouse"):
             blob = pulse_api_blob("clickhouse_native", dsn=body.connection_url.strip())
+            mode = "native"
         elif body.clickhouse_https_url:
             blob = pulse_api_blob(
                 "clickhouse_http",
@@ -95,6 +93,7 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
                 user=body.clickhouse_user or "",
                 password=body.clickhouse_password or "",
             )
+            mode = "http"
         else:
             raise bad_request(
                 "BAD_REQUEST",
@@ -102,18 +101,8 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
             )
         return {
             "plaintext_secret": blob,
-            "db_type": "clickhouse",
-            "host": None,
-            "port": None,
-            "database_name": None,
-            "username": None,
             "connector_type": "clickhouse",
-            "connection_meta": {
-                "kind": "clickhouse",
-                "mode": "native"
-                if (body.connection_url or "").strip().lower().startswith("clickhouse")
-                else "http",
-            },
+            "connection_meta": {"kind": "clickhouse", "db_type": "clickhouse", "mode": mode},
         }
 
     if ct == "airtable":
@@ -122,13 +111,12 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         blob = pulse_api_blob("airtable", pat=body.airtable_pat.strip())
         return {
             "plaintext_secret": blob,
-            "db_type": "airtable",
-            "host": None,
-            "port": None,
-            "database_name": (body.airtable_base_id or "").strip() or None,
-            "username": None,
             "connector_type": "airtable",
-            "connection_meta": {"kind": "airtable", "base_id": (body.airtable_base_id or "").strip() or None},
+            "connection_meta": {
+                "kind": "airtable",
+                "db_type": "airtable",
+                "database_name": (body.airtable_base_id or "").strip() or None,
+            },
         }
 
     if ct == "google_sheets":
@@ -141,14 +129,10 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         )
         return {
             "plaintext_secret": blob,
-            "db_type": "google_sheets",
-            "host": None,
-            "port": None,
-            "database_name": None,
-            "username": None,
             "connector_type": "google_sheets",
             "connection_meta": {
                 "kind": "google_sheets",
+                "db_type": "google_sheets",
                 "spreadsheet_id": body.google_spreadsheet_id.strip(),
             },
         }
@@ -159,13 +143,8 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         blob = pulse_api_blob("mongodb", uri=body.mongodb_uri.strip())
         return {
             "plaintext_secret": blob,
-            "db_type": "mongodb",
-            "host": None,
-            "port": None,
-            "database_name": None,
-            "username": None,
             "connector_type": "mongodb",
-            "connection_meta": {"kind": "mongodb"},
+            "connection_meta": {"kind": "mongodb", "db_type": "mongodb"},
         }
 
     if ct == "s3":
@@ -180,14 +159,10 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         )
         return {
             "plaintext_secret": blob,
-            "db_type": "s3",
-            "host": None,
-            "port": None,
-            "database_name": None,
-            "username": None,
             "connector_type": "s3",
             "connection_meta": {
                 "kind": "s3",
+                "db_type": "s3",
                 "bucket": body.s3_bucket.strip(),
                 "region": body.s3_region or "us-east-1",
             },
@@ -203,13 +178,12 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         )
         return {
             "plaintext_secret": blob,
-            "db_type": "gcs",
-            "host": None,
-            "port": None,
-            "database_name": None,
-            "username": None,
             "connector_type": "gcs",
-            "connection_meta": {"kind": "gcs", "bucket": body.gcs_bucket.strip()},
+            "connection_meta": {
+                "kind": "gcs",
+                "db_type": "gcs",
+                "bucket": body.gcs_bucket.strip(),
+            },
         }
 
     raise bad_request("BAD_REQUEST", f"Unsupported connector_type: {ct}")

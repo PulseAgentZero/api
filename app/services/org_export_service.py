@@ -40,18 +40,14 @@ def _user_public(u: User) -> dict[str, Any]:
 
 
 def _connection_public(c: Connection) -> dict[str, Any]:
+    # All connector-specific fields live in connection_meta; expose it directly.
+    # Individual convenience fields (db_type, host, etc.) are read via model properties.
     return {
         "id": str(c.id),
         "name": c.name,
         "connector_type": c.connector_type,
-        "db_type": c.db_type,
-        "host": c.host,
-        "port": c.port,
-        "database_name": c.database_name,
-        "username": c.username,
-        "sslmode": c.sslmode,
+        "connection_meta": c.connection_meta or {},
         "status": c.status,
-        "connection_meta": getattr(c, "connection_meta", None) or {},
         "config": c.config or {},
         "has_encrypted_secret": bool(c.encrypted_dsn),
         "last_tested_at": _dt(c.last_tested_at),
