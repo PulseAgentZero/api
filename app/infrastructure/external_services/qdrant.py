@@ -88,17 +88,18 @@ class QdrantService:
                     lowercase=True,
                 ),
             )
-            for keyword_field in ("risk_tier", "status", "model_version"):
+            for keyword_field in ("risk_tier", "status", "model_version", "chunk_type"):
                 await client.create_payload_index(
                     collection_name=collection_name,
                     field_name=keyword_field,
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
-            await client.create_payload_index(
-                collection_name=collection_name,
-                field_name="last_scored_at",
-                field_schema=models.PayloadSchemaType.FLOAT,
-            )
+            for float_field in ("last_scored_at", "embedded_at"):
+                await client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=float_field,
+                    field_schema=models.PayloadSchemaType.FLOAT,
+                )
         except Exception as exc:
             logger.warning("Payload index creation skipped: %s", exc)
         logger.info("Created Qdrant collection %s for org %s", collection_name, org_id)

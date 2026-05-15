@@ -148,6 +148,43 @@ def _profile_to_text(profile: dict) -> str:
     return " | ".join(parts)
 
 
+def _profile_to_summary_text(profile: dict) -> str:
+    """Compact (~100-150 token) embedding anchor focused on dominant signals.
+
+    Avoids the "Rich but Unfindable" problem — full-narrative embeddings are too
+    diffuse for precise cosine similarity. Full text is preserved in the payload.
+    """
+    parts: list[str] = [f"Entity {profile.get('entity_id', 'unknown')}"]
+
+    summary = str(profile.get("profile_summary", "")).strip()
+    if summary:
+        short = summary[:200]
+        for sep in (". ", "! ", "? "):
+            idx = summary.find(sep, 40)
+            if 40 <= idx <= 200:
+                short = summary[: idx + 1]
+                break
+        parts.append(short)
+
+    metrics = profile.get("behavioural_metrics", {})
+    if metrics and isinstance(metrics, dict):
+        top = sorted(
+            ((k, v) for k, v in metrics.items() if isinstance(v, (int, float))),
+            key=lambda kv: abs(kv[1]),
+            reverse=True,
+        )[:3]
+        if top:
+            parts.append("signals: " + ", ".join(f"{k}={v}" for k, v in top))
+
+    attrs = profile.get("base_attributes", {})
+    if attrs and isinstance(attrs, dict):
+        cats = [(k, v) for k, v in attrs.items() if isinstance(v, str)][:2]
+        if cats:
+            parts.append("attrs: " + ", ".join(f"{k}={v}" for k, v in cats))
+
+    return " | ".join(parts)
+
+
 def _entity_to_query_text(entity: dict) -> str:
     """Concise dump of an entity's profile + signals for retrieval."""
     parts: list[str] = []
@@ -184,7 +221,7 @@ async def embed_and_store_profiles(org_id: str, profiles: list[dict]) -> None:
             eid = p.get("entity_id")
             if eid is None:
                 continue
-            texts.append(_profile_to_text(p))
+            texts.append(_profile_to_summary_text(p))
             entity_ids.append(str(eid))
 
         if not texts:
@@ -205,6 +242,7 @@ async def embed_and_store_profiles(org_id: str, profiles: list[dict]) -> None:
                 "base_attributes": profile.get("base_attributes", {}),
                 "model_version": embedding_service.model,
                 "embedded_at": ts,
+                "chunk_type": "summary",
             }
             items.append((entity_id, vector, payload))
 
@@ -424,9 +462,41 @@ async def enrich_entities_with_similar(
             c for c in candidates if c.score is None or c.score >= cfg.score_threshold
         ]
         if not filtered and candidates:
-            # Keep the top dense candidate if everything got filtered — better
-            # than nothing if the threshold is too aggressive.
-            filtered = candidates[: max(cfg.top_k, 1)]
+            # Adaptive threshold fallback: retry with a looser threshold rather than
+            # blindly keeping the top candidate, which may be irrelevant.
+            fallback_threshold = cfg.score_threshold * settings.RAG_THRESHOLD_FALLBACK_FACTOR
+            logger.debug(
+                "[RAG] entity=%s: no candidates above %.2f; retrying at %.2f",
+                eid, cfg.score_threshold, fallback_threshold,
+            )
+            try:
+                retry_candidates = await _retrieve_candidates(
+                    org_id,
+                    query_text=raw_query,
+                    rewritten_query=rewritten,
+                    qdrant=qd,
+                    svc=svc,
+                    config=RagConfig(
+                        top_k=cfg.top_k,
+                        prefetch_limit=max(cfg.prefetch_limit, cfg.top_k + 1),
+                        score_threshold=fallback_threshold,
+                        freshness_days=cfg.freshness_days,
+                        enable_rerank=cfg.enable_rerank,
+                        enable_hybrid=False,  # pure dense for fallback — more stable
+                        enable_query_rewrite=False,
+                        enable_autocut=cfg.enable_autocut,
+                        rerank_model=cfg.rerank_model,
+                    ),
+                    filter_condition=filter_condition,
+                )
+                retry_candidates = [c for c in retry_candidates if str(c.entity_id) != str(eid)]
+                filtered = [c for c in retry_candidates if c.score is None or c.score >= fallback_threshold]
+                if not filtered:
+                    filtered = retry_candidates[: max(cfg.top_k, 1)]
+                logger.debug("[RAG] entity=%s: fallback retrieved %d candidates", eid, len(filtered))
+            except Exception as exc:
+                logger.debug("[RAG] threshold fallback failed for %s: %s", eid, exc)
+                filtered = candidates[: max(cfg.top_k, 1)]
 
         # Autocut: remove candidates below a significant score gap (Weaviate ebook)
         if cfg.enable_autocut and len(filtered) > 1:

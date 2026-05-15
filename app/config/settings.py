@@ -220,6 +220,10 @@ class Settings:
     QDRANT_TTL_DAYS: int = int(os.getenv("QDRANT_TTL_DAYS", "365"))
     RAG_ENABLE_AUTOCUT: bool = os.getenv("RAG_ENABLE_AUTOCUT", "true").lower() == "true"
     RAG_EVAL_RECALL_THRESHOLD: float = float(os.getenv("RAG_EVAL_RECALL_THRESHOLD", "0.5"))
+    RAG_THRESHOLD_FALLBACK_FACTOR: float = float(os.getenv("RAG_THRESHOLD_FALLBACK_FACTOR", "0.7"))
+    RAG_ENABLE_QUERY_DECOMPOSE: bool = os.getenv("RAG_ENABLE_QUERY_DECOMPOSE", "false").lower() == "true"
+    AGENT_CONTEXT_COMPRESS_THRESHOLD: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_THRESHOLD", "60000"))
+    AGENT_CONTEXT_COMPRESS_KEEP_RECENT: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_KEEP_RECENT", "6"))
 
     # ------------------------------------------------------------------
     # Groq API (LLM)

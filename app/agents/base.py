@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 MAX_REACT_ITERATIONS = 12
 MAX_VALIDATION_RETRIES = 3
 MAX_TOOL_RESULT_CHARS = 12_000  # Truncate tool output to prevent context blowup
+_COMPRESS_TAIL_CHARS = 300     # Chars kept per old tool message after compression
 
 
 class LLMProvider(str, Enum):
@@ -54,6 +55,7 @@ class AgentMetrics:
     tool_failures: int = 0
     validation_retries: int = 0
     provider_fallbacks: int = 0
+    compression_count: int = 0
     providers_used: list[str] = field(default_factory=list)
 
 
@@ -91,9 +93,66 @@ def _truncate_tool_output(data: Any, max_chars: int = MAX_TOOL_RESULT_CHARS) -> 
     raw = json.dumps(data, default=str)
     if len(raw) <= max_chars:
         return raw
-    # Truncate and add a notice so the LLM knows data was cut
     truncated = raw[:max_chars]
     return truncated + f'\n... [TRUNCATED: {len(raw)} chars total, showing first {max_chars}]'
+
+
+def _estimate_context_chars(messages: list[dict[str, Any]]) -> int:
+    """Rough character count of a message list (proxy for token usage)."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    total += len(str(item.get("content", "")))
+                    total += len(str(item.get("text", "")))
+    return total
+
+
+def _compress_old_tool_outputs(
+    messages: list[dict[str, Any]],
+    *,
+    keep_recent: int,
+    tail_chars: int = _COMPRESS_TAIL_CHARS,
+) -> int:
+    """Aggressively truncate tool outputs in older messages to free context space.
+
+    Leaves the `keep_recent` most-recent messages untouched. Returns total chars
+    removed. Mutates `messages` in-place — no LLM call needed.
+    """
+    if len(messages) <= keep_recent + 2:
+        return 0
+
+    compress_targets = messages[: max(0, len(messages) - keep_recent)]
+    removed = 0
+
+    for msg in compress_targets:
+        content = msg.get("content")
+        if isinstance(content, str) and len(content) > tail_chars:
+            removed += len(content) - tail_chars
+            msg["content"] = content[:tail_chars] + " ...[compressed]"
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                # Anthropic tool_result blocks
+                if item.get("type") == "tool_result":
+                    c = item.get("content", "")
+                    if isinstance(c, str) and len(c) > tail_chars:
+                        removed += len(c) - tail_chars
+                        item["content"] = c[:tail_chars] + " ...[compressed]"
+                # Groq function call arguments
+                fn = item.get("function", {})
+                if fn and isinstance(fn.get("arguments", ""), str):
+                    a = fn["arguments"]
+                    if len(a) > tail_chars:
+                        removed += len(a) - tail_chars
+                        fn["arguments"] = a[:tail_chars] + " ...[compressed]"
+
+    return removed
 
 
 class BaseAgent:
@@ -308,8 +367,23 @@ class BaseAgent:
 
         logger.info("[%s] ReAct start (anthropic): model=%s, tools=%d", self.name, model, len(self.registry.tools))
 
+        compress_threshold = settings.AGENT_CONTEXT_COMPRESS_THRESHOLD
+        keep_recent = settings.AGENT_CONTEXT_COMPRESS_KEEP_RECENT
+
         while iteration < max_iterations:
             iteration += 1
+
+            # Context compression: when accumulated tool outputs grow large, truncate
+            # old messages so the context window stays manageable.
+            if compress_threshold > 0 and _estimate_context_chars(messages) > compress_threshold:
+                removed = _compress_old_tool_outputs(messages, keep_recent=keep_recent)
+                if removed > 0:
+                    self._metrics.compression_count += 1
+                    logger.info(
+                        "[%s] Context compressed at iter %d: removed ~%d chars",
+                        self.name, iteration, removed,
+                    )
+
             kwargs: dict[str, Any] = dict(
                 model=model, max_tokens=max_tokens,
                 system=system_prompt, messages=messages, temperature=temperature,
@@ -402,8 +476,21 @@ class BaseAgent:
 
         logger.info("[%s] ReAct start (groq): model=%s, tools=%d", self.name, model, len(self.registry.tools))
 
+        compress_threshold = settings.AGENT_CONTEXT_COMPRESS_THRESHOLD
+        keep_recent = settings.AGENT_CONTEXT_COMPRESS_KEEP_RECENT
+
         while iteration < max_iterations:
             iteration += 1
+
+            if compress_threshold > 0 and _estimate_context_chars(messages) > compress_threshold:
+                removed = _compress_old_tool_outputs(messages, keep_recent=keep_recent)
+                if removed > 0:
+                    self._metrics.compression_count += 1
+                    logger.info(
+                        "[%s] Context compressed at iter %d: removed ~%d chars",
+                        self.name, iteration, removed,
+                    )
+
             kwargs: dict[str, Any] = dict(
                 model=model, max_tokens=max_tokens,
                 messages=messages, temperature=temperature,
@@ -553,6 +640,7 @@ class BaseAgent:
             "duration_ms": m.total_duration_ms,
             "validation_retries": m.validation_retries,
             "provider_fallbacks": m.provider_fallbacks,
+            "compression_count": m.compression_count,
             "providers_used": m.providers_used,
         }
 
