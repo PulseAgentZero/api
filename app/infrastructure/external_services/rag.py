@@ -1,7 +1,8 @@
-"""Production-grade RAG helpers: embed, retrieve, rerank, fuse."""
+"""RAG helpers: embed, retrieve, rerank, fuse."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import time
@@ -27,6 +28,33 @@ from app.infrastructure.external_services.query_rewrite import rewrite_entity_qu
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class RagRunStats:
+    """Accumulated latency and quality counters for one enrich_entities_with_similar call."""
+
+    entities_enriched: int = 0
+    total_rewrite_ms: float = 0.0
+    total_embed_ms: float = 0.0
+    total_search_ms: float = 0.0
+    total_rerank_ms: float = 0.0
+    total_rag_ms: float = 0.0
+    rerank_applied_count: int = 0
+    autocut_removed_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+def _merge_rag_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """Sum numeric fields from two serialised RagRunStats dicts."""
+    keys = (
+        "entities_enriched", "total_rewrite_ms", "total_embed_ms",
+        "total_search_ms", "total_rerank_ms", "total_rag_ms",
+        "rerank_applied_count", "autocut_removed_count",
+    )
+    return {k: a.get(k, 0) + b.get(k, 0) for k in keys}
+
+
 @dataclass(frozen=True)
 class RagConfig:
     """Effective RAG tuning for one request. Built by `RagConfig.resolve`."""
@@ -38,6 +66,7 @@ class RagConfig:
     enable_rerank: bool
     enable_hybrid: bool
     enable_query_rewrite: bool
+    enable_autocut: bool = True
     rerank_model: str | None = None
 
     @classmethod
@@ -50,6 +79,7 @@ class RagConfig:
             enable_rerank=settings.RAG_ENABLE_RERANK,
             enable_hybrid=settings.RAG_ENABLE_HYBRID,
             enable_query_rewrite=settings.RAG_ENABLE_QUERY_REWRITE,
+            enable_autocut=settings.RAG_ENABLE_AUTOCUT,
             rerank_model=None,
         )
 
@@ -71,8 +101,36 @@ class RagConfig:
             enable_query_rewrite=bool(
                 overrides.get("enable_query_rewrite", base.enable_query_rewrite)
             ),
+            enable_autocut=bool(overrides.get("enable_autocut", base.enable_autocut)),
             rerank_model=overrides.get("rerank_model") or base.rerank_model,
         )
+
+
+def _autocut_candidates(candidates: list[SearchResult]) -> list[SearchResult]:
+    """Remove candidates below a significant score gap (Weaviate Autocut).
+
+    Cuts at the first gap that is both >2x the mean gap and >0.05 absolute.
+    """
+    if len(candidates) <= 1:
+        return candidates
+    scores = [c.score for c in candidates if c.score is not None]
+    if len(scores) < 2:
+        return candidates
+    gaps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
+    mean_gap = sum(gaps) / len(gaps)
+    for i, gap in enumerate(gaps):
+        if gap > 2.0 * mean_gap and gap > 0.05:
+            return candidates[: i + 1]
+    return candidates
+
+
+async def run_ttl_cleanup(org_id: str, ttl_days: int | None = None) -> int:
+    """Delete Qdrant points older than ttl_days. Returns count removed."""
+    if not settings.is_qdrant_configured():
+        return 0
+    effective_days = ttl_days if ttl_days is not None else settings.QDRANT_TTL_DAYS
+    qdrant = QdrantService()
+    return await qdrant.archive_stale_points(org_id, effective_days)
 
 
 def _profile_to_text(profile: dict) -> str:
@@ -253,6 +311,7 @@ async def enrich_entities_with_similar(
     score_threshold: float | None = None,
     past_recs_by_entity: dict[str, list[dict]] | None = None,
     tier_filter: str | None = None,
+    run_stats: RagRunStats | None = None,
 ) -> list[dict]:
     """Attach `similar_entities` per entity using the full RAG pipeline.
 
@@ -262,12 +321,13 @@ async def enrich_entities_with_similar(
       3. Embed query with Voyage
       4. (optional) Hybrid dense+keyword retrieval with RRF, over-fetched
       5. Apply metadata filter (risk_tier hint, freshness window)
+      5b. (optional) Autocut: remove candidates below a significant score gap
       6. (optional) Voyage rerank to top-K
       7. Self-exclude and attach past recommendations if provided
 
     `config` carries effective tuning (per-org overrides resolved by caller).
     `limit`/`prefetch_limit`/`score_threshold` remain as ad-hoc overrides for
-    tests and one-off callers.
+    tests and one-off callers. `run_stats` collects per-call latency telemetry.
     """
     if not entities or not settings.is_voyage_configured():
         return entities
@@ -288,6 +348,7 @@ async def enrich_entities_with_similar(
             enable_rerank=cfg.enable_rerank,
             enable_hybrid=cfg.enable_hybrid,
             enable_query_rewrite=cfg.enable_query_rewrite,
+            enable_autocut=cfg.enable_autocut,
             rerank_model=cfg.rerank_model,
         )
     rerank = reranker or (
@@ -306,6 +367,8 @@ async def enrich_entities_with_similar(
     )
 
     enriched: list[dict] = []
+    wall_t0 = time.perf_counter()
+
     for entity in entities:
         eid = entity.get("entity_id")
         raw_query = _entity_to_query_text(entity)
@@ -314,14 +377,18 @@ async def enrich_entities_with_similar(
             continue
 
         if cfg.enable_query_rewrite:
+            t_rw = time.perf_counter()
             try:
                 rewritten = await rewrite_entity_query(entity, raw_query)
             except Exception as exc:
                 logger.debug("[RAG] query rewrite failed (using raw): %s", exc)
                 rewritten = raw_query
+            if run_stats is not None:
+                run_stats.total_rewrite_ms += (time.perf_counter() - t_rw) * 1000
         else:
             rewritten = raw_query
 
+        t_search = time.perf_counter()
         try:
             candidates = await _retrieve_candidates(
                 org_id,
@@ -337,6 +404,7 @@ async def enrich_entities_with_similar(
                     enable_rerank=cfg.enable_rerank,
                     enable_hybrid=cfg.enable_hybrid,
                     enable_query_rewrite=cfg.enable_query_rewrite,
+                    enable_autocut=cfg.enable_autocut,
                     rerank_model=cfg.rerank_model,
                 ),
                 filter_condition=filter_condition,
@@ -345,6 +413,8 @@ async def enrich_entities_with_similar(
             logger.warning("[RAG] retrieval failed for entity %s: %s", eid, exc)
             enriched.append(entity)
             continue
+        if run_stats is not None:
+            run_stats.total_search_ms += (time.perf_counter() - t_search) * 1000
 
         # Self-exclusion
         candidates = [c for c in candidates if str(c.entity_id) != str(eid)]
@@ -358,8 +428,16 @@ async def enrich_entities_with_similar(
             # than nothing if the threshold is too aggressive.
             filtered = candidates[: max(cfg.top_k, 1)]
 
+        # Autocut: remove candidates below a significant score gap (Weaviate ebook)
+        if cfg.enable_autocut and len(filtered) > 1:
+            before_autocut = len(filtered)
+            filtered = _autocut_candidates(filtered)
+            if run_stats is not None:
+                run_stats.autocut_removed_count += before_autocut - len(filtered)
+
         # Rerank with Voyage rerank model over the over-fetched set
         if cfg.enable_rerank and len(filtered) > cfg.top_k:
+            t_rr = time.perf_counter()
             try:
                 docs = [
                     c.payload.get("profile_summary") or _profile_to_text(c.payload)
@@ -371,6 +449,9 @@ async def enrich_entities_with_similar(
                     top_n=cfg.top_k,
                 )
                 filtered = [filtered[i] for i, _ in order]
+                if run_stats is not None:
+                    run_stats.rerank_applied_count += 1
+                    run_stats.total_rerank_ms += (time.perf_counter() - t_rr) * 1000
             except Exception as exc:
                 logger.debug("[RAG] rerank failed (keeping dense order): %s", exc)
                 filtered = filtered[: cfg.top_k]
@@ -396,5 +477,10 @@ async def enrich_entities_with_similar(
         entity_copy = dict(entity)
         entity_copy["similar_entities"] = similar
         enriched.append(entity_copy)
+        if run_stats is not None:
+            run_stats.entities_enriched += 1
+
+    if run_stats is not None:
+        run_stats.total_rag_ms = (time.perf_counter() - wall_t0) * 1000
 
     return enriched

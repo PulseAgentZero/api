@@ -217,6 +217,9 @@ class Settings:
     RAG_FRESHNESS_WINDOW_DAYS: int = int(
         os.getenv("RAG_FRESHNESS_WINDOW_DAYS", "180")
     )
+    QDRANT_TTL_DAYS: int = int(os.getenv("QDRANT_TTL_DAYS", "365"))
+    RAG_ENABLE_AUTOCUT: bool = os.getenv("RAG_ENABLE_AUTOCUT", "true").lower() == "true"
+    RAG_EVAL_RECALL_THRESHOLD: float = float(os.getenv("RAG_EVAL_RECALL_THRESHOLD", "0.5"))
 
     # ------------------------------------------------------------------
     # Groq API (LLM)

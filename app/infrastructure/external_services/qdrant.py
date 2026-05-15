@@ -288,6 +288,69 @@ class QdrantService:
             for p in results.points
         ]
 
+    async def archive_stale_points(self, org_id: str, ttl_days: int) -> int:
+        """Delete points whose embedded_at is older than ttl_days. Returns removed count."""
+        client = await self._get_client()
+        collection_name = settings.get_org_collection_name(org_id)
+        if not await client.collection_exists(collection_name):
+            return 0
+
+        cutoff = time.time() - ttl_days * 86400
+        stale_ids: list = []
+        offset = None
+
+        while True:
+            async for attempt in _retry():
+                with attempt:
+                    records, next_offset = await client.scroll(
+                        collection_name=collection_name,
+                        scroll_filter=None,
+                        limit=256,
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+            for record in records:
+                embedded_at = (record.payload or {}).get("embedded_at")
+                if embedded_at is not None and float(embedded_at) < cutoff:
+                    stale_ids.append(record.id)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        if not stale_ids:
+            return 0
+
+        async for attempt in _retry():
+            with attempt:
+                await client.delete(
+                    collection_name=collection_name,
+                    points_selector=models.PointIdsList(points=stale_ids),
+                )
+        logger.info(
+            "[Qdrant] TTL cleanup: removed %d stale points from %s",
+            len(stale_ids),
+            collection_name,
+        )
+        return len(stale_ids)
+
+    async def get_collection_stats(self, org_id: str) -> dict:
+        """Return point count and vector stats for monitoring."""
+        client = await self._get_client()
+        collection_name = settings.get_org_collection_name(org_id)
+        try:
+            if not await client.collection_exists(collection_name):
+                return {}
+            info = await client.get_collection(collection_name)
+            return {
+                "collection": collection_name,
+                "points_count": info.points_count or 0,
+                "indexed_vectors_count": info.indexed_vectors_count or 0,
+            }
+        except Exception as exc:
+            logger.debug("[Qdrant] get_collection_stats failed: %s", exc)
+            return {}
+
     async def remove_entity(self, org_id: str, entity_id: str) -> None:
         client = await self._get_client()
         collection_name = settings.get_org_collection_name(org_id)

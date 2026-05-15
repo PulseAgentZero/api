@@ -23,6 +23,8 @@ from app.agents.state import PipelineState
 from app.infrastructure.database.client_queries import compute_risk, fetch_entities, get_schema_mapping
 from app.infrastructure.external_services.rag import (
     RagConfig,
+    RagRunStats,
+    _merge_rag_stats,
     enrich_entities_with_similar,
     update_entity_metadata,
 )
@@ -213,10 +215,15 @@ class RiskScoringAgent(BaseAgent):
                 _rag_overrides = getattr(_mapping, "rag_config", None)
             except Exception:
                 _rag_overrides = None
+            _rag_stats = RagRunStats()
             payload = await enrich_entities_with_similar(
                 str(org_id),
                 payload,
                 config=RagConfig.resolve(_rag_overrides),
+                run_stats=_rag_stats,
+            )
+            state["rag_run_stats"] = _merge_rag_stats(
+                state.get("rag_run_stats") or {}, _rag_stats.to_dict()
             )
 
             try:

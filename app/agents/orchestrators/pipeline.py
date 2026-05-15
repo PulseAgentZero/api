@@ -11,6 +11,7 @@ Production-grade orchestration with:
 """
 
 import asyncio
+import dataclasses
 import logging
 import os
 import time
@@ -273,7 +274,35 @@ class PipelineOrchestrator:
             started_at=pipeline_start,
             step_metrics=step_metrics,
             state=state,
+            rag_metrics=rag_metrics_payload,
         )
+
+        # Collect RAG latency stats accumulated by risk/rec agents into state.
+        rag_stats_raw: dict[str, Any] = state.get("rag_run_stats") or {}
+
+        # RAG eval regression + TTL cleanup — both non-fatal, run regardless of pipeline outcome.
+        rag_metrics_payload: dict[str, Any] = {"latency": rag_stats_raw}
+
+        try:
+            from app.services.rag_eval import run_rag_eval_regression
+
+            eval_report = await run_rag_eval_regression(str(org_id))
+            rag_metrics_payload["eval"] = (
+                dataclasses.asdict(eval_report) if not eval_report.skipped else {"skipped": True}
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] RAG eval regression failed: %s", e)
+            rag_metrics_payload["eval"] = {"error": str(e)}
+
+        try:
+            from app.infrastructure.external_services.rag import run_ttl_cleanup
+
+            ttl_removed = await run_ttl_cleanup(str(org_id))
+            rag_metrics_payload["ttl_cleaned"] = ttl_removed
+        except Exception as e:
+            logger.warning("[Pipeline] Qdrant TTL cleanup failed: %s", e)
+
+        state["rag_metrics"] = rag_metrics_payload
 
         if not state.get("error"):
             try:
@@ -363,6 +392,7 @@ class PipelineOrchestrator:
         started_at: float,
         step_metrics: list[dict],
         state: PipelineState | None,
+        rag_metrics: dict[str, Any] | None = None,
     ) -> None:
         risk_summary = (state or {}).get("risk_summary") or {}
         rec_stats = (state or {}).get("recommendation_stats") or {}
@@ -386,6 +416,7 @@ class PipelineOrchestrator:
                 provider_fallbacks=metrics["provider_fallbacks"],
                 step_metrics=step_metrics,
                 generation_caps=caps,
+                rag_metrics=rag_metrics,
             )
             await self._session.commit()
         except SQLAlchemyError as e:

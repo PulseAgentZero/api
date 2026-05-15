@@ -25,6 +25,8 @@ from app.infrastructure.database.repositories.recommendation_repository import (
 from app.infrastructure.database.client_queries import get_schema_mapping
 from app.infrastructure.external_services.rag import (
     RagConfig,
+    RagRunStats,
+    _merge_rag_stats,
     enrich_entities_with_similar,
 )
 from app.config.settings import settings
@@ -117,11 +119,16 @@ class RecommendationAgent(BaseAgent):
         for i in range(0, len(enriched_at_risk), batch_size):
             batch = enriched_at_risk[i : i + batch_size]
             try:
+                _rag_stats = RagRunStats()
                 batch = await enrich_entities_with_similar(
                     str(org_id),
                     batch,
                     config=_rag_config,
                     past_recs_by_entity=past_recs_by_entity,
+                    run_stats=_rag_stats,
+                )
+                state["rag_run_stats"] = _merge_rag_stats(
+                    state.get("rag_run_stats") or {}, _rag_stats.to_dict()
                 )
                 batch_recs = await self._generate_batch(prompt, state, batch)
                 all_recs.extend(batch_recs)
