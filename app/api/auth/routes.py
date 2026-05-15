@@ -226,11 +226,10 @@ async def verify_email(token: str = Query(...), db: AsyncSession = Depends(get_d
     user = await UserRepository(db).get_by_id(user_id)
     if not user:
         raise bad_request("INVALID_TOKEN", "Invalid token")
-    if user.is_verified:
-        raise bad_request("ALREADY_VERIFIED", "Email already verified")
-    user.is_verified = True
+    if not user.is_verified:
+        user.is_verified = True
+        await db.commit()
     await redis_tokens.delete_email_verify_token(token)
-    await db.commit()
     return {"message": "Email verified successfully"}
 
 

@@ -43,6 +43,97 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/onboarding", tags=["Onboarding"])
 
 
+def _infer_col(columns: list, *patterns: str) -> str | None:
+    """Find the first column whose name matches any of the given patterns."""
+    col_map = {c.name.lower(): c.name for c in columns}
+    for pat in patterns:
+        for lower, original in col_map.items():
+            if lower == pat or lower.endswith(f"_{pat}") or lower.startswith(f"{pat}_"):
+                return original
+    return None
+
+
+async def _auto_create_schema_mapping(
+    db: AsyncSession,
+    org_id,
+    connection_id,
+    plaintext_dsn: str,
+    sslmode: str | None,
+    entity_label: str | None,
+    goal_label: str | None,
+) -> None:
+    """Introspect the client DB and create (or update) a best-guess schema mapping."""
+    try:
+        tables = await introspect_schema(plaintext_dsn, sslmode=sslmode)
+    except Exception:
+        logger.warning("Schema introspection failed for connection %s — skipping auto-mapping", connection_id)
+        return
+
+    if not tables:
+        return
+
+    # Score tables: prefer the one whose name matches the entity label
+    entity_kw = (entity_label or "").lower().strip()
+
+    def _table_score(t) -> tuple:
+        name = t.name.lower()
+        if entity_kw and (entity_kw in name or name in entity_kw):
+            return (3, len(t.columns))
+        if any(kw in name for kw in ("customer", "user", "subscriber", "patient", "client", "member", "account", "employee", "product", "item", "sku")):
+            return (2, len(t.columns))
+        if any(kw in name for kw in ("log", "audit", "config", "setting", "migration", "session", "token", "permission")):
+            return (0, len(t.columns))
+        return (1, len(t.columns))
+
+    best = max(tables, key=_table_score)
+    cols = best.columns
+
+    entity_id_col = _infer_col(cols, "id", "uuid", "key", "pk") or cols[0].name
+    entity_name_col = _infer_col(cols, "name", "full_name", "fullname", "display_name", "title", "email", "username")
+    timestamp_col = _infer_col(cols, "created_at", "timestamp", "date", "updated_at", "event_date", "recorded_at")
+
+    goal_kw = (goal_label or "").lower()
+    target_col = None
+    if "churn" in goal_kw:
+        target_col = _infer_col(cols, "churned", "churn", "is_active", "active", "status", "cancelled")
+    elif any(kw in goal_kw for kw in ("stock", "inventor")):
+        target_col = _infer_col(cols, "stock", "quantity", "inventory", "available", "qty")
+    elif "risk" in goal_kw:
+        target_col = _infer_col(cols, "risk", "risk_score", "risk_tier", "score")
+
+    raw_schema = {
+        "tables": [
+            {"name": t.name, "columns": [{"name": c.name, "data_type": c.data_type, "nullable": c.nullable} for c in t.columns]}
+            for t in tables
+        ]
+    }
+
+    mapping_repo = SchemaMappingRepository(db)
+    existing = await mapping_repo.list_by_org(org_id)
+    if existing:
+        await mapping_repo.update(
+            existing[0].id,
+            connection_id=connection_id,
+            entity_table=best.name,
+            entity_id_col=entity_id_col,
+            entity_name_col=entity_name_col,
+            timestamp_col=timestamp_col,
+            target_column=target_col,
+            raw_schema=raw_schema,
+        )
+    else:
+        await mapping_repo.create(
+            org_id=org_id,
+            connection_id=connection_id,
+            entity_table=best.name,
+            entity_id_col=entity_id_col,
+            entity_name_col=entity_name_col,
+            timestamp_col=timestamp_col,
+            target_column=target_col,
+            raw_schema=raw_schema,
+        )
+
+
 def _pick_primary_connection_for_introspect(conns: list[Connection]) -> Connection | None:
     """Prefer active DB connections with a DSN, then most recently updated."""
     live = [c for c in conns if c.deleted_at is None and c.encrypted_dsn]
@@ -85,23 +176,45 @@ async def save_and_test_connection(
     db: AsyncSession = Depends(get_db),
 ) -> OnboardingConnectionResponse:
     repo = ConnectionRepository(db)
-    await max_cloud_free_connections(db, current_user.org_id, await repo.count_active(current_user.org_id))
     built = build_encrypted_secret_and_row_fields(body)
     plaintext = built.pop("plaintext_secret")
     meta = built.pop("connection_meta", None) or {}
-    conn = await repo.create(
-        org_id=current_user.org_id,
-        encrypted_dsn=encrypt_dsn(plaintext),
-        name=body.name or "My Connection",
-        sslmode=body.sslmode,
-        db_type=built.get("db_type"),
-        host=built.get("host"),
-        port=built.get("port"),
-        database_name=built.get("database_name"),
-        username=built.get("username"),
-        connector_type=built.get("connector_type"),
-        connection_meta=meta,
-    )
+
+    # Reuse the org's existing onboarding connection if one exists so we don't
+    # create duplicates when the user goes back and resubmits this step.
+    existing = await repo.list_by_org(current_user.org_id)
+    live = [c for c in existing if c.deleted_at is None]
+    if live:
+        conn = max(live, key=lambda c: c.updated_at or c.created_at)
+        await repo.update(
+            conn.id,
+            encrypted_dsn=encrypt_dsn(plaintext),
+            name=body.name or conn.name,
+            sslmode=body.sslmode or conn.sslmode,
+            db_type=built.get("db_type"),
+            host=built.get("host"),
+            port=built.get("port"),
+            database_name=built.get("database_name"),
+            username=built.get("username"),
+            connector_type=built.get("connector_type"),
+            connection_meta=meta,
+        )
+    else:
+        await max_cloud_free_connections(db, current_user.org_id, 0)
+        conn = await repo.create(
+            org_id=current_user.org_id,
+            encrypted_dsn=encrypt_dsn(plaintext),
+            name=body.name or "My Connection",
+            sslmode=body.sslmode,
+            db_type=built.get("db_type"),
+            host=built.get("host"),
+            port=built.get("port"),
+            database_name=built.get("database_name"),
+            username=built.get("username"),
+            connector_type=built.get("connector_type"),
+            connection_meta=meta,
+        )
+
     success, message, db_version = await test_connection(plaintext, body.sslmode)
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
@@ -111,6 +224,20 @@ async def save_and_test_connection(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"success": False, "message": message, "connection_id": str(conn.id)},
         )
+
+    # Auto-infer schema mapping so the user doesn't have to configure it manually.
+    org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    await _auto_create_schema_mapping(
+        db,
+        org_id=current_user.org_id,
+        connection_id=conn.id,
+        plaintext_dsn=plaintext,
+        sslmode=body.sslmode,
+        entity_label=org.entity_label if org else None,
+        goal_label=org.goal_label if org else None,
+    )
+    await db.commit()
+
     return OnboardingConnectionResponse(
         connection=_connection_to_response(conn),
         success=True,

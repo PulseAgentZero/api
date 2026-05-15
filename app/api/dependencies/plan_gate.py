@@ -83,5 +83,5 @@ async def max_cloud_free_connections(db: AsyncSession, org_id: UUID, active_coun
     org = await _get_org(db, org_id)
     if org is None:
         return
-    if (org.plan or "free").lower() == "free" and active_count >= 1:
-        raise plan_limit("Active connection limit reached for the free plan.")
+    if (org.plan or "free").lower() == "free" and active_count >= 5:
+        raise plan_limit("Active connection limit reached for the free plan (max 5).")

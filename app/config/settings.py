@@ -267,7 +267,7 @@ class Settings:
         "ENCRYPTION_KEY",
         "K_k8N_IyoXaDyql8ijHUmO9KA6FyuAqP7guglrC0Pns=",
     )
-    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3001")
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
     PASSWORD_HASH_ITERATIONS: int = int(
         os.getenv("PASSWORD_HASH_ITERATIONS", "600000")
