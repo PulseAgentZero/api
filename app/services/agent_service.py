@@ -1,5 +1,6 @@
 """Conversational agent service with live-data tools."""
 
+import asyncio
 import json
 import logging
 import re
@@ -50,12 +51,77 @@ from app.services.conversational_memory import (
     recall as recall_memories,
     reflect_and_commit,
 )
+from groq import AsyncGroq
+
+from app.agents.prompts.conversational import (
+    CLARIFICATION_REPLY_PROMPT,
+    GREETING_REPLY_PROMPT,
+    HELP_REPLY_PROMPT,
+    OFF_TOPIC_REPLY_PROMPT,
+    render_chat_system_prompt,
+)
 from app.services.intent_router import (
     CONVERSATIONAL_INTENTS,
     build_fastpath_args,
     classify_intent,
     filter_tools_by_intent,
 )
+
+
+_conv_groq_client: AsyncGroq | None = None
+
+
+def _get_conv_groq() -> AsyncGroq | None:
+    global _conv_groq_client
+    if not settings.is_groq_configured():
+        return None
+    if _conv_groq_client is None:
+        _conv_groq_client = AsyncGroq(
+            api_key=settings.groq_api_key, max_retries=1, timeout=6.0,
+        )
+    return _conv_groq_client
+
+
+_CONV_REPLY_PROMPTS = {
+    "greeting": GREETING_REPLY_PROMPT,
+    "help": HELP_REPLY_PROMPT,
+    "off_topic": OFF_TOPIC_REPLY_PROMPT,
+    "unknown": CLARIFICATION_REPLY_PROMPT,
+}
+
+
+async def _craft_conversational_reply(intent_name: str, state: dict) -> str | None:
+    """Groq fast-model call to craft a warm, grounded reply for a conversational intent.
+
+    Returns the reply text on success, or None if Groq is unavailable / errors out
+    / returns an unparseable response — caller falls back to a static template."""
+    system = _CONV_REPLY_PROMPTS.get(intent_name)
+    if system is None:
+        return None
+    client = _get_conv_groq()
+    if client is None:
+        return None
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(state, default=str)[:1200]},
+                ],
+                temperature=0.6,
+                max_tokens=300,
+                response_format={"type": "json_object"},
+            ),
+            timeout=6.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        data = json.loads(raw)
+        reply = (data.get("reply") or "").strip() if isinstance(data, dict) else ""
+        return reply or None
+    except Exception as exc:
+        logger.debug("[conv_reply] LLM craft failed (%s), falling back to template", exc)
+        return None
 
 
 TOOLS = [
@@ -295,11 +361,7 @@ async def _find_similar(
     }
 
 
-_ACTION_DRAFT_SYSTEM = (
-    "You write short, professional action drafts for an operations team to use with at-risk "
-    "customers / entities. Be specific to the entity's signals and recommendations — never use "
-    "generic boilerplate. Output ONLY the draft text. No preamble, no markdown headers, no JSON."
-)
+from app.agents.prompts.action_draft import ACTION_DRAFT_PROMPT as _ACTION_DRAFT_SYSTEM
 
 
 def _action_draft_fallback(detail: dict, entity_id: str, action_type: str) -> dict:
@@ -538,16 +600,15 @@ async def _system_prompt(
     memory = await _load_user_memory(db, current_user)
     memory_block = _format_memory_for_prompt(memory)
 
-    return (
-        f"You are Pulse, an operational intelligence agent for {org_name}. "
-        f"The organization models {entity_label} and the goal is to {goal_label}. "
-        f"Business context: {context}\n"
-        f"{pipeline_block}"
-        f"{memory_block}"
-        f"{handoff_block}"
-        f"{recalled_block}"
-        "Answer data-dependent questions only after using the provided tools. "
-        "Be concise, operational, and avoid guessing."
+    return render_chat_system_prompt(
+        org_name=org_name,
+        entity_label=entity_label,
+        goal_label=goal_label,
+        business_context=context,
+        pipeline_block=pipeline_block,
+        memory_block=memory_block,
+        handoff_block=handoff_block,
+        recalled_block=recalled_block,
     )
 
 
@@ -661,39 +722,63 @@ async def _conversational_reply(
     except Exception:
         user_first = ""
 
+    # State passed to the LLM prompt and the fallback templates.
+    state = {
+        "user_first": user_first,
+        "org_name": org_name,
+        "entity_label": entity_label,
+        "goal_label": goal_label,
+        "message": user_message,
+    }
+
+    # Try LLM-crafted reply first (warmer + tone-matched).
+    crafted = await _craft_conversational_reply(intent_name, state)
+    if crafted:
+        return crafted
+
+    # Fallback: static templates when Groq is unavailable or returns junk.
+    return _conversational_reply_template(intent_name, state)
+
+
+def _conversational_reply_template(intent_name: str, state: dict) -> str:
+    """Deterministic template fallback for the conversational intents."""
+    user_first = state.get("user_first") or ""
+    org_name = state.get("org_name") or "your team"
+    entity_label = state.get("entity_label") or "entities"
+    goal_label = state.get("goal_label") or "improve operations"
+    singular = entity_label[:-1] if entity_label.endswith("s") else entity_label
+
     if intent_name == "greeting":
         opener = f"Hi {user_first}!" if user_first else "Hi!"
         return (
             f"{opener} I'm Pulse, the operational intelligence agent for {org_name}. "
             f"Ask me about your {entity_label}, risk tiers, recommendations, or to "
-            f"draft an outreach — anything that helps you {goal_label}."
+            f"draft an outreach: anything that helps you {goal_label}."
         )
 
     if intent_name == "help":
         return (
-            f"I help you act on {org_name}'s {entity_label} data. Things I can do:\n"
-            f"- Give a high-level **overview** of risk and recommendations\n"
-            f"- Pull **details for a specific {entity_label[:-1] if entity_label.endswith('s') else entity_label}** (e.g. \"tell me about NG-00075\")\n"
-            f"- **List** {entity_label} by tier (e.g. \"show critical {entity_label}\")\n"
-            f"- Surface **active recommendations** by urgency\n"
-            f"- **Find similar** {entity_label} for a reference one\n"
-            f"- **Draft an outreach** message for a specific {entity_label[:-1] if entity_label.endswith('s') else entity_label}\n"
-            f"- **Compare or explain** trends (e.g. \"why is NG-00075 critical?\")"
+            f"Here's what I can do for {org_name}:\n"
+            f"- Quick overview (\"what's our status?\")\n"
+            f"- Pull details for a {singular} (\"tell me about NG-00075\")\n"
+            f"- List {entity_label} by tier (\"show critical {entity_label}\")\n"
+            f"- Active recommendations (\"what should I action today?\")\n"
+            f"- Find similar {entity_label} (\"5 more like NG-00075\")\n"
+            f"- Draft an outreach (\"draft a message for NG-00075\")\n"
+            f"- Explain trends (\"why is NG-00075 critical?\")\n\n"
+            f"What would you like to start with?"
         )
 
     if intent_name == "off_topic":
         return (
-            f"That's outside what I can help with — I'm focused on {org_name}'s "
-            f"{entity_label}, their risk profiles, and what to do about them. "
-            f"Try \"what's our status?\" or \"show critical {entity_label}\" to get started."
+            f"That's outside what I can help with. I'm focused on {org_name}'s "
+            f"{entity_label}: try \"what's our status?\" or \"show critical {entity_label}\" to start."
         )
 
-    # unknown
+    # unknown / clarification
     return (
-        f"I didn't quite catch that. I can answer questions about {org_name}'s "
-        f"{entity_label}, recommendations, or risk trends — could you rephrase? "
-        f"Examples: \"show me critical {entity_label}\", \"tell me about a specific {entity_label[:-1] if entity_label.endswith('s') else entity_label}\", "
-        f"or \"what should I action today?\""
+        f"I'm not sure what you're after. Try \"what's our status?\", "
+        f"\"show critical {entity_label}\", or \"what should I action today?\" to get going."
     )
 
 

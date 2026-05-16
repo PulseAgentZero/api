@@ -35,21 +35,9 @@ QUERY_TOOLS_NAMES = (
 )
 
 
-_QUERY_SYSTEM_SUFFIX = (
-    "\nROLE: You are the QUERY agent. Your only job is to gather the data needed "
-    "to answer the user's question by calling the provided retrieval tools. "
-    "Do NOT compose a polished answer — return a compact JSON object with the "
-    "facts you gathered, e.g. {\"entities\": [...], \"recommendations\": [...]}. "
-    "If the question needs no data, return {}."
-)
-
-
-_SYNTHESIS_SYSTEM = (
-    "You are Pulse's synthesis agent. You will receive the user's question and a "
-    "structured data dict gathered by the Query agent. Your job is to write a "
-    "concise, operational reply grounded in that data — no guessing, no extra "
-    "data lookups. If the data is empty, say so plainly. Do NOT echo the JSON "
-    "back; speak naturally."
+from app.agents.prompts.specialized_agents import (
+    QUERY_AGENT_SYSTEM_SUFFIX as _QUERY_SYSTEM_SUFFIX,
+    SYNTHESIS_AGENT_SYSTEM as _SYNTHESIS_SYSTEM,
 )
 
 

@@ -14,71 +14,10 @@ from typing import Optional
 
 from groq import AsyncGroq
 
+from app.agents.prompts.intent_classifier import INTENT_CLASSIFIER_PROMPT
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
-
-
-_INTENT_SYSTEM = """You classify a user's chat message for Pulse, an operational \
-intelligence assistant. Output a SINGLE JSON object.
-
-## Intents (pick exactly ONE):
-
-### Conversational (no data tools needed):
-
-1. **greeting** — Hi, hello, good morning, hey, "how are you", "who are you".
-   Examples: "hi", "hello", "good morning", "hey there", "what's up"
-
-2. **help** — User asks what the bot can do, how to use it, capabilities.
-   Examples: "what can you do?", "how does this work?", "help", "what should I ask?"
-
-3. **off_topic** — Anything NOT about the user's operational data: weather, jokes,
-   personal questions, coding help, general knowledge, abuse, world events.
-   Examples: "what's the weather", "tell me a joke", "are you real", "write me code"
-
-### Data intents (need tools):
-
-4. **lookup_overview** — High-level snapshot: totals, risk breakdown, top critical.
-   Examples: "what's our status?", "overview", "how are we doing?"
-
-5. **lookup_entity** — Details for ONE specific entity. MUST extract entity_id.
-   Examples: "tell me about ENT-001", "what's going on with NG-00075"
-
-6. **lookup_entities** — A list of entities, optionally filtered by tier.
-   Examples: "show critical entities", "list high-risk subscribers"
-
-7. **lookup_recommendations** — Active recommendations list, optionally by urgency.
-   Examples: "what should I action?", "show high-urgency recs"
-
-8. **find_similar** — Entities similar to a specific one. MUST extract entity_id.
-   Examples: "5 more like ENT-001", "subscribers similar to NG-00075"
-
-9. **generate_draft** — Draft an action/message for an entity. MUST extract entity_id.
-   Examples: "draft an outreach for NG-00075", "write a message to ENT-001"
-
-10. **compare_or_explain** — Comparison, trend analysis, or detailed reasoning.
-    Examples: "this month vs last", "why is NG-00075 critical?", "compare Lagos vs Kano"
-
-### Fallback:
-
-11. **unknown** — Truly ambiguous after considering all above; need to ask user to clarify.
-
-## Output JSON shape:
-{
-  "intent": "<one of the 11 names>",
-  "confidence": 0.0-1.0,
-  "entity_ids": ["ENT-001"],
-  "tier_filter": "critical|high|medium|low" | null,
-  "urgency_filter": "high|medium|low" | null
-}
-
-Confidence rules:
-- 0.85+ when the intent is unambiguous AND required params (entity_id when needed) are present
-- 0.6-0.8 when intent is clear but params missing or implicit
-- 0.3-0.5 when message could fit multiple intents
-
-Output ONLY the JSON object. No preamble, no markdown.
-"""
 
 
 _ENTITY_ID_RE = re.compile(r"\b[A-Z]{2,}-?\d{2,}\b")
@@ -180,7 +119,7 @@ async def classify_intent(
     if client is None:
         return _heuristic_fallback(user_message)
 
-    messages: list[dict] = [{"role": "system", "content": _INTENT_SYSTEM}]
+    messages: list[dict] = [{"role": "system", "content": INTENT_CLASSIFIER_PROMPT}]
     if convo_history:
         for m in convo_history[-3:]:
             role = m.get("role")

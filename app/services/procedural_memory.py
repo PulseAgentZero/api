@@ -32,15 +32,7 @@ _ORG_USER_SENTINEL = "__org__"
 _KIND = "procedural"
 
 
-_EXTRACT_SYSTEM = (
-    "You distill ONE durable, generalizable learning from a Pulse pipeline run. "
-    "Examples worth committing: which retrieval config worked, which risk-tier "
-    "patterns dominated, which agent decisions paid off, which inputs caused "
-    "regressions. Skip routine successes that add no new knowledge.\n"
-    "Return ONLY JSON: "
-    '{"commit": bool, "content": "single sentence stating the learning", '
-    '"importance": float 0..1}.'
-)
+from app.agents.prompts.procedural import EXTRACT_FROM_RUN_PROMPT as _EXTRACT_SYSTEM
 
 
 _groq_client: AsyncGroq | None = None

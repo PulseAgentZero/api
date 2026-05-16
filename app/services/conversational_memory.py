@@ -28,24 +28,7 @@ from app.infrastructure.external_services.qdrant import (
 logger = logging.getLogger(__name__)
 
 
-_REFLECT_SYSTEM = (
-    "You decide whether a user/assistant exchange contains a durable fact about "
-    "the user worth remembering across future conversations. Examples worth "
-    "committing: stated preferences, recurring concerns, named entities the "
-    "user is responsible for, decisions the user has made. Skip greetings, "
-    "small talk, or one-off lookups.\n"
-    "Return ONLY JSON: "
-    '{"commit": bool, "content": "single sentence in third person", '
-    '"importance": float 0..1, "kind": "episodic"}. '
-    "If commit is false, content/importance/kind may be empty."
-)
-
-_SUMMARY_SYSTEM = (
-    "You distil a chat thread between a user and Pulse (an operational "
-    "intelligence assistant) into ONE sentence in third person. Capture the "
-    "topic, key entities mentioned, and any outcome or decision. Skip "
-    "pleasantries. 30 words max. Output the sentence only — no preamble."
-)
+from app.agents.prompts.memory import REFLECT_PROMPT, SUMMARIZE_PROMPT
 
 
 _groq_client: AsyncGroq | None = None
@@ -82,7 +65,7 @@ async def _reflect(user_message: str, assistant_reply: str) -> dict | None:
             client.chat.completions.create(
                 model=settings.GROQ_LLM_MODEL_FAST,
                 messages=[
-                    {"role": "system", "content": _REFLECT_SYSTEM},
+                    {"role": "system", "content": REFLECT_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.0,
@@ -259,7 +242,7 @@ async def summarize_conversation(
             client.chat.completions.create(
                 model=settings.GROQ_LLM_MODEL_FAST,
                 messages=[
-                    {"role": "system", "content": _SUMMARY_SYSTEM},
+                    {"role": "system", "content": SUMMARIZE_PROMPT},
                     {"role": "user", "content": transcript},
                 ],
                 temperature=0.0,
