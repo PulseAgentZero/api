@@ -30,6 +30,8 @@ x-app: &app
     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
     REDIS_URL: redis://redis:6379/0
     DEPLOYMENT_MODE: cloud
+  volumes:
+    - ../../../app:/app/app
   networks:
     - pulse
   restart: unless-stopped

@@ -58,6 +58,13 @@ async def list_recommendations(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """List recommendations for the org, with optional filters.
+
+    **status** — `open`, `actioned`, `dismissed`, `escalated`. Omit to return all.
+    **urgency** — `critical`, `high`, `medium`, `low`.
+    **entity_id** — filter to one entity's recommendations.
+    Results are paginated; default page size is 50.
+    """
     repo = RecommendationRepository(db)
     offset = (page - 1) * limit
     recs = await repo.list_by_org(
@@ -83,6 +90,7 @@ async def get_recommendation(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Return a single recommendation by ID, including full reasoning and suggested action."""
     rec = await RecommendationRepository(db).get_by_id(_parse_uuid(recommendation_id, "recommendation_id"))
     if not rec or rec.org_id != current_user.org_id:
         raise not_found()
@@ -100,6 +108,11 @@ async def action_recommendation(
     current_user: User = Depends(require_role("admin", "manager", "analyst")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Mark a recommendation as actioned. Requires admin, manager, or analyst role.
+
+    Optionally supply `outcome_notes` in the request body to record what was done.
+    Sets `status` → `"actioned"` and records who actioned it and when.
+    """
     rec = await RecommendationRepository(db).get_by_id(_parse_uuid(recommendation_id, "recommendation_id"))
     if not rec or rec.org_id != current_user.org_id:
         raise not_found()
@@ -124,6 +137,11 @@ async def dismiss_recommendation(
     current_user: User = Depends(require_role("admin", "manager", "analyst")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Dismiss a recommendation. Requires admin, manager, or analyst role.
+
+    Optionally supply a `reason` string. Returns 422 if the recommendation is already
+    actioned or dismissed.
+    """
     rec = await RecommendationRepository(db).get_by_id(_parse_uuid(recommendation_id, "recommendation_id"))
     if not rec or rec.org_id != current_user.org_id:
         raise not_found()
@@ -141,6 +159,11 @@ async def escalate_recommendation(
     current_user: User = Depends(require_role("admin", "manager", "analyst")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Escalate a recommendation to admin/manager level.
+
+    Sets `status` → `"escalated"` and sends an in-app notification to every active
+    admin and manager in the org. Returns 422 if already actioned, dismissed, or escalated.
+    """
     rec = await RecommendationRepository(db).get_by_id(_parse_uuid(recommendation_id, "recommendation_id"))
     if not rec or rec.org_id != current_user.org_id:
         raise not_found()

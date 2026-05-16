@@ -41,6 +41,201 @@ from app.infrastructure.database.session import get_db
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/connections", tags=["Connections"])
 
+_CONNECTOR_CATALOG = [
+    {
+        "connector_type": "postgresql",
+        "display_name": "PostgreSQL",
+        "category": "SQL Database",
+        "icon_slug": "postgresql",
+        "description": "Connect to a PostgreSQL database.",
+        "fields": [
+            {"key": "host", "label": "Host", "type": "string", "required": True},
+            {"key": "port", "label": "Port", "type": "integer", "required": True, "default": 5432},
+            {"key": "database_name", "label": "Database Name", "type": "string", "required": True},
+            {"key": "username", "label": "Username", "type": "string", "required": True},
+            {"key": "password", "label": "Password", "type": "password", "required": True},
+            {"key": "sslmode", "label": "SSL Mode", "type": "select", "required": False, "default": "prefer",
+             "options": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]},
+        ],
+    },
+    {
+        "connector_type": "mysql",
+        "display_name": "MySQL",
+        "category": "SQL Database",
+        "icon_slug": "mysql",
+        "description": "Connect to a MySQL or MariaDB database.",
+        "fields": [
+            {"key": "host", "label": "Host", "type": "string", "required": True},
+            {"key": "port", "label": "Port", "type": "integer", "required": True, "default": 3306},
+            {"key": "database_name", "label": "Database Name", "type": "string", "required": True},
+            {"key": "username", "label": "Username", "type": "string", "required": True},
+            {"key": "password", "label": "Password", "type": "password", "required": True},
+        ],
+    },
+    {
+        "connector_type": "mssql",
+        "display_name": "Microsoft SQL Server",
+        "category": "SQL Database",
+        "icon_slug": "mssql",
+        "description": "Connect to a Microsoft SQL Server database.",
+        "fields": [
+            {"key": "host", "label": "Host", "type": "string", "required": True},
+            {"key": "port", "label": "Port", "type": "integer", "required": True, "default": 1433},
+            {"key": "database_name", "label": "Database Name", "type": "string", "required": True},
+            {"key": "username", "label": "Username", "type": "string", "required": True},
+            {"key": "password", "label": "Password", "type": "password", "required": True},
+        ],
+    },
+    {
+        "connector_type": "redshift",
+        "display_name": "Amazon Redshift",
+        "category": "SQL Database",
+        "icon_slug": "redshift",
+        "description": "Connect to an Amazon Redshift cluster.",
+        "fields": [
+            {"key": "host", "label": "Host", "type": "string", "required": True},
+            {"key": "port", "label": "Port", "type": "integer", "required": True, "default": 5439},
+            {"key": "database_name", "label": "Database Name", "type": "string", "required": True},
+            {"key": "username", "label": "Username", "type": "string", "required": True},
+            {"key": "password", "label": "Password", "type": "password", "required": True},
+        ],
+    },
+    {
+        "connector_type": "sqlite",
+        "display_name": "SQLite",
+        "category": "SQL Database",
+        "icon_slug": "sqlite",
+        "description": "Connect to a local SQLite database file.",
+        "fields": [
+            {"key": "database_name", "label": "Database File Path", "type": "string", "required": True,
+             "placeholder": "/path/to/database.db"},
+        ],
+    },
+    {
+        "connector_type": "snowflake",
+        "display_name": "Snowflake",
+        "category": "Cloud Warehouse",
+        "icon_slug": "snowflake",
+        "description": "Connect to a Snowflake data warehouse.",
+        "fields": [
+            {"key": "connection_url", "label": "Connection URL", "type": "string", "required": True,
+             "placeholder": "snowflake://user:pass@account/db?warehouse=WH&role=ROLE"},
+        ],
+    },
+    {
+        "connector_type": "bigquery",
+        "display_name": "Google BigQuery",
+        "category": "Cloud Warehouse",
+        "icon_slug": "bigquery",
+        "description": "Connect to Google BigQuery.",
+        "fields": [
+            {"key": "connection_url", "label": "Connection URL", "type": "string", "required": True,
+             "placeholder": "bigquery://project/dataset"},
+        ],
+    },
+    {
+        "connector_type": "databricks",
+        "display_name": "Databricks",
+        "category": "Cloud Warehouse",
+        "icon_slug": "databricks",
+        "description": "Connect to a Databricks SQL warehouse.",
+        "fields": [
+            {"key": "connection_url", "label": "Connection URL", "type": "string", "required": True,
+             "placeholder": "databricks+connector://token@host/database"},
+        ],
+    },
+    {
+        "connector_type": "clickhouse",
+        "display_name": "ClickHouse",
+        "category": "Analytical Database",
+        "icon_slug": "clickhouse",
+        "description": "Connect to a ClickHouse analytical database via native DSN or HTTP.",
+        "fields": [
+            {"key": "connection_url", "label": "Native DSN", "type": "string", "required": False,
+             "placeholder": "clickhouse+native://user:pass@host:9000/db"},
+            {"key": "clickhouse_https_url", "label": "HTTPS URL", "type": "string", "required": False,
+             "placeholder": "https://host:8443"},
+            {"key": "clickhouse_user", "label": "Username", "type": "string", "required": False},
+            {"key": "clickhouse_password", "label": "Password", "type": "password", "required": False},
+        ],
+        "notes": "Provide either a native DSN or the HTTPS URL with credentials.",
+    },
+    {
+        "connector_type": "mongodb",
+        "display_name": "MongoDB",
+        "category": "NoSQL Database",
+        "icon_slug": "mongodb",
+        "description": "Connect to a MongoDB cluster.",
+        "fields": [
+            {"key": "mongodb_uri", "label": "Connection URI", "type": "string", "required": True,
+             "placeholder": "mongodb+srv://user:pass@cluster.mongodb.net/db"},
+        ],
+    },
+    {
+        "connector_type": "airtable",
+        "display_name": "Airtable",
+        "category": "SaaS / Spreadsheet",
+        "icon_slug": "airtable",
+        "description": "Connect to an Airtable base using a Personal Access Token.",
+        "fields": [
+            {"key": "airtable_pat", "label": "Personal Access Token", "type": "password", "required": True},
+            {"key": "airtable_base_id", "label": "Base ID", "type": "string", "required": False,
+             "placeholder": "appXXXXXXXXXXXXXX"},
+        ],
+    },
+    {
+        "connector_type": "google_sheets",
+        "display_name": "Google Sheets",
+        "category": "SaaS / Spreadsheet",
+        "icon_slug": "google_sheets",
+        "description": "Connect to a Google Spreadsheet using an API key.",
+        "fields": [
+            {"key": "google_sheets_api_key", "label": "Google API Key", "type": "password", "required": True},
+            {"key": "google_spreadsheet_id", "label": "Spreadsheet ID", "type": "string", "required": True,
+             "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"},
+        ],
+    },
+    {
+        "connector_type": "s3",
+        "display_name": "Amazon S3",
+        "category": "Object Storage",
+        "icon_slug": "s3",
+        "description": "Connect to an Amazon S3 bucket containing CSV or Parquet files.",
+        "fields": [
+            {"key": "s3_bucket", "label": "Bucket Name", "type": "string", "required": True},
+            {"key": "s3_access_key_id", "label": "Access Key ID", "type": "string", "required": True},
+            {"key": "s3_secret_access_key", "label": "Secret Access Key", "type": "password", "required": True},
+            {"key": "s3_region", "label": "Region", "type": "string", "required": False, "default": "us-east-1"},
+        ],
+    },
+    {
+        "connector_type": "gcs",
+        "display_name": "Google Cloud Storage",
+        "category": "Object Storage",
+        "icon_slug": "gcs",
+        "description": "Connect to a Google Cloud Storage bucket containing CSV or Parquet files.",
+        "fields": [
+            {"key": "gcs_bucket", "label": "Bucket Name", "type": "string", "required": True},
+            {"key": "gcs_service_account_json", "label": "Service Account JSON", "type": "textarea", "required": True},
+        ],
+    },
+    {
+        "connector_type": "csv",
+        "display_name": "CSV / File Upload",
+        "category": "File",
+        "icon_slug": "csv",
+        "description": "Upload a CSV file directly. Max 50 MB. Use POST /connections/upload.",
+        "fields": [],
+        "upload_endpoint": "/api/v1/connections/upload",
+    },
+]
+
+
+@router.get("/catalog")
+async def get_connector_catalog() -> list[dict]:
+    """Return the full list of supported connector types with display metadata and required fields."""
+    return _CONNECTOR_CATALOG
+
 
 def _parse_uuid(value: str, field_name: str) -> UUID:
     try:
@@ -119,6 +314,7 @@ async def list_connections(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[ConnectionResponse]:
+    """List all data source connections for the org. Soft-deleted connections are excluded."""
     conns = await ConnectionRepository(db).list_by_org(current_user.org_id)
     return [_connection_to_response(c) for c in conns]
 
@@ -129,6 +325,12 @@ async def upload_connection_file(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
+    """Upload a CSV or spreadsheet file as a data source. Max file size: 50 MB.
+
+    Send as `multipart/form-data` with the file in the `file` field. The connection
+    is created with `status: "pending"` — further pipeline configuration is required
+    before the AI pipeline can use it.
+    """
     await max_cloud_free_connections(db, current_user.org_id, await ConnectionRepository(db).count_active(current_user.org_id))
     max_bytes = 50 * 1024 * 1024
     upload_dir = f"/tmp/pulse_uploads/{current_user.org_id}"
@@ -168,6 +370,10 @@ async def test_current_connection(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TestConnectionResponse:
+    """Test the org's most recent connection. Returns 422 if the test fails.
+
+    Prefer `POST /connections/{id}/test` when you have a specific connection ID.
+    """
     conn = await _get_current_connection(db, current_user.org_id)
     _assert_live(conn)
     success, message, db_version = await _test_and_mark_connection(conn)
@@ -212,6 +418,12 @@ async def list_connection_tables(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> IntrospectResponse:
+    """Introspect all tables and columns in a connection. Makes a live query against the remote DB.
+
+    Use this to populate the schema-mapping step in onboarding or settings. For large databases
+    this can take several seconds. Prefer the cached schema from `GET /onboarding/connection/schema`
+    during the onboarding flow.
+    """
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
@@ -229,6 +441,11 @@ async def preview_connection_table(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TablePreviewResponse:
+    """Preview up to 500 rows from a specific table. Useful for verifying column mappings.
+
+    Results are returned as `rows: [{ column: value, ... }]`. No sensitive values are
+    masked — use this only in trusted admin contexts.
+    """
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
@@ -247,6 +464,7 @@ async def get_connection(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
+    """Return a single connection by ID."""
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
@@ -260,6 +478,14 @@ async def create_connection(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
+    """Create and immediately test a new data source connection.
+
+    Set `connector_type` to one of the values returned by `GET /connections/catalog`.
+    Each connector type requires different fields — see the catalog for the exact field list.
+    Returns 422 if the connection test fails; the `fields.connection_id` in the error
+    contains the ID of the failed record so the frontend can offer a retry without creating
+    a duplicate.
+    """
     repo = ConnectionRepository(db)
     await max_cloud_free_connections(db, current_user.org_id, await repo.count_active(current_user.org_id))
     built = build_encrypted_secret_and_row_fields(body)

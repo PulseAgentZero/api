@@ -2,7 +2,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,6 +54,7 @@ def _to_response(user: User) -> UserResponse:
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)) -> UserResponse:
+    """Return the currently authenticated user's profile. Prefer `GET /auth/me` which also returns org details."""
     return _to_response(current_user)
 
 
@@ -63,10 +64,66 @@ async def update_me(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
+    """Update the current user's display name or avatar URL.
+
+    To upload an image file directly use `POST /users/me/avatar` instead.
+    Pass `avatar_url` to set an externally-hosted image (e.g. from OAuth providers).
+    """
     if body.full_name is not None:
         current_user.full_name = body.full_name
     if body.avatar_url is not None:
         current_user.profile_image_url = body.avatar_url
+    await db.commit()
+    await db.refresh(current_user)
+    return _to_response(current_user)
+
+
+_ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+@router.post("/me/avatar", response_model=UserResponse)
+async def upload_my_avatar(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Upload a profile photo for the current user.
+
+    Send as `multipart/form-data` with the image in the `file` field.
+    Accepted formats: JPEG, PNG, WebP, GIF. Max size: 5 MB.
+    On success, `profile_image_url` in all subsequent `/auth/me` and `/users/me`
+    responses will reflect the new URL.
+
+    Requires `ASSETS_S3_BUCKET` to be configured; returns 503 if S3 is not set up.
+    """
+    content_type = file.content_type or ""
+    if content_type not in _ALLOWED_IMAGE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_FILE_TYPE", "message": f"File must be an image (jpeg/png/webp/gif), got {content_type!r}"},
+        )
+    data = await file.read(_MAX_AVATAR_BYTES + 1)
+    if len(data) > _MAX_AVATAR_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={"code": "FILE_TOO_LARGE", "message": "Avatar must be 5 MB or smaller"},
+        )
+    try:
+        from app.infrastructure.external_services.s3_assets import upload_bytes_to_s3
+        url = upload_bytes_to_s3(
+            data,
+            org_id=current_user.org_id,
+            category="profile",
+            filename=file.filename or "avatar",
+            content_type=content_type,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "STORAGE_UNAVAILABLE", "message": str(exc)},
+        ) from exc
+    current_user.profile_image_url = url
     await db.commit()
     await db.refresh(current_user)
     return _to_response(current_user)
@@ -78,6 +135,11 @@ async def update_me_password(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Change the current user's password. Requires the existing password for verification.
+
+    Returns 422 if `current_password` is wrong or `new_password` is shorter than 8 characters.
+    Not available for OAuth-only accounts (Google sign-in with no password set).
+    """
     if not current_user.password_hash:
         raise bad_request("NO_PASSWORD", "OAuth-only account has no password")
     if not verify_password(body.current_password, current_user.password_hash):
@@ -94,6 +156,7 @@ async def list_users(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> list[UserResponse]:
+    """List all active and inactive users in the org. Requires admin or manager role."""
     users = await UserRepository(db).list_by_org(current_user.org_id)
     return [_to_response(user) for user in users]
 
@@ -104,6 +167,13 @@ async def invite_user(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> InviteUserResponse:
+    """Invite a teammate by email with a specific role. Requires admin role.
+
+    Sends an email with a 72-hour accept link pointing to `{FRONTEND_URL}/auth/accept-invite?token=...`.
+    The invitee calls `POST /auth/accept-invite` with the token, their name, and a password to
+    create their account. Roles available: `manager`, `analyst`, `viewer` (admin cannot be invited).
+    Returns 409 if a pending invitation already exists for that email.
+    """
     if body.role == "admin":
         raise bad_request("BAD_REQUEST", "Cannot invite as admin via this endpoint")
     repo = UserRepository(db)
@@ -168,6 +238,7 @@ async def list_invitations(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """List all pending (not yet accepted, not yet expired) invitations. Requires admin role."""
     now = datetime.now(timezone.utc)
     r = await db.execute(
         select(Invitation).where(
@@ -192,12 +263,56 @@ async def list_invitations(
     }
 
 
+@router.post("/invitations/{invitation_id}/resend", response_model=InviteUserResponse)
+async def resend_invitation(
+    invitation_id: UUID,
+    current_user: User = Depends(require_role("admin")),
+    db: AsyncSession = Depends(get_db),
+) -> InviteUserResponse:
+    """Resend an invitation email and reset the 72-hour expiry window. Requires admin role.
+
+    Generates a fresh token (invalidating the old link), updates the expiry, and
+    re-sends the email. Returns 404 if the invitation doesn't exist or was already accepted.
+    """
+    inv = await db.get(Invitation, invitation_id)
+    if not inv or inv.org_id != current_user.org_id or inv.accepted_at is not None:
+        raise not_found("Invitation not found or already accepted")
+
+    inv.token = secrets.token_hex(32)
+    inv.expires_at = datetime.now(timezone.utc) + timedelta(hours=72)
+    await db.flush()
+    org = await db.get(Organization, current_user.org_id)
+    try:
+        await send_invitation_email(
+            to=inv.email,
+            token=inv.token,
+            invited_by=current_user.full_name or current_user.email,
+            org_name=org.name if org else "your organization",
+            role=inv.role,
+        )
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("resend invitation email failed for %s", inv.email)
+    await db.commit()
+    await db.refresh(inv)
+    return InviteUserResponse(
+        invitation_id=inv.id,
+        email=inv.email,
+        role=inv.role,
+        expires_at=inv.expires_at,
+    )
+
+
 @router.delete("/invitations/{invitation_id}", status_code=204)
 async def revoke_invitation(
     invitation_id: UUID,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Revoke a pending invitation, invalidating its token. Requires admin role.
+
+    Returns 404 if the invitation does not exist or has already been accepted.
+    """
     inv = await db.get(Invitation, invitation_id)
     if not inv or inv.org_id != current_user.org_id or inv.accepted_at is not None:
         raise not_found("Invitation not found or already accepted")
@@ -212,6 +327,11 @@ async def update_user_role(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
+    """Change a user's role. Requires admin role.
+
+    Cannot demote yourself, cannot remove the last admin.
+    Available roles: `admin`, `manager`, `analyst`, `viewer`.
+    """
     repo = UserRepository(db)
     target = await repo.get_by_id(_parse_uuid(user_id, "user_id"))
     if not target or target.org_id != current_user.org_id:
@@ -232,6 +352,11 @@ async def deactivate_user(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Deactivate (soft-delete) a user. The account is disabled but data is retained. Requires admin role.
+
+    Cannot deactivate yourself. Cannot deactivate the last admin.
+    Deactivated users receive a 403 on their next request.
+    """
     repo = UserRepository(db)
     target = await repo.get_by_id(_parse_uuid(user_id, "user_id"))
     if not target or target.org_id != current_user.org_id:

@@ -46,6 +46,7 @@ async def list_rules(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """List all alert rules configured for the org. Requires admin or manager role."""
     result = await db.execute(select(AlertRule).where(AlertRule.org_id == current_user.org_id))
     rows = list(result.scalars().all())
     return {"rules": [_rule_out(r) for r in rows]}
@@ -75,6 +76,14 @@ async def create_rule(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Create an alert rule. Requires admin or manager role.
+
+    **metric** — the field to evaluate, e.g. `"risk_score"`.
+    **operator** — `"gt"`, `"lt"`, `"gte"`, `"lte"`, `"eq"`.
+    **threshold** — numeric value that triggers the alert.
+    **channel_ids** — list of notification channel UUIDs to notify on trigger.
+    **cooldown_minutes** — minimum minutes between consecutive alerts for the same rule (default 60).
+    """
     await _validate_channels(db, current_user.org_id, body.channel_ids)
     row = AlertRule(
         org_id=current_user.org_id,
@@ -101,6 +110,7 @@ async def update_rule(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Replace all fields of an alert rule. Requires admin or manager role."""
     row = await db.get(AlertRule, rule_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()
@@ -124,6 +134,7 @@ async def delete_rule(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Delete an alert rule permanently. Requires admin role."""
     row = await db.get(AlertRule, rule_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()
@@ -136,6 +147,7 @@ async def list_channels(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """List all notification channels for the org. Requires admin or manager role."""
     result = await db.execute(
         select(NotificationChannel).where(NotificationChannel.org_id == current_user.org_id)
     )
@@ -166,6 +178,14 @@ async def create_channel(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Create a notification channel. Requires admin or manager role.
+
+    **type** — `"slack"`, `"webhook"`, `"email"`.
+    **config** — channel-specific credentials:
+    - Slack: `{ "webhook_url": "https://hooks.slack.com/..." }`
+    - Webhook: `{ "url": "https://...", "headers": {} }`
+    - Email: `{ "to": "ops@company.com" }`
+    """
     enc = encrypt_dsn(json.dumps(body.config)) if body.config else None
     row = NotificationChannel(
         org_id=current_user.org_id,
@@ -192,6 +212,7 @@ async def update_channel(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Replace all fields of a notification channel. Requires admin or manager role."""
     row = await db.get(NotificationChannel, channel_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()
@@ -215,6 +236,7 @@ async def delete_channel(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Delete a notification channel permanently. Requires admin role."""
     row = await db.get(NotificationChannel, channel_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()
@@ -228,6 +250,10 @@ async def test_channel(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Send a test payload to a notification channel to verify it is configured correctly.
+
+    Returns `{ "success": true, "message": "..." }` on success, or 422 on failure.
+    """
     from app.api.errors import bad_request, not_found
     from app.services.webhook_dispatch import send_channel_test
 
@@ -247,6 +273,11 @@ async def list_events(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """List alert events (triggered rule firings), most recent first.
+
+    Filter by `rule_id` to see events for a specific rule. Paginated, default 50 per page.
+    Each event records the metric value, threshold, and how many entities were affected.
+    """
     stmt = select(AlertEvent).where(AlertEvent.org_id == current_user.org_id)
     if rule_id:
         stmt = stmt.where(AlertEvent.rule_id == rule_id)

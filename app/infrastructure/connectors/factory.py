@@ -45,7 +45,7 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         )
         return {
             "plaintext_secret": dsn,
-            "connector_type": "mysql" if ct == "mysql" else ("postgres" if ct == "postgresql" else ct),
+            "connector_type": ct,
             "connection_meta": {
                 "kind": "sql",
                 "db_type": db_t,

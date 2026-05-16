@@ -59,6 +59,11 @@ async def trigger_pipeline_legacy(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Trigger an async pipeline run (legacy alias for POST /pipeline/trigger).
+
+    Returns 202 immediately. Poll `GET /pipeline/runs/{run_id}` or stream progress via
+    `GET /pipeline/runs/{run_id}/stream`. Requires admin or manager role.
+    """
     return await _trigger_common(current_user, db)
 
 
@@ -68,6 +73,12 @@ async def trigger_pipeline(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Trigger an async pipeline run.
+
+    Optionally pass `mapping_id` to target a specific schema mapping; otherwise the
+    org's active mapping is used. Returns 202 with `run_id` immediately — the pipeline
+    executes in the background worker. Requires admin or manager role.
+    """
     mid = body.mapping_id if body else None
     return await _trigger_common(current_user, db, mapping_id=mid)
 
@@ -156,6 +167,15 @@ async def stream_pipeline_run(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Stream real-time pipeline progress via Server-Sent Events (SSE).
+
+    Connect with `EventSource` in the browser. Three event types:
+    - `progress` — `{ current_step, step_count, last_step }` emitted whenever a step changes.
+    - `done` — `{ status, current_step }` emitted when the run reaches a terminal state.
+    - `error` — `{ error }` emitted if the run record disappears.
+
+    The stream closes automatically when the run completes, fails, or is cancelled.
+    """
     try:
         rid = UUID(run_id)
     except ValueError as exc:
@@ -198,6 +218,12 @@ async def cancel_pipeline_run(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Request cancellation of an in-progress pipeline run.
+
+    Sets run status to `cancelled`. The worker checks this flag between pipeline steps,
+    so cancellation may not be instant. Returns 422 if the run has already completed.
+    Requires admin or manager role.
+    """
     try:
         rid = UUID(run_id)
     except ValueError as exc:
@@ -217,6 +243,11 @@ async def get_schedule(
     current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict | None:
+    """Return the org's pipeline schedule, or null if no schedule has been configured.
+
+    The default schedule is every 6 hours (`0 */6 * * *`), created automatically when
+    onboarding completes. Requires admin or manager role.
+    """
     r = await db.execute(
         select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
     )
@@ -240,6 +271,12 @@ async def put_schedule(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
+    """Create or update the org's pipeline schedule. Requires admin role.
+
+    `cron_expression` must be a valid 5-field cron string (e.g. `"0 */6 * * *"` for every
+    6 hours). `timezone` is a tz database name (e.g. `"Africa/Lagos"`). Set `is_active: false`
+    to pause the schedule without deleting it.
+    """
     try:
         croniter(body.cron_expression)
     except Exception:

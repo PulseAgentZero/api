@@ -1,8 +1,9 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
 
 from croniter import croniter
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +32,8 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.schema_mapping_repository import (
     SchemaMappingRepository,
 )
-from app.infrastructure.database.session import get_db
+from app.infrastructure.database.session import async_session_factory, get_db
+from app.services.pipeline_queue import enqueue_introspection_job
 from app.services.recommendation_service import (
     ClientDBError,
     generate_recommendations_for_org,
@@ -134,6 +136,25 @@ async def _auto_create_schema_mapping(
         )
 
 
+async def _introspect_in_background(
+    org_id,
+    connection_id,
+    plaintext_dsn: str,
+    sslmode: str | None,
+    entity_label: str | None,
+    goal_label: str | None,
+) -> None:
+    """Run schema introspection in a background task with its own DB session."""
+    try:
+        async with async_session_factory() as db:
+            await _auto_create_schema_mapping(
+                db, org_id, connection_id, plaintext_dsn, sslmode, entity_label, goal_label
+            )
+            await db.commit()
+    except Exception:
+        logger.exception("Background schema introspection failed for connection %s", connection_id)
+
+
 def _pick_primary_connection_for_introspect(conns: list[Connection]) -> Connection | None:
     """Prefer active DB connections with a DSN, then most recently updated."""
     live = [c for c in conns if c.deleted_at is None and c.encrypted_dsn]
@@ -150,6 +171,12 @@ async def save_context(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Save the org's business context — industry, entity label, and goal.
+
+    Step 1 of the onboarding wizard. All fields are optional on each call so the
+    frontend can save partial progress. The values are used later by the AI pipeline to
+    personalise risk narratives and recommendations.
+    """
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     if not org:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
@@ -172,9 +199,20 @@ async def save_context(
 @router.post("/connection", response_model=OnboardingConnectionResponse)
 async def save_and_test_connection(
     body: CreateConnectionRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> OnboardingConnectionResponse:
+    """Save and test a data source connection.
+
+    Tests the connection immediately (credentials + reachability). Schema introspection
+    runs in the background after this call returns — poll `GET /onboarding/connection/schema`
+    to check when it is ready. This keeps response time under ~10 s regardless of how
+    many tables the remote database contains.
+
+    Returns 422 if the connection test fails. On success the connection `status` will be
+    `"active"`.
+    """
     repo = ConnectionRepository(db)
     built = build_encrypted_secret_and_row_fields(body)
     plaintext = built.pop("plaintext_secret")
@@ -213,18 +251,25 @@ async def save_and_test_connection(
             detail={"success": False, "message": message, "connection_id": str(conn.id)},
         )
 
-    # Auto-infer schema mapping so the user doesn't have to configure it manually.
+    # Schema introspection (N+1 queries over the remote DB) runs in the background
+    # so this endpoint returns immediately after the connection test passes.
+    # Prefer the Redis-backed worker queue for durability; fall back to an in-process
+    # FastAPI BackgroundTask when Redis is not configured (dev / no-Redis deployments).
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
-    await _auto_create_schema_mapping(
-        db,
-        org_id=current_user.org_id,
+    queued = await enqueue_introspection_job(
         connection_id=conn.id,
-        plaintext_dsn=plaintext,
-        sslmode=body.sslmode,
-        entity_label=org.entity_label if org else None,
-        goal_label=org.goal_label if org else None,
+        org_id=current_user.org_id,
     )
-    await db.commit()
+    if not queued:
+        background_tasks.add_task(
+            _introspect_in_background,
+            org_id=current_user.org_id,
+            connection_id=conn.id,
+            plaintext_dsn=plaintext,
+            sslmode=body.sslmode,
+            entity_label=org.entity_label if org else None,
+            goal_label=org.goal_label if org else None,
+        )
 
     return OnboardingConnectionResponse(
         connection=_connection_to_response(conn),
@@ -239,6 +284,13 @@ async def get_connection_schema(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> IntrospectResponse:
+    """Return the schema (tables + columns) for the org's active connection.
+
+    Serves from the cached schema stored during the background introspection triggered by
+    `POST /onboarding/connection`. If the cache is not yet ready (background task still
+    running), falls back to a live introspection query. Either way the response shape is
+    the same — call this endpoint after `POST /onboarding/connection` succeeds.
+    """
     conns = await ConnectionRepository(db).list_by_org(current_user.org_id)
     if not conns:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
@@ -248,6 +300,16 @@ async def get_connection_schema(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "BAD_REQUEST", "message": "This connector type does not support schema introspection"},
         )
+
+    # Serve from the raw_schema cached by the background introspection task when available.
+    mappings = await SchemaMappingRepository(db).list_by_org(current_user.org_id)
+    if mappings:
+        raw = mappings[0].raw_schema or {}
+        tables_data = raw.get("tables") or []
+        if tables_data:
+            return IntrospectResponse.model_validate({"tables": tables_data})
+
+    # Background task hasn't finished yet — fall back to live introspection.
     tables = await introspect_schema(decrypt_dsn(conn.encrypted_dsn), sslmode=conn.sslmode)
     return IntrospectResponse(tables=tables)
 
@@ -258,6 +320,16 @@ async def save_schema_mapping(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> OnboardingSchemaMappingResponse:
+    """Confirm the schema mapping for the active connection.
+
+    Step 3 of the onboarding wizard. The frontend should pre-fill this form using the
+    schema returned by `GET /onboarding/connection/schema` and the auto-inferred mapping
+    values. The user can correct any field before submitting.
+
+    `entity_table` is the primary table to profile. `entity_id_col` must uniquely identify
+    each entity row. `signal_columns` is an optional dict mapping column names to semantic
+    labels (e.g. `{"last_payment_date": "recency", "total_spend": "value"}`).
+    """
     conn = await ConnectionRepository(db).get_by_id(body.connection_id)
     if not conn or conn.org_id != current_user.org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
@@ -285,6 +357,15 @@ async def complete_onboarding(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CompleteOnboardingResponse:
+    """Finalise onboarding and trigger the first pipeline run.
+
+    Step 4 (final step) of the onboarding wizard. Marks the org as onboarded, creates the
+    default pipeline schedule (every 6 hours), generates an initial batch of recommendations
+    synchronously, then kicks off a full pipeline run in the background.
+
+    Returns 409 if onboarding is already complete. Returns the number of recommendations
+    generated in `generated_recommendations`.
+    """
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     if not org:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
