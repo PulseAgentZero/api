@@ -43,6 +43,7 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.services.conversational_agents import run_split
 from app.services.conversational_memory import (
     format_recalled_for_prompt,
     recall as recall_memories,
@@ -638,6 +639,27 @@ async def run(
     latest_user = _latest_user_message(conversation_messages)
     recalled = await recall_memories(current_user, latest_user) if latest_user else []
     recalled_block = format_recalled_for_prompt(recalled)
+
+    # Optional Query+Synthesis split (hierarchical pattern from Agentic Architectures e-book).
+    if settings.CONV_AGENT_SPLIT_ENABLED:
+        base_system = await _system_prompt(db, current_user, recalled_block=recalled_block)
+        try:
+            reply_text = await run_split(
+                db, current_user, conversation_messages,
+                base_system_prompt=base_system,
+                run_tool=_run_tool, full_tools=TOOLS, json_ready=_json_ready,
+            )
+        except Exception as exc:
+            logger.warning("[agent_service] split run failed, falling back to single-agent: %s", exc)
+            reply_text = ""
+        if reply_text:
+            if latest_user:
+                try:
+                    await reflect_and_commit(current_user, latest_user, reply_text)
+                except Exception as exc:
+                    logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
+            return reply_text
+        # If split returned empty, fall through to single-agent path below.
 
     reply_text: str = ""
     try:

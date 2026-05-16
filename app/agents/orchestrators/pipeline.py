@@ -562,6 +562,9 @@ class PipelineOrchestrator:
             "reasoning_log": [],
             "started_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": None,
+            # Cross-agent scratchpad. Agents can read/write freely; cleared when state is GC'd.
+            "working_memory": {},
+            "procedural_learnings": [],
         }
         return state
 

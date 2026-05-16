@@ -240,6 +240,9 @@ class Settings:
     CONV_MEMORY_IMPORTANCE_THRESHOLD: float = float(os.getenv("CONV_MEMORY_IMPORTANCE_THRESHOLD", "0.5"))
     CONV_MEMORY_RETENTION_DAYS: int = int(os.getenv("CONV_MEMORY_RETENTION_DAYS", "180"))
 
+    # Conversational agent split (Query Agent + Synthesis Agent)
+    CONV_AGENT_SPLIT_ENABLED: bool = os.getenv("CONV_AGENT_SPLIT_ENABLED", "false").lower() == "true"
+
     # ------------------------------------------------------------------
     # Groq API (LLM)
     # ------------------------------------------------------------------

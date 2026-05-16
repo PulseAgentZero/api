@@ -57,3 +57,15 @@ class PipelineState(TypedDict, total=False):
     generation_caps: Optional[dict]     # caps/sampling notes (e.g. narrative limit hit)
     started_at: str
     completed_at: Optional[str]
+
+    # Working memory: shared scratchpad for cross-agent intermediate state.
+    # Per Context Engineering e-book: a temporary holding area for in-progress
+    # multi-step tasks, distinct from short-term context window and long-term store.
+    # Example uses:
+    #   state["working_memory"]["dominant_risk_tier"] = "critical"
+    #   state["working_memory"]["entity_count"] = 642
+    # Cleared implicitly when the pipeline run ends (state is not persisted).
+    working_memory: dict
+
+    # Procedural memory recall — top learnings surfaced from prior pipeline runs.
+    procedural_learnings: list[str]
