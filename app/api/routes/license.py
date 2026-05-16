@@ -47,6 +47,11 @@ async def get_license(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """**Self-hosted only.** Returns 404 on cloud deployments.
+
+    Return the current license status for this org: plan, active features, seat usage,
+    expiry date, and whether the instance is locked. No license → `plan: "free"`, `is_valid: false`.
+    """
     _cloud_404()
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
@@ -118,6 +123,13 @@ async def activate_license(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """**Self-hosted only.** Returns 404 on cloud deployments.
+
+    Activate or replace the license key for this self-hosted instance. Contacts the Pulse
+    license server to validate the key, then stores plan, features, seat limit, and expiry
+    locally. Sets a validation cache window (default 7 days) so the instance stays functional
+    if the license server is temporarily unreachable. Returns 422 on invalid or expired keys.
+    """
     _cloud_404()
     if settings.PULSE_LICENSE_PUBLIC_KEY:
         try:
@@ -200,6 +212,12 @@ async def refresh_license(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """**Self-hosted only.** Returns 404 on cloud deployments.
+
+    Re-validate the stored license key against the Pulse license server and refresh the
+    local cache. Call this manually if the instance was offline during the normal validation
+    window and is now showing as locked.
+    """
     _cloud_404()
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()

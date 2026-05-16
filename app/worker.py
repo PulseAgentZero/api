@@ -34,7 +34,7 @@ async def _handle_introspection(data: dict) -> None:
     from app.infrastructure.crypto import decrypt_dsn
     from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
     from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
-    from app.api.routes.onboarding import _auto_create_schema_mapping
+    from app.services.schema_introspection import auto_create_schema_mapping
 
     connection_id = UUID(data["connection_id"])
     org_id = UUID(data["org_id"])
@@ -46,7 +46,7 @@ async def _handle_introspection(data: dict) -> None:
             return
         org = await OrganizationRepository(session).get_by_id(org_id)
         plaintext = decrypt_dsn(conn.encrypted_dsn)
-        await _auto_create_schema_mapping(
+        await auto_create_schema_mapping(
             session,
             org_id=org_id,
             connection_id=connection_id,

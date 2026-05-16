@@ -37,6 +37,12 @@ async def get_llm_keys(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, bool]:
+    """**Self-hosted only.** Returns 404 on cloud deployments.
+
+    Return whether each LLM provider key is configured. Returns `{ "anthropic": bool, "groq": bool }`.
+    Keys themselves are never returned — only presence is indicated. Falls back to env-var detection
+    if no org-level key has been stored via `PUT /settings/llm-keys`.
+    """
     _require_self_hosted()
     r = await db.execute(select(LlmKeyStore).where(LlmKeyStore.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
@@ -58,6 +64,13 @@ async def put_llm_keys(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, bool]:
+    """**Self-hosted only.** Returns 404 on cloud deployments.
+
+    Store or update LLM API keys for this org. Keys are encrypted at rest with Fernet.
+    Pass `null` or an empty string for a provider to remove its stored key (the instance
+    will fall back to the `ANTHROPIC_API_KEY` / `GROQ_API_KEY` environment variables).
+    Returns the updated presence flags — never the raw keys.
+    """
     _require_self_hosted()
     r = await db.execute(select(LlmKeyStore).where(LlmKeyStore.org_id == current_user.org_id))
     row = r.scalar_one_or_none()

@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -20,6 +19,7 @@ from app.api.schemas.schema_mapping import CreateSchemaMappingRequest
 from app.infrastructure.connectors.factory import build_encrypted_secret_and_row_fields
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
 from app.infrastructure.database.connection_tester import introspect_schema, test_connection
+from app.services.schema_introspection import auto_create_schema_mapping
 from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.user import User
@@ -45,95 +45,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/onboarding", tags=["Onboarding"])
 
 
-def _infer_col(columns: list, *patterns: str) -> str | None:
-    """Find the first column whose name matches any of the given patterns."""
-    col_map = {c.name.lower(): c.name for c in columns}
-    for pat in patterns:
-        for lower, original in col_map.items():
-            if lower == pat or lower.endswith(f"_{pat}") or lower.startswith(f"{pat}_"):
-                return original
-    return None
-
-
-async def _auto_create_schema_mapping(
-    db: AsyncSession,
-    org_id,
-    connection_id,
-    plaintext_dsn: str,
-    sslmode: str | None,
-    entity_label: str | None,
-    goal_label: str | None,
-) -> None:
-    """Introspect the client DB and create (or update) a best-guess schema mapping."""
-    try:
-        tables = await introspect_schema(plaintext_dsn, sslmode=sslmode)
-    except Exception:
-        logger.warning("Schema introspection failed for connection %s — skipping auto-mapping", connection_id)
-        return
-
-    if not tables:
-        return
-
-    # Score tables: prefer the one whose name matches the entity label
-    entity_kw = (entity_label or "").lower().strip()
-
-    def _table_score(t) -> tuple:
-        name = t.name.lower()
-        if entity_kw and (entity_kw in name or name in entity_kw):
-            return (3, len(t.columns))
-        if any(kw in name for kw in ("customer", "user", "subscriber", "patient", "client", "member", "account", "employee", "product", "item", "sku")):
-            return (2, len(t.columns))
-        if any(kw in name for kw in ("log", "audit", "config", "setting", "migration", "session", "token", "permission")):
-            return (0, len(t.columns))
-        return (1, len(t.columns))
-
-    best = max(tables, key=_table_score)
-    cols = best.columns
-
-    entity_id_col = _infer_col(cols, "id", "uuid", "key", "pk") or cols[0].name
-    entity_name_col = _infer_col(cols, "name", "full_name", "fullname", "display_name", "title", "email", "username")
-    timestamp_col = _infer_col(cols, "created_at", "timestamp", "date", "updated_at", "event_date", "recorded_at")
-
-    goal_kw = (goal_label or "").lower()
-    target_col = None
-    if "churn" in goal_kw:
-        target_col = _infer_col(cols, "churned", "churn", "is_active", "active", "status", "cancelled")
-    elif any(kw in goal_kw for kw in ("stock", "inventor")):
-        target_col = _infer_col(cols, "stock", "quantity", "inventory", "available", "qty")
-    elif "risk" in goal_kw:
-        target_col = _infer_col(cols, "risk", "risk_score", "risk_tier", "score")
-
-    raw_schema = {
-        "tables": [
-            {"name": t.name, "columns": [{"name": c.name, "data_type": c.data_type, "nullable": c.nullable} for c in t.columns]}
-            for t in tables
-        ]
-    }
-
-    mapping_repo = SchemaMappingRepository(db)
-    existing = await mapping_repo.list_by_org(org_id)
-    if existing:
-        await mapping_repo.update(
-            existing[0].id,
-            connection_id=connection_id,
-            entity_table=best.name,
-            entity_id_col=entity_id_col,
-            entity_name_col=entity_name_col,
-            timestamp_col=timestamp_col,
-            target_column=target_col,
-            raw_schema=raw_schema,
-        )
-    else:
-        await mapping_repo.create(
-            org_id=org_id,
-            connection_id=connection_id,
-            entity_table=best.name,
-            entity_id_col=entity_id_col,
-            entity_name_col=entity_name_col,
-            timestamp_col=timestamp_col,
-            target_column=target_col,
-            raw_schema=raw_schema,
-        )
 
 
 async def _introspect_in_background(
@@ -144,11 +55,17 @@ async def _introspect_in_background(
     entity_label: str | None,
     goal_label: str | None,
 ) -> None:
-    """Run schema introspection in a background task with its own DB session."""
+    """Fallback: run schema introspection in-process when Redis is unavailable."""
     try:
         async with async_session_factory() as db:
-            await _auto_create_schema_mapping(
-                db, org_id, connection_id, plaintext_dsn, sslmode, entity_label, goal_label
+            await auto_create_schema_mapping(
+                db,
+                org_id=org_id,
+                connection_id=connection_id,
+                plaintext_dsn=plaintext_dsn,
+                sslmode=sslmode,
+                entity_label=entity_label,
+                goal_label=goal_label,
             )
             await db.commit()
     except Exception:
