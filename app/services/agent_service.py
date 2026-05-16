@@ -1,5 +1,6 @@
 """Conversational agent service with live-data tools."""
 
+import asyncio
 import json
 import logging
 import re
@@ -43,6 +44,84 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.services.conversational_agents import run_split, synthesis_agent_run
+from app.services.conversational_memory import (
+    format_handoff_for_prompt,
+    format_recalled_for_prompt,
+    recall as recall_memories,
+    reflect_and_commit,
+)
+from groq import AsyncGroq
+
+from app.agents.prompts.conversational import (
+    CLARIFICATION_REPLY_PROMPT,
+    GREETING_REPLY_PROMPT,
+    HELP_REPLY_PROMPT,
+    OFF_TOPIC_REPLY_PROMPT,
+    render_chat_system_prompt,
+)
+from app.services.intent_router import (
+    CONVERSATIONAL_INTENTS,
+    build_fastpath_args,
+    classify_intent,
+    filter_tools_by_intent,
+)
+
+
+_conv_groq_client: AsyncGroq | None = None
+
+
+def _get_conv_groq() -> AsyncGroq | None:
+    global _conv_groq_client
+    if not settings.is_groq_configured():
+        return None
+    if _conv_groq_client is None:
+        _conv_groq_client = AsyncGroq(
+            api_key=settings.groq_api_key, max_retries=1, timeout=6.0,
+        )
+    return _conv_groq_client
+
+
+_CONV_REPLY_PROMPTS = {
+    "greeting": GREETING_REPLY_PROMPT,
+    "help": HELP_REPLY_PROMPT,
+    "off_topic": OFF_TOPIC_REPLY_PROMPT,
+    "unknown": CLARIFICATION_REPLY_PROMPT,
+}
+
+
+async def _craft_conversational_reply(intent_name: str, state: dict) -> str | None:
+    """Groq fast-model call to craft a warm, grounded reply for a conversational intent.
+
+    Returns the reply text on success, or None if Groq is unavailable / errors out
+    / returns an unparseable response — caller falls back to a static template."""
+    system = _CONV_REPLY_PROMPTS.get(intent_name)
+    if system is None:
+        return None
+    client = _get_conv_groq()
+    if client is None:
+        return None
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(state, default=str)[:1200]},
+                ],
+                temperature=0.6,
+                max_tokens=300,
+                response_format={"type": "json_object"},
+            ),
+            timeout=6.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        data = json.loads(raw)
+        reply = (data.get("reply") or "").strip() if isinstance(data, dict) else ""
+        return reply or None
+    except Exception as exc:
+        logger.debug("[conv_reply] LLM craft failed (%s), falling back to template", exc)
+        return None
 
 
 TOOLS = [
@@ -282,11 +361,7 @@ async def _find_similar(
     }
 
 
-_ACTION_DRAFT_SYSTEM = (
-    "You write short, professional action drafts for an operations team to use with at-risk "
-    "customers / entities. Be specific to the entity's signals and recommendations — never use "
-    "generic boilerplate. Output ONLY the draft text. No preamble, no markdown headers, no JSON."
-)
+from app.agents.prompts.action_draft import ACTION_DRAFT_PROMPT as _ACTION_DRAFT_SYSTEM
 
 
 def _action_draft_fallback(detail: dict, entity_id: str, action_type: str) -> dict:
@@ -499,7 +574,22 @@ async def update_user_memory_from_message(
         logger.debug("[memory] upsert failed (non-fatal): %s", exc)
 
 
-async def _system_prompt(db: AsyncSession, current_user: User) -> str:
+def _latest_user_message(conversation_messages: list[dict]) -> str:
+    for msg in reversed(conversation_messages):
+        if msg.get("role") == "user" and msg.get("content"):
+            content = msg["content"]
+            if isinstance(content, str):
+                return content
+    return ""
+
+
+async def _system_prompt(
+    db: AsyncSession,
+    current_user: User,
+    *,
+    recalled_block: str = "",
+    handoff_block: str = "",
+) -> str:
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     org_name = org.name if org else "this organization"
     entity_label = org.entity_label if org and org.entity_label else "entities"
@@ -510,14 +600,15 @@ async def _system_prompt(db: AsyncSession, current_user: User) -> str:
     memory = await _load_user_memory(db, current_user)
     memory_block = _format_memory_for_prompt(memory)
 
-    return (
-        f"You are Pulse, an operational intelligence agent for {org_name}. "
-        f"The organization models {entity_label} and the goal is to {goal_label}. "
-        f"Business context: {context}\n"
-        f"{pipeline_block}"
-        f"{memory_block}"
-        "Answer data-dependent questions only after using the provided tools. "
-        "Be concise, operational, and avoid guessing."
+    return render_chat_system_prompt(
+        org_name=org_name,
+        entity_label=entity_label,
+        goal_label=goal_label,
+        business_context=context,
+        pipeline_block=pipeline_block,
+        memory_block=memory_block,
+        handoff_block=handoff_block,
+        recalled_block=recalled_block,
     )
 
 
@@ -605,6 +696,92 @@ async def _fallback_reply(
     )
 
 
+async def _conversational_reply(
+    db: AsyncSession,
+    current_user: User,
+    intent_name: str,
+    user_message: str,
+) -> str:
+    """Tool-free reply for greeting / help / off_topic / unknown.
+
+    Pulls org context (name, entity_label, goal_label) so the reply is grounded
+    in the org's vocabulary instead of generic Pulse boilerplate.
+    """
+    try:
+        org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    except Exception:
+        org = None
+    org_name = (org.name if org else None) or "your team"
+    entity_label = (org.entity_label if org and org.entity_label else "entities").lower()
+    goal_label = (org.goal_label if org and org.goal_label else "improve operations").lower()
+
+    user_first = ""
+    try:
+        full = getattr(current_user, "full_name", None) or getattr(current_user, "name", None) or ""
+        user_first = str(full).split()[0] if full else ""
+    except Exception:
+        user_first = ""
+
+    # State passed to the LLM prompt and the fallback templates.
+    state = {
+        "user_first": user_first,
+        "org_name": org_name,
+        "entity_label": entity_label,
+        "goal_label": goal_label,
+        "message": user_message,
+    }
+
+    # Try LLM-crafted reply first (warmer + tone-matched).
+    crafted = await _craft_conversational_reply(intent_name, state)
+    if crafted:
+        return crafted
+
+    # Fallback: static templates when Groq is unavailable or returns junk.
+    return _conversational_reply_template(intent_name, state)
+
+
+def _conversational_reply_template(intent_name: str, state: dict) -> str:
+    """Deterministic template fallback for the conversational intents."""
+    user_first = state.get("user_first") or ""
+    org_name = state.get("org_name") or "your team"
+    entity_label = state.get("entity_label") or "entities"
+    goal_label = state.get("goal_label") or "improve operations"
+    singular = entity_label[:-1] if entity_label.endswith("s") else entity_label
+
+    if intent_name == "greeting":
+        opener = f"Hi {user_first}!" if user_first else "Hi!"
+        return (
+            f"{opener} I'm Pulse, the operational intelligence agent for {org_name}. "
+            f"Ask me about your {entity_label}, risk tiers, recommendations, or to "
+            f"draft an outreach: anything that helps you {goal_label}."
+        )
+
+    if intent_name == "help":
+        return (
+            f"Here's what I can do for {org_name}:\n"
+            f"- Quick overview (\"what's our status?\")\n"
+            f"- Pull details for a {singular} (\"tell me about NG-00075\")\n"
+            f"- List {entity_label} by tier (\"show critical {entity_label}\")\n"
+            f"- Active recommendations (\"what should I action today?\")\n"
+            f"- Find similar {entity_label} (\"5 more like NG-00075\")\n"
+            f"- Draft an outreach (\"draft a message for NG-00075\")\n"
+            f"- Explain trends (\"why is NG-00075 critical?\")\n\n"
+            f"What would you like to start with?"
+        )
+
+    if intent_name == "off_topic":
+        return (
+            f"That's outside what I can help with. I'm focused on {org_name}'s "
+            f"{entity_label}: try \"what's our status?\" or \"show critical {entity_label}\" to start."
+        )
+
+    # unknown / clarification
+    return (
+        f"I'm not sure what you're after. Try \"what's our status?\", "
+        f"\"show critical {entity_label}\", or \"what should I action today?\" to get going."
+    )
+
+
 async def run(
     db: AsyncSession,
     current_user: User,
@@ -615,6 +792,105 @@ async def run(
     if not settings.is_anthropic_configured():
         return await _fallback_reply(db, current_user, conversation_messages)
 
+    latest_user = _latest_user_message(conversation_messages)
+    recalled = await recall_memories(current_user, latest_user) if latest_user else []
+    recalled_block = format_recalled_for_prompt(recalled)
+
+    # First-turn handoff: surface prior-session summaries only on conversation entry,
+    # so reopened threads aren't polluted by mid-thread handoff text.
+    handoff_block = ""
+    is_first_turn = len([m for m in conversation_messages if m.get("role") == "user"]) <= 1
+    if is_first_turn and latest_user:
+        handoffs = await recall_memories(
+            current_user, latest_user,
+            top_k=settings.CONV_MEMORY_HANDOFF_K,
+            kind="conversation_summary",
+            min_score=0.0,  # any prior summary is worth surfacing on first turn
+        )
+        handoff_block = format_handoff_for_prompt(handoffs)
+
+    # Semantic intent detection: fast-path high-confidence simple intents past
+    # the full ReAct loop; otherwise prefilter the tool list for the ReAct loop.
+    tools_for_run = TOOLS
+    if settings.CHAT_INTENT_DETECTION_ENABLED and latest_user:
+        recent_for_intent = [
+            {"role": m["role"], "content": m["content"]}
+            for m in conversation_messages[-6:]
+            if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)
+        ]
+        intent = await classify_intent(latest_user, convo_history=recent_for_intent)
+
+        # Conversational intents — greeting / help / off_topic / (low-confidence) unknown.
+        # Skip ReAct and tool calls entirely; return a context-aware reply.
+        if intent and intent.intent in CONVERSATIONAL_INTENTS and intent.confidence >= 0.5:
+            logger.info(
+                "[agent_service] conversational intent=%s confidence=%.2f",
+                intent.intent, intent.confidence,
+            )
+            return await _conversational_reply(db, current_user, intent.intent, latest_user)
+
+        if intent and intent.confidence >= settings.CHAT_INTENT_FASTPATH_CONFIDENCE:
+            fp = build_fastpath_args(intent)
+            if fp is not None:
+                tool_name, tool_args = fp
+                logger.info(
+                    "[agent_service] intent fast-path: intent=%s confidence=%.2f tool=%s",
+                    intent.intent, intent.confidence, tool_name,
+                )
+                try:
+                    tool_result = await _run_tool(
+                        tool_name, tool_args, db, current_user.org_id,
+                    )
+                    base_system = await _system_prompt(
+                        db, current_user,
+                        recalled_block=recalled_block, handoff_block=handoff_block,
+                    )
+                    synthesis_reply = await synthesis_agent_run(
+                        db, current_user, conversation_messages,
+                        {tool_name: _json_ready(tool_result)},
+                        base_system_prompt=base_system,
+                    )
+                    if synthesis_reply:
+                        try:
+                            await reflect_and_commit(current_user, latest_user, synthesis_reply)
+                        except Exception as exc:
+                            logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
+                        return synthesis_reply
+                except Exception as exc:
+                    logger.warning(
+                        "[agent_service] fast-path failed, falling back to ReAct: %s", exc,
+                    )
+        if intent:
+            tools_for_run = filter_tools_by_intent(TOOLS, intent)
+            logger.debug(
+                "[agent_service] intent=%s confidence=%.2f tools=%d/%d",
+                intent.intent, intent.confidence, len(tools_for_run), len(TOOLS),
+            )
+
+    # Optional Query+Synthesis split (hierarchical pattern from Agentic Architectures e-book).
+    if settings.CONV_AGENT_SPLIT_ENABLED:
+        base_system = await _system_prompt(
+            db, current_user, recalled_block=recalled_block, handoff_block=handoff_block,
+        )
+        try:
+            reply_text = await run_split(
+                db, current_user, conversation_messages,
+                base_system_prompt=base_system,
+                run_tool=_run_tool, full_tools=tools_for_run, json_ready=_json_ready,
+            )
+        except Exception as exc:
+            logger.warning("[agent_service] split run failed, falling back to single-agent: %s", exc)
+            reply_text = ""
+        if reply_text:
+            if latest_user:
+                try:
+                    await reflect_and_commit(current_user, latest_user, reply_text)
+                except Exception as exc:
+                    logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
+            return reply_text
+        # If split returned empty, fall through to single-agent path below.
+
+    reply_text: str = ""
     try:
         client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
         messages = [
@@ -626,8 +902,8 @@ async def run(
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
-            system=await _system_prompt(db, current_user),
-            tools=TOOLS,
+            system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block),
+            tools=tools_for_run,
             messages=messages,
         )
 
@@ -637,7 +913,8 @@ async def run(
                 text = "".join(
                     block.text for block in response.content if block.type == "text"
                 ).strip()
-                return text or await _fallback_reply(db, current_user, conversation_messages)
+                reply_text = text or await _fallback_reply(db, current_user, conversation_messages)
+                break
 
             messages.append(
                 {
@@ -664,14 +941,23 @@ async def run(
             response = await client.messages.create(
                 model=settings.ANTHROPIC_LLM_MODEL,
                 max_tokens=900,
-                system=await _system_prompt(db, current_user),
-                tools=TOOLS,
+                system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block),
+                tools=tools_for_run,
                 messages=messages,
             )
-
-        return "I could not complete the tool workflow in time. Try narrowing the question."
+        else:
+            reply_text = "I could not complete the tool workflow in time. Try narrowing the question."
     except Exception:
-        return await _fallback_reply(db, current_user, conversation_messages)
+        reply_text = await _fallback_reply(db, current_user, conversation_messages)
+
+    # Memory commit is best-effort; never let it block or fail the reply.
+    if latest_user and reply_text:
+        try:
+            await reflect_and_commit(current_user, latest_user, reply_text)
+        except Exception as exc:
+            logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
+
+    return reply_text
 
 
 async def run_stream(
@@ -686,14 +972,30 @@ async def run_stream(
         yield await _fallback_reply(db, current_user, conversation_messages)
         return
 
+    latest_user = _latest_user_message(conversation_messages)
+    recalled = await recall_memories(current_user, latest_user) if latest_user else []
+    recalled_block = format_recalled_for_prompt(recalled)
+
+    handoff_block = ""
+    is_first_turn = len([m for m in conversation_messages if m.get("role") == "user"]) <= 1
+    if is_first_turn and latest_user:
+        handoffs = await recall_memories(
+            current_user, latest_user,
+            top_k=settings.CONV_MEMORY_HANDOFF_K,
+            kind="conversation_summary",
+            min_score=0.0,
+        )
+        handoff_block = format_handoff_for_prompt(handoffs)
+
     client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
     messages = [
         {"role": msg["role"], "content": msg["content"]}
         for msg in conversation_messages
         if msg.get("role") in {"user", "assistant"} and msg.get("content")
     ]
-    system_prompt = await _system_prompt(db, current_user)
+    system_prompt = await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block)
 
+    accumulated: list[str] = []
     try:
         for _ in range(4):
             tool_uses: list = []
@@ -706,12 +1008,13 @@ async def run_stream(
             ) as stream:
                 async for text_chunk in stream.text_stream:
                     if text_chunk:
+                        accumulated.append(text_chunk)
                         yield text_chunk
                 final_message = await stream.get_final_message()
 
             tool_uses = [b for b in final_message.content if b.type == "tool_use"]
             if not tool_uses:
-                return
+                break
 
             messages.append(
                 {
@@ -735,8 +1038,19 @@ async def run_stream(
                     }
                 )
             messages.append({"role": "user", "content": tool_results})
-
-        yield "\n\n[Reached tool-loop limit — narrow the question.]"
+        else:
+            limit_msg = "\n\n[Reached tool-loop limit — narrow the question.]"
+            accumulated.append(limit_msg)
+            yield limit_msg
     except Exception as exc:
         logger.warning("[agent_service] stream failed, falling back: %s", exc)
-        yield await _fallback_reply(db, current_user, conversation_messages)
+        fallback = await _fallback_reply(db, current_user, conversation_messages)
+        accumulated.append(fallback)
+        yield fallback
+
+    full_reply = "".join(accumulated).strip()
+    if latest_user and full_reply:
+        try:
+            await reflect_and_commit(current_user, latest_user, full_reply)
+        except Exception as exc:
+            logger.debug("[agent_service] reflect_and_commit failed: %s", exc)

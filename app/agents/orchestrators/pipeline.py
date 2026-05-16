@@ -45,6 +45,11 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.pipeline_run_repository import (
     PipelineRunRepository,
 )
+from app.services.procedural_memory import (
+    extract_and_commit_from_run,
+    format_learnings_for_prompt,
+    recall_learnings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +127,26 @@ class PipelineOrchestrator:
                 state=state,
             )
             return state
+
+        # Procedural memory recall: surface learnings from prior runs so downstream
+        # agents (and operators looking at logs) can see what's worked before.
+        try:
+            recall_query = " ".join(
+                str(state.get(k) or "")
+                for k in ("org_name", "industry", "entity_label", "goal_label", "business_context")
+            ).strip()
+            learnings = await recall_learnings(org_id, recall_query) if recall_query else []
+            if learnings:
+                state["procedural_learnings"] = [
+                    (m.payload or {}).get("content", "") for m in learnings
+                ]
+                logger.info(
+                    "[Pipeline] Recalled %d procedural learnings for org %s:\n%s",
+                    len(learnings), org_id,
+                    format_learnings_for_prompt(learnings).rstrip(),
+                )
+        except Exception as exc:
+            logger.debug("[Pipeline] procedural recall skipped (non-fatal): %s", exc)
 
         pipeline = [
             ("schema_intelligence", SchemaIntelligenceAgent()),
@@ -334,6 +359,27 @@ class PipelineOrchestrator:
             pipeline_metrics["provider_fallbacks"],
         )
 
+        # Procedural memory commit: extract a durable learning from this run.
+        # Best-effort; never blocks the response or surfaces errors to callers.
+        try:
+            run_summary = {
+                "org_id": str(org_id),
+                "org_name": state.get("org_name"),
+                "industry": state.get("industry"),
+                "status": "failed" if state.get("error") else "succeeded",
+                "duration_ms": pipeline_metrics.get("total_duration_ms"),
+                "risk_summary": risk_summary,
+                "recommendation_stats": rec_stats,
+                "rag_eval": rag_metrics_payload.get("eval"),
+                "step_summary": [
+                    {"step": s.get("step"), "ms": s.get("duration_ms"), "ok": s.get("success")}
+                    for s in step_metrics
+                ],
+            }
+            await extract_and_commit_from_run(org_id, run_summary)
+        except Exception as exc:
+            logger.debug("[Pipeline] procedural extract skipped (non-fatal): %s", exc)
+
         state["pipeline_run_id"] = str(run.id)
         return state
 
@@ -516,6 +562,9 @@ class PipelineOrchestrator:
             "reasoning_log": [],
             "started_at": datetime.now(timezone.utc).isoformat(),
             "completed_at": None,
+            # Cross-agent scratchpad. Agents can read/write freely; cleared when state is GC'd.
+            "working_memory": {},
+            "procedural_learnings": [],
         }
         return state
 

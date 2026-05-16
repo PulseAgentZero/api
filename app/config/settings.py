@@ -183,6 +183,11 @@ class Settings:
     def get_org_collection_name(cls, org_id: str) -> str:
         return f"{cls.QDRANT_COLLECTION_PREFIX}{org_id}"
 
+    @classmethod
+    def get_org_memory_collection_name(cls, org_id: str) -> str:
+        """Per-org Qdrant collection for conversational/episodic memory entries."""
+        return f"{cls.QDRANT_COLLECTION_PREFIX}{org_id}_memory"
+
     # ------------------------------------------------------------------
     # Voyage AI (embeddings for vector search)
     # ------------------------------------------------------------------
@@ -228,6 +233,22 @@ class Settings:
     RAG_VALIDATION_MIN_RELEVANT: int = int(os.getenv("RAG_VALIDATION_MIN_RELEVANT", "1"))
     AGENT_CONTEXT_COMPRESS_THRESHOLD: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_THRESHOLD", "60000"))
     AGENT_CONTEXT_COMPRESS_KEEP_RECENT: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_KEEP_RECENT", "6"))
+
+    # Conversational semantic memory (episodic store in Qdrant)
+    CONV_MEMORY_ENABLED: bool = os.getenv("CONV_MEMORY_ENABLED", "true").lower() == "true"
+    CONV_MEMORY_RECALL_K: int = int(os.getenv("CONV_MEMORY_RECALL_K", "3"))
+    CONV_MEMORY_IMPORTANCE_THRESHOLD: float = float(os.getenv("CONV_MEMORY_IMPORTANCE_THRESHOLD", "0.5"))
+    CONV_MEMORY_RETENTION_DAYS: int = int(os.getenv("CONV_MEMORY_RETENTION_DAYS", "180"))
+    CONV_MEMORY_MIN_RECALL_SCORE: float = float(os.getenv("CONV_MEMORY_MIN_RECALL_SCORE", "0.30"))
+    CONV_MEMORY_IDLE_SUMMARY_MINUTES: int = int(os.getenv("CONV_MEMORY_IDLE_SUMMARY_MINUTES", "30"))
+    CONV_MEMORY_HANDOFF_K: int = int(os.getenv("CONV_MEMORY_HANDOFF_K", "2"))
+
+    # Conversational agent split (Query Agent + Synthesis Agent)
+    CONV_AGENT_SPLIT_ENABLED: bool = os.getenv("CONV_AGENT_SPLIT_ENABLED", "false").lower() == "true"
+
+    # Semantic intent detection (fast classifier ahead of ReAct loop)
+    CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"
+    CHAT_INTENT_FASTPATH_CONFIDENCE: float = float(os.getenv("CHAT_INTENT_FASTPATH_CONFIDENCE", "0.85"))
 
     # ------------------------------------------------------------------
     # Groq API (LLM)
