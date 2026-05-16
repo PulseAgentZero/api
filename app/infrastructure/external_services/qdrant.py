@@ -450,28 +450,36 @@ class QdrantService:
         org_id: str,
         vector: list[float],
         *,
-        user_id: str,
+        user_id: str | None = None,
+        kind: str | None = None,
         limit: int = 3,
         score_threshold: float | None = None,
     ) -> list[SearchResult]:
-        """Per-user semantic search over the memory collection."""
+        """Semantic search over the per-org memory collection.
+
+        Pass `user_id` for per-user episodic recall; pass `kind='procedural'` for
+        org-level procedural recall. Both can be combined.
+        """
         client = await self._get_client()
         collection_name = settings.get_org_memory_collection_name(org_id)
         if not await client.collection_exists(collection_name):
             return []
-        user_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="user_id", match=models.MatchValue(value=user_id)
-                )
-            ]
-        )
+        must: list = []
+        if user_id:
+            must.append(
+                models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id))
+            )
+        if kind:
+            must.append(
+                models.FieldCondition(key="kind", match=models.MatchValue(value=kind))
+            )
+        filter_obj = models.Filter(must=must) if must else None
         async for attempt in _retry():
             with attempt:
                 results = await client.query_points(
                     collection_name=collection_name,
                     query=vector,
-                    query_filter=user_filter,
+                    query_filter=filter_obj,
                     limit=limit,
                     score_threshold=score_threshold,
                     with_payload=True,
