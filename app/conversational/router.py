@@ -2,6 +2,7 @@
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -15,6 +16,7 @@ from app.api.schemas.agent import (
     ConversationListItem,
     ConversationResponse,
 )
+from app.config.settings import settings
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.agent_conversation_repository import (
     AgentConversationRepository,
@@ -25,6 +27,7 @@ from app.services.agent_service import (
     run_stream as run_agent_stream,
     update_user_memory_from_message,
 )
+from app.services.conversational_memory import summarize_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,28 @@ def _parse_uuid(value: str, field_name: str) -> UUID:
         return UUID(value)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid {field_name}") from exc
+
+
+async def _maybe_summarize_on_idle(
+    db: AsyncSession,
+    current_user: User,
+    conv,
+) -> None:
+    """If the prior assistant reply is older than the idle threshold, summarize the
+    existing thread before the new turn arrives. Best-effort; never raises."""
+    minutes = settings.CONV_MEMORY_IDLE_SUMMARY_MINUTES
+    if minutes <= 0 or conv.last_message_at is None:
+        return
+    prior = (conv.messages or {}).get("messages", [])
+    if not prior:
+        return
+    age = datetime.now(timezone.utc) - conv.last_message_at
+    if age < timedelta(minutes=minutes):
+        return
+    try:
+        await summarize_conversation(current_user, prior)
+    except Exception as exc:
+        logger.debug("[chat] idle-summary failed (non-fatal): %s", exc)
 
 
 async def _stream_chat_sse(
@@ -142,6 +167,10 @@ async def chat(
             status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
         )
 
+    # If this conversation was idle past the threshold, summarize the prior segment
+    # into long-term memory before adding the new turn.
+    await _maybe_summarize_on_idle(db, current_user, conv)
+
     user_msg = {"role": "user", "content": body.content}
     await repo.append_messages(conv_id, user_msg)
     await update_user_memory_from_message(db, current_user, body.content)
@@ -180,6 +209,8 @@ async def chat_without_path_conversation(
     else:
         conv = await repo.create(org_id=current_user.org_id, user_id=current_user.id)
         await db.flush()
+
+    await _maybe_summarize_on_idle(db, current_user, conv)
 
     user_msg = {"role": "user", "content": body.content}
     await repo.append_messages(conv.id, user_msg)

@@ -40,6 +40,13 @@ _REFLECT_SYSTEM = (
     "If commit is false, content/importance/kind may be empty."
 )
 
+_SUMMARY_SYSTEM = (
+    "You distil a chat thread between a user and Pulse (an operational "
+    "intelligence assistant) into ONE sentence in third person. Capture the "
+    "topic, key entities mentioned, and any outcome or decision. Skip "
+    "pleasantries. 30 words max. Output the sentence only — no preamble."
+)
+
 
 _groq_client: AsyncGroq | None = None
 
@@ -152,20 +159,30 @@ async def recall(
     query_text: str,
     *,
     top_k: int | None = None,
+    min_score: float | None = None,
+    kind: str | None = None,
 ) -> list[SearchResult]:
-    """Return top-K semantically relevant memories for this user. Empty list on any failure."""
+    """Return top-K semantically relevant memories for this user, filtered by min score.
+
+    `kind` lets callers narrow to a specific memory type (e.g. 'conversation_summary'
+    for the handoff block). When None, all per-user memories are eligible.
+    """
     if not _can_use_memory() or not query_text.strip():
         return []
     k = top_k or settings.CONV_MEMORY_RECALL_K
+    threshold = settings.CONV_MEMORY_MIN_RECALL_SCORE if min_score is None else min_score
     org_id = str(current_user.org_id)
     user_id = str(current_user.id)
 
     try:
         qdrant = QdrantService()
         vector = await embedding_service.embed_query(query_text)
-        return await qdrant.search_memory(
-            org_id, vector, user_id=user_id, limit=k,
+        results = await qdrant.search_memory(
+            org_id, vector, user_id=user_id, kind=kind, limit=k,
         )
+        if threshold > 0:
+            results = [r for r in results if (r.score or 0.0) >= threshold]
+        return results
     except Exception as exc:
         logger.debug("[conv_memory] recall failed (returning empty): %s", exc)
         return []
@@ -190,6 +207,92 @@ def format_recalled_for_prompt(memories: list[SearchResult]) -> str:
         + "\n".join(lines)
         + "\n"
     )
+
+
+def format_handoff_for_prompt(summaries: list[SearchResult]) -> str:
+    """Render conversation summaries as a 'recent sessions' handoff block."""
+    if not summaries:
+        return ""
+    lines: list[str] = []
+    for m in summaries:
+        content = (m.payload or {}).get("content", "").strip()
+        if content:
+            lines.append(f"- {content}")
+    if not lines:
+        return ""
+    return (
+        "Context from this user's recent sessions (use only if the question "
+        "implies continuity; do not pre-emptively reference):\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
+def _format_transcript_for_summary(messages: list[dict]) -> str:
+    """Render the last N messages of a chat thread for the summarizer prompt."""
+    lines: list[str] = []
+    for m in messages[-10:]:
+        role = m.get("role")
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, default=str)[:300]
+        if role and content:
+            lines.append(f"{role}: {content[:400]}")
+    return "\n".join(lines)
+
+
+async def summarize_conversation(
+    current_user: User,
+    messages: list[dict],
+) -> str | None:
+    """Distil a chat thread to one sentence and commit as kind='conversation_summary'."""
+    if not _can_use_memory() or not messages:
+        return None
+    client = _get_groq()
+    if client is None:
+        return None
+    transcript = _format_transcript_for_summary(messages)
+    if not transcript:
+        return None
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=settings.GROQ_LLM_MODEL_FAST,
+                messages=[
+                    {"role": "system", "content": _SUMMARY_SYSTEM},
+                    {"role": "user", "content": transcript},
+                ],
+                temperature=0.0,
+                max_tokens=120,
+            ),
+            timeout=6.0,
+        )
+        summary = (response.choices[0].message.content or "").strip()
+        if not summary:
+            return None
+
+        org_id = str(current_user.org_id)
+        user_id = str(current_user.id)
+        qdrant = QdrantService()
+        await qdrant.ensure_memory_collection(org_id)
+        vector = await embedding_service.embed_query(summary)
+        # Distinct namespace so summaries don't collide with fact memories.
+        pid = memory_point_id(user_id + ":summary", summary)
+        await qdrant.upsert_memory(org_id, [(
+            pid, vector, {
+                "user_id": user_id,
+                "kind": "conversation_summary",
+                "content": summary,
+                "importance": 0.75,
+                "source": "idle_summary",
+                "embedded_at": time.time(),
+            },
+        )])
+        logger.info("[conv_memory] summarized conversation user=%s: %r", user_id, summary[:80])
+        return summary
+    except Exception as exc:
+        logger.debug("[conv_memory] summarize failed: %s", exc)
+        return None
 
 
 async def prune(org_id: UUID | str) -> int:

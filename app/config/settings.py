@@ -239,9 +239,16 @@ class Settings:
     CONV_MEMORY_RECALL_K: int = int(os.getenv("CONV_MEMORY_RECALL_K", "3"))
     CONV_MEMORY_IMPORTANCE_THRESHOLD: float = float(os.getenv("CONV_MEMORY_IMPORTANCE_THRESHOLD", "0.5"))
     CONV_MEMORY_RETENTION_DAYS: int = int(os.getenv("CONV_MEMORY_RETENTION_DAYS", "180"))
+    CONV_MEMORY_MIN_RECALL_SCORE: float = float(os.getenv("CONV_MEMORY_MIN_RECALL_SCORE", "0.30"))
+    CONV_MEMORY_IDLE_SUMMARY_MINUTES: int = int(os.getenv("CONV_MEMORY_IDLE_SUMMARY_MINUTES", "30"))
+    CONV_MEMORY_HANDOFF_K: int = int(os.getenv("CONV_MEMORY_HANDOFF_K", "2"))
 
     # Conversational agent split (Query Agent + Synthesis Agent)
     CONV_AGENT_SPLIT_ENABLED: bool = os.getenv("CONV_AGENT_SPLIT_ENABLED", "false").lower() == "true"
+
+    # Semantic intent detection (fast classifier ahead of ReAct loop)
+    CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"
+    CHAT_INTENT_FASTPATH_CONFIDENCE: float = float(os.getenv("CHAT_INTENT_FASTPATH_CONFIDENCE", "0.85"))
 
     # ------------------------------------------------------------------
     # Groq API (LLM)

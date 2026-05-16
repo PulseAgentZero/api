@@ -43,11 +43,18 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
-from app.services.conversational_agents import run_split
+from app.services.conversational_agents import run_split, synthesis_agent_run
 from app.services.conversational_memory import (
+    format_handoff_for_prompt,
     format_recalled_for_prompt,
     recall as recall_memories,
     reflect_and_commit,
+)
+from app.services.intent_router import (
+    CONVERSATIONAL_INTENTS,
+    build_fastpath_args,
+    classify_intent,
+    filter_tools_by_intent,
 )
 
 
@@ -519,6 +526,7 @@ async def _system_prompt(
     current_user: User,
     *,
     recalled_block: str = "",
+    handoff_block: str = "",
 ) -> str:
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     org_name = org.name if org else "this organization"
@@ -536,6 +544,7 @@ async def _system_prompt(
         f"Business context: {context}\n"
         f"{pipeline_block}"
         f"{memory_block}"
+        f"{handoff_block}"
         f"{recalled_block}"
         "Answer data-dependent questions only after using the provided tools. "
         "Be concise, operational, and avoid guessing."
@@ -626,6 +635,68 @@ async def _fallback_reply(
     )
 
 
+async def _conversational_reply(
+    db: AsyncSession,
+    current_user: User,
+    intent_name: str,
+    user_message: str,
+) -> str:
+    """Tool-free reply for greeting / help / off_topic / unknown.
+
+    Pulls org context (name, entity_label, goal_label) so the reply is grounded
+    in the org's vocabulary instead of generic Pulse boilerplate.
+    """
+    try:
+        org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    except Exception:
+        org = None
+    org_name = (org.name if org else None) or "your team"
+    entity_label = (org.entity_label if org and org.entity_label else "entities").lower()
+    goal_label = (org.goal_label if org and org.goal_label else "improve operations").lower()
+
+    user_first = ""
+    try:
+        full = getattr(current_user, "full_name", None) or getattr(current_user, "name", None) or ""
+        user_first = str(full).split()[0] if full else ""
+    except Exception:
+        user_first = ""
+
+    if intent_name == "greeting":
+        opener = f"Hi {user_first}!" if user_first else "Hi!"
+        return (
+            f"{opener} I'm Pulse, the operational intelligence agent for {org_name}. "
+            f"Ask me about your {entity_label}, risk tiers, recommendations, or to "
+            f"draft an outreach — anything that helps you {goal_label}."
+        )
+
+    if intent_name == "help":
+        return (
+            f"I help you act on {org_name}'s {entity_label} data. Things I can do:\n"
+            f"- Give a high-level **overview** of risk and recommendations\n"
+            f"- Pull **details for a specific {entity_label[:-1] if entity_label.endswith('s') else entity_label}** (e.g. \"tell me about NG-00075\")\n"
+            f"- **List** {entity_label} by tier (e.g. \"show critical {entity_label}\")\n"
+            f"- Surface **active recommendations** by urgency\n"
+            f"- **Find similar** {entity_label} for a reference one\n"
+            f"- **Draft an outreach** message for a specific {entity_label[:-1] if entity_label.endswith('s') else entity_label}\n"
+            f"- **Compare or explain** trends (e.g. \"why is NG-00075 critical?\")"
+        )
+
+    if intent_name == "off_topic":
+        return (
+            f"That's outside what I can help with — I'm focused on {org_name}'s "
+            f"{entity_label}, their risk profiles, and what to do about them. "
+            f"Try \"what's our status?\" or \"show critical {entity_label}\" to get started."
+        )
+
+    # unknown
+    return (
+        f"I didn't quite catch that. I can answer questions about {org_name}'s "
+        f"{entity_label}, recommendations, or risk trends — could you rephrase? "
+        f"Examples: \"show me critical {entity_label}\", \"tell me about a specific {entity_label[:-1] if entity_label.endswith('s') else entity_label}\", "
+        f"or \"what should I action today?\""
+    )
+
+
 async def run(
     db: AsyncSession,
     current_user: User,
@@ -640,14 +711,87 @@ async def run(
     recalled = await recall_memories(current_user, latest_user) if latest_user else []
     recalled_block = format_recalled_for_prompt(recalled)
 
+    # First-turn handoff: surface prior-session summaries only on conversation entry,
+    # so reopened threads aren't polluted by mid-thread handoff text.
+    handoff_block = ""
+    is_first_turn = len([m for m in conversation_messages if m.get("role") == "user"]) <= 1
+    if is_first_turn and latest_user:
+        handoffs = await recall_memories(
+            current_user, latest_user,
+            top_k=settings.CONV_MEMORY_HANDOFF_K,
+            kind="conversation_summary",
+            min_score=0.0,  # any prior summary is worth surfacing on first turn
+        )
+        handoff_block = format_handoff_for_prompt(handoffs)
+
+    # Semantic intent detection: fast-path high-confidence simple intents past
+    # the full ReAct loop; otherwise prefilter the tool list for the ReAct loop.
+    tools_for_run = TOOLS
+    if settings.CHAT_INTENT_DETECTION_ENABLED and latest_user:
+        recent_for_intent = [
+            {"role": m["role"], "content": m["content"]}
+            for m in conversation_messages[-6:]
+            if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)
+        ]
+        intent = await classify_intent(latest_user, convo_history=recent_for_intent)
+
+        # Conversational intents — greeting / help / off_topic / (low-confidence) unknown.
+        # Skip ReAct and tool calls entirely; return a context-aware reply.
+        if intent and intent.intent in CONVERSATIONAL_INTENTS and intent.confidence >= 0.5:
+            logger.info(
+                "[agent_service] conversational intent=%s confidence=%.2f",
+                intent.intent, intent.confidence,
+            )
+            return await _conversational_reply(db, current_user, intent.intent, latest_user)
+
+        if intent and intent.confidence >= settings.CHAT_INTENT_FASTPATH_CONFIDENCE:
+            fp = build_fastpath_args(intent)
+            if fp is not None:
+                tool_name, tool_args = fp
+                logger.info(
+                    "[agent_service] intent fast-path: intent=%s confidence=%.2f tool=%s",
+                    intent.intent, intent.confidence, tool_name,
+                )
+                try:
+                    tool_result = await _run_tool(
+                        tool_name, tool_args, db, current_user.org_id,
+                    )
+                    base_system = await _system_prompt(
+                        db, current_user,
+                        recalled_block=recalled_block, handoff_block=handoff_block,
+                    )
+                    synthesis_reply = await synthesis_agent_run(
+                        db, current_user, conversation_messages,
+                        {tool_name: _json_ready(tool_result)},
+                        base_system_prompt=base_system,
+                    )
+                    if synthesis_reply:
+                        try:
+                            await reflect_and_commit(current_user, latest_user, synthesis_reply)
+                        except Exception as exc:
+                            logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
+                        return synthesis_reply
+                except Exception as exc:
+                    logger.warning(
+                        "[agent_service] fast-path failed, falling back to ReAct: %s", exc,
+                    )
+        if intent:
+            tools_for_run = filter_tools_by_intent(TOOLS, intent)
+            logger.debug(
+                "[agent_service] intent=%s confidence=%.2f tools=%d/%d",
+                intent.intent, intent.confidence, len(tools_for_run), len(TOOLS),
+            )
+
     # Optional Query+Synthesis split (hierarchical pattern from Agentic Architectures e-book).
     if settings.CONV_AGENT_SPLIT_ENABLED:
-        base_system = await _system_prompt(db, current_user, recalled_block=recalled_block)
+        base_system = await _system_prompt(
+            db, current_user, recalled_block=recalled_block, handoff_block=handoff_block,
+        )
         try:
             reply_text = await run_split(
                 db, current_user, conversation_messages,
                 base_system_prompt=base_system,
-                run_tool=_run_tool, full_tools=TOOLS, json_ready=_json_ready,
+                run_tool=_run_tool, full_tools=tools_for_run, json_ready=_json_ready,
             )
         except Exception as exc:
             logger.warning("[agent_service] split run failed, falling back to single-agent: %s", exc)
@@ -673,8 +817,8 @@ async def run(
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
-            system=await _system_prompt(db, current_user, recalled_block=recalled_block),
-            tools=TOOLS,
+            system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block),
+            tools=tools_for_run,
             messages=messages,
         )
 
@@ -712,8 +856,8 @@ async def run(
             response = await client.messages.create(
                 model=settings.ANTHROPIC_LLM_MODEL,
                 max_tokens=900,
-                system=await _system_prompt(db, current_user, recalled_block=recalled_block),
-                tools=TOOLS,
+                system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block),
+                tools=tools_for_run,
                 messages=messages,
             )
         else:
@@ -747,13 +891,24 @@ async def run_stream(
     recalled = await recall_memories(current_user, latest_user) if latest_user else []
     recalled_block = format_recalled_for_prompt(recalled)
 
+    handoff_block = ""
+    is_first_turn = len([m for m in conversation_messages if m.get("role") == "user"]) <= 1
+    if is_first_turn and latest_user:
+        handoffs = await recall_memories(
+            current_user, latest_user,
+            top_k=settings.CONV_MEMORY_HANDOFF_K,
+            kind="conversation_summary",
+            min_score=0.0,
+        )
+        handoff_block = format_handoff_for_prompt(handoffs)
+
     client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
     messages = [
         {"role": msg["role"], "content": msg["content"]}
         for msg in conversation_messages
         if msg.get("role") in {"user", "assistant"} and msg.get("content")
     ]
-    system_prompt = await _system_prompt(db, current_user, recalled_block=recalled_block)
+    system_prompt = await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block)
 
     accumulated: list[str] = []
     try:
