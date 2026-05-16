@@ -42,6 +42,10 @@ from app.services.schedulers.license_scheduler import (
     shutdown_license_scheduler,
     start_license_scheduler,
 )
+from app.services.schedulers.memory_prune_scheduler import (
+    shutdown_memory_prune_scheduler,
+    start_memory_prune_scheduler,
+)
 from app.services.schedulers.pipeline_scheduler import (
     shutdown_scheduler,
     start_pipeline_scheduler,
@@ -54,11 +58,13 @@ configure_logging()
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     scheduler = await start_pipeline_scheduler()
     await start_license_scheduler()
+    await start_memory_prune_scheduler()
     try:
         yield
     finally:
         shutdown_scheduler()
         shutdown_license_scheduler()
+        shutdown_memory_prune_scheduler()
         await close_redis()
 
 

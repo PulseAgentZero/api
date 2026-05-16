@@ -48,6 +48,11 @@ def _all_chunk_point_ids(entity_id: str) -> list[str]:
     return [_to_point_id(entity_id + s) for s in _CHUNK_SUFFIXES]
 
 
+def memory_point_id(user_id: str, content: str) -> str:
+    """Stable UUID per (user, content) — same fact gets the same point id (natural dedup)."""
+    return str(uuid.uuid5(_POINT_ID_NS, f"mem:{user_id}:{content[:200]}"))
+
+
 def _retry() -> AsyncRetrying:
     return AsyncRetrying(
         stop=stop_after_attempt(3),
@@ -381,3 +386,159 @@ class QdrantService:
         if self.client is not None:
             await self.client.close()
             self.client = None
+
+    # ─── Conversational memory collection ──────────────────────────────
+    # Separate collection per org for episodic / semantic / procedural memory entries.
+    # Distinct from the entity-profile collection so the two have independent
+    # lifecycles (retention, prune, schema).
+
+    async def ensure_memory_collection(self, org_id: str) -> None:
+        client = await self._get_client()
+        collection_name = settings.get_org_memory_collection_name(org_id)
+        if await client.collection_exists(collection_name):
+            return
+        await client.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(
+                size=settings.QDRANT_VECTOR_SIZE,
+                distance=models.Distance.COSINE,
+            ),
+            quantization_config=models.ScalarQuantization(
+                scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8),
+            ),
+        )
+        try:
+            for keyword_field in ("user_id", "kind", "source"):
+                await client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=keyword_field,
+                    field_schema=models.PayloadSchemaType.KEYWORD,
+                )
+            for float_field in ("importance", "embedded_at"):
+                await client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=float_field,
+                    field_schema=models.PayloadSchemaType.FLOAT,
+                )
+        except Exception as exc:
+            logger.warning("Memory payload index creation skipped: %s", exc)
+        logger.info("Created Qdrant memory collection %s for org %s", collection_name, org_id)
+
+    async def upsert_memory(
+        self,
+        org_id: str,
+        items: Sequence[tuple[str, list[float], dict[str, Any]]],
+    ) -> None:
+        """Upsert memory points. Each item is (point_id, vector, payload)."""
+        if not items:
+            return
+        client = await self._get_client()
+        collection_name = settings.get_org_memory_collection_name(org_id)
+        points = [
+            models.PointStruct(id=pid, vector=vec, payload=payload)
+            for pid, vec, payload in items
+        ]
+        async for attempt in _retry():
+            with attempt:
+                for start in range(0, len(points), _UPSERT_BATCH_SIZE):
+                    chunk = points[start : start + _UPSERT_BATCH_SIZE]
+                    await client.upsert(collection_name=collection_name, points=chunk)
+        logger.debug("[Qdrant] memory upsert %d points to %s", len(points), collection_name)
+
+    async def search_memory(
+        self,
+        org_id: str,
+        vector: list[float],
+        *,
+        user_id: str,
+        limit: int = 3,
+        score_threshold: float | None = None,
+    ) -> list[SearchResult]:
+        """Per-user semantic search over the memory collection."""
+        client = await self._get_client()
+        collection_name = settings.get_org_memory_collection_name(org_id)
+        if not await client.collection_exists(collection_name):
+            return []
+        user_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="user_id", match=models.MatchValue(value=user_id)
+                )
+            ]
+        )
+        async for attempt in _retry():
+            with attempt:
+                results = await client.query_points(
+                    collection_name=collection_name,
+                    query=vector,
+                    query_filter=user_filter,
+                    limit=limit,
+                    score_threshold=score_threshold,
+                    with_payload=True,
+                )
+        return [
+            SearchResult(
+                entity_id=str(p.id),
+                score=p.score,
+                payload=p.payload or {},
+            )
+            for p in results.points
+        ]
+
+    async def prune_memory(
+        self,
+        org_id: str,
+        *,
+        importance_below: float | None = None,
+        older_than_days: int | None = None,
+    ) -> int:
+        """Delete memory points matching importance/age filters. Returns removed count."""
+        client = await self._get_client()
+        collection_name = settings.get_org_memory_collection_name(org_id)
+        if not await client.collection_exists(collection_name):
+            return 0
+
+        must: list = []
+        if importance_below is not None:
+            must.append(
+                models.FieldCondition(
+                    key="importance",
+                    range=models.Range(lt=float(importance_below)),
+                )
+            )
+        if older_than_days is not None and older_than_days > 0:
+            cutoff = time.time() - older_than_days * 86400
+            must.append(
+                models.FieldCondition(
+                    key="embedded_at",
+                    range=models.Range(lt=cutoff),
+                )
+            )
+        if not must:
+            return 0
+
+        # Scroll once to count what will be deleted, then delete by filter.
+        # Counting via scroll is bounded by limit; for true count we'd need a separate count call.
+        # We opt for a delete-by-filter and report via a follow-up count.
+        before = (await self._memory_point_count(org_id)) or 0
+        prune_filter = models.Filter(must=must)
+        async for attempt in _retry():
+            with attempt:
+                await client.delete(
+                    collection_name=collection_name,
+                    points_selector=models.FilterSelector(filter=prune_filter),
+                )
+        after = (await self._memory_point_count(org_id)) or 0
+        removed = max(0, before - after)
+        if removed:
+            logger.info("[Qdrant] memory prune removed %d points from %s", removed, collection_name)
+        return removed
+
+    async def _memory_point_count(self, org_id: str) -> int | None:
+        client = await self._get_client()
+        collection_name = settings.get_org_memory_collection_name(org_id)
+        try:
+            info = await client.get_collection(collection_name)
+            return int(info.points_count or 0)
+        except Exception:
+            return None

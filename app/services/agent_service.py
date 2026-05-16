@@ -43,6 +43,11 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.services.conversational_memory import (
+    format_recalled_for_prompt,
+    recall as recall_memories,
+    reflect_and_commit,
+)
 
 
 TOOLS = [
@@ -499,7 +504,21 @@ async def update_user_memory_from_message(
         logger.debug("[memory] upsert failed (non-fatal): %s", exc)
 
 
-async def _system_prompt(db: AsyncSession, current_user: User) -> str:
+def _latest_user_message(conversation_messages: list[dict]) -> str:
+    for msg in reversed(conversation_messages):
+        if msg.get("role") == "user" and msg.get("content"):
+            content = msg["content"]
+            if isinstance(content, str):
+                return content
+    return ""
+
+
+async def _system_prompt(
+    db: AsyncSession,
+    current_user: User,
+    *,
+    recalled_block: str = "",
+) -> str:
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     org_name = org.name if org else "this organization"
     entity_label = org.entity_label if org and org.entity_label else "entities"
@@ -516,6 +535,7 @@ async def _system_prompt(db: AsyncSession, current_user: User) -> str:
         f"Business context: {context}\n"
         f"{pipeline_block}"
         f"{memory_block}"
+        f"{recalled_block}"
         "Answer data-dependent questions only after using the provided tools. "
         "Be concise, operational, and avoid guessing."
     )
@@ -615,6 +635,11 @@ async def run(
     if not settings.is_anthropic_configured():
         return await _fallback_reply(db, current_user, conversation_messages)
 
+    latest_user = _latest_user_message(conversation_messages)
+    recalled = await recall_memories(current_user, latest_user) if latest_user else []
+    recalled_block = format_recalled_for_prompt(recalled)
+
+    reply_text: str = ""
     try:
         client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
         messages = [
@@ -626,7 +651,7 @@ async def run(
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
-            system=await _system_prompt(db, current_user),
+            system=await _system_prompt(db, current_user, recalled_block=recalled_block),
             tools=TOOLS,
             messages=messages,
         )
@@ -637,7 +662,8 @@ async def run(
                 text = "".join(
                     block.text for block in response.content if block.type == "text"
                 ).strip()
-                return text or await _fallback_reply(db, current_user, conversation_messages)
+                reply_text = text or await _fallback_reply(db, current_user, conversation_messages)
+                break
 
             messages.append(
                 {
@@ -664,14 +690,23 @@ async def run(
             response = await client.messages.create(
                 model=settings.ANTHROPIC_LLM_MODEL,
                 max_tokens=900,
-                system=await _system_prompt(db, current_user),
+                system=await _system_prompt(db, current_user, recalled_block=recalled_block),
                 tools=TOOLS,
                 messages=messages,
             )
-
-        return "I could not complete the tool workflow in time. Try narrowing the question."
+        else:
+            reply_text = "I could not complete the tool workflow in time. Try narrowing the question."
     except Exception:
-        return await _fallback_reply(db, current_user, conversation_messages)
+        reply_text = await _fallback_reply(db, current_user, conversation_messages)
+
+    # Memory commit is best-effort; never let it block or fail the reply.
+    if latest_user and reply_text:
+        try:
+            await reflect_and_commit(current_user, latest_user, reply_text)
+        except Exception as exc:
+            logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
+
+    return reply_text
 
 
 async def run_stream(
@@ -686,14 +721,19 @@ async def run_stream(
         yield await _fallback_reply(db, current_user, conversation_messages)
         return
 
+    latest_user = _latest_user_message(conversation_messages)
+    recalled = await recall_memories(current_user, latest_user) if latest_user else []
+    recalled_block = format_recalled_for_prompt(recalled)
+
     client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
     messages = [
         {"role": msg["role"], "content": msg["content"]}
         for msg in conversation_messages
         if msg.get("role") in {"user", "assistant"} and msg.get("content")
     ]
-    system_prompt = await _system_prompt(db, current_user)
+    system_prompt = await _system_prompt(db, current_user, recalled_block=recalled_block)
 
+    accumulated: list[str] = []
     try:
         for _ in range(4):
             tool_uses: list = []
@@ -706,12 +746,13 @@ async def run_stream(
             ) as stream:
                 async for text_chunk in stream.text_stream:
                     if text_chunk:
+                        accumulated.append(text_chunk)
                         yield text_chunk
                 final_message = await stream.get_final_message()
 
             tool_uses = [b for b in final_message.content if b.type == "tool_use"]
             if not tool_uses:
-                return
+                break
 
             messages.append(
                 {
@@ -735,8 +776,19 @@ async def run_stream(
                     }
                 )
             messages.append({"role": "user", "content": tool_results})
-
-        yield "\n\n[Reached tool-loop limit — narrow the question.]"
+        else:
+            limit_msg = "\n\n[Reached tool-loop limit — narrow the question.]"
+            accumulated.append(limit_msg)
+            yield limit_msg
     except Exception as exc:
         logger.warning("[agent_service] stream failed, falling back: %s", exc)
-        yield await _fallback_reply(db, current_user, conversation_messages)
+        fallback = await _fallback_reply(db, current_user, conversation_messages)
+        accumulated.append(fallback)
+        yield fallback
+
+    full_reply = "".join(accumulated).strip()
+    if latest_user and full_reply:
+        try:
+            await reflect_and_commit(current_user, latest_user, full_reply)
+        except Exception as exc:
+            logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
