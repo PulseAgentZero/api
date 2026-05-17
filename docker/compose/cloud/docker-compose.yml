@@ -34,11 +34,15 @@ x-app: &app
     - ../../../app:/app/app
   networks:
     - pulse
+  volumes:
+    - ../../../logs:/app/logs
   restart: unless-stopped
   depends_on:
     postgres:
       condition: service_healthy
     redis:
+      condition: service_healthy
+    qdrant:
       condition: service_healthy
 
 services:
@@ -84,6 +88,23 @@ services:
       timeout: 5s
       retries: 5
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - pulse
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # ── Application ─────────────────────────────────────────────────────────────
 
   api:
@@ -93,6 +114,7 @@ services:
       PULSE_SERVICE: api
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
       DEPLOYMENT_MODE: cloud
       API_WORKERS: ${API_WORKERS:-2}
       # Internal URL so api can proxy /agent/* requests to the agent service
@@ -113,11 +135,14 @@ services:
       PULSE_SERVICE: worker
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
       DEPLOYMENT_MODE: cloud
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
       api:
         condition: service_started    # wait for migrations
@@ -136,6 +161,7 @@ services:
       PULSE_SERVICE: agent
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
       DEPLOYMENT_MODE: cloud
       AGENT_PORT: "8001"
       AGENT_WORKERS: ${AGENT_WORKERS:-1}
@@ -143,6 +169,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
       api:
         condition: service_started
@@ -161,11 +189,14 @@ services:
       PULSE_SERVICE: scheduler
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
       DEPLOYMENT_MODE: cloud
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
       api:
         condition: service_started
@@ -210,6 +241,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  qdrant_data:
 
 networks:
   pulse:

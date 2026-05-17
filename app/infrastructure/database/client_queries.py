@@ -18,6 +18,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Any, AsyncIterator
+from uuid import UUID
 
 from sqlalchemy import case, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, create_async_engine
@@ -102,13 +103,28 @@ class ClientDBError(Exception):
     """Raised when the client DB is not available or misconfigured."""
 
 
-async def get_schema_mapping(db: AsyncSession, org_id) -> SchemaMapping:
+async def get_schema_mapping(
+    db: AsyncSession,
+    org_id,
+    mapping_id: UUID | None = None,
+) -> SchemaMapping:
     """Return the org's schema mapping from Pulse DB, or raise ClientDBError."""
+    stmt = select(SchemaMapping).where(SchemaMapping.org_id == org_id)
+    if mapping_id is not None:
+        stmt = stmt.where(SchemaMapping.id == mapping_id)
+    else:
+        stmt = stmt.order_by(
+            SchemaMapping.is_active.desc(),
+            SchemaMapping.updated_at.desc(),
+            SchemaMapping.created_at.desc(),
+        )
     result = await db.execute(
-        select(SchemaMapping).where(SchemaMapping.org_id == org_id).limit(1)
+        stmt.limit(1)
     )
     mapping = result.scalar_one_or_none()
     if not mapping:
+        if mapping_id is not None:
+            raise ClientDBError("Requested schema mapping is not configured for this organization")
         raise ClientDBError("No schema mapping configured for this organization")
     return mapping
 

@@ -56,6 +56,7 @@ class RecommendationAgent(BaseAgent):
         """Generate recommendations for elevated-risk entities."""
 
         org_id = UUID(state["org_id"])
+        mapping_id = UUID(str(state["mapping_id"])) if state.get("mapping_id") else None
         scored = state.get("scored_entities", [])
         recommendation_limit = DEFAULT_RECOMMENDATION_LIMIT
 
@@ -108,7 +109,7 @@ class RecommendationAgent(BaseAgent):
 
         # Resolve per-org RAG config once and reuse across batches.
         try:
-            _mapping = await get_schema_mapping(db, org_id)
+            _mapping = await get_schema_mapping(db, org_id, mapping_id=mapping_id)
             _rag_config = RagConfig.resolve(getattr(_mapping, "rag_config", None))
         except Exception:
             _rag_config = RagConfig.from_defaults()
@@ -130,7 +131,8 @@ class RecommendationAgent(BaseAgent):
                 state["rag_run_stats"] = _merge_rag_stats(
                     state.get("rag_run_stats") or {}, _rag_stats.to_dict()
                 )
-                batch_recs = await self._generate_batch(prompt, state, batch)
+                raw_batch_recs = await self._generate_batch(prompt, state, batch)
+                batch_recs = self._normalize_recommendations(raw_batch_recs, batch, state)
                 all_recs.extend(batch_recs)
             except Exception as e:
                 logger.error(
@@ -229,6 +231,47 @@ class RecommendationAgent(BaseAgent):
         if isinstance(result, list):
             return result
         return []
+
+    @staticmethod
+    def _normalize_recommendations(
+        recommendations: list[Any], batch: list[dict], state: PipelineState
+    ) -> list[dict]:
+        """Keep valid LLM recommendations and fill gaps with deterministic fallbacks."""
+        batch_by_id = {
+            str(entity.get("entity_id")): entity
+            for entity in batch
+            if entity.get("entity_id") is not None
+        }
+        normalized: list[dict] = []
+        seen: set[str] = set()
+        for rec in recommendations:
+            if not isinstance(rec, dict):
+                continue
+            entity_id = str(rec.get("entity_id") or "").strip()
+            entity = batch_by_id.get(entity_id)
+            if not entity or entity_id in seen:
+                continue
+            seen.add(entity_id)
+            normalized.append({
+                "entity_id": entity_id,
+                "entity_name": rec.get("entity_name") or entity.get("entity_name"),
+                "risk_score": rec.get("risk_score", entity.get("risk_score", 0)),
+                "risk_tier": rec.get("risk_tier", entity.get("risk_tier", "high")),
+                "type": rec.get("type") or "retention_intervention",
+                "urgency": rec.get("urgency") or "high",
+                "title": rec.get("title") or "Risk intervention required",
+                "reasoning": rec.get("reasoning") or "",
+                "suggested_action": rec.get("suggested_action") or "",
+            })
+
+        missing = [
+            entity
+            for entity in batch
+            if str(entity.get("entity_id")) not in seen
+        ]
+        if missing:
+            normalized.extend(RecommendationAgent._fallback_recommendations(missing, state))
+        return normalized
 
     @staticmethod
     def _fallback_recommendations(

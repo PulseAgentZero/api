@@ -42,13 +42,20 @@ class PipelineRunRepository:
         return list(result.scalars().all())
 
     async def create_queued(
-        self, org_id: UUID, *, trigger_source: str
+        self,
+        org_id: UUID,
+        *,
+        trigger_source: str,
+        mapping_id: UUID | None = None,
+        triggered_by: UUID | None = None,
     ) -> PipelineRun:
         run = PipelineRun(
             org_id=org_id,
             status="queued",
             trigger_source=trigger_source,
             current_step="queued",
+            mapping_id=mapping_id,
+            triggered_by=triggered_by,
         )
         self.db.add(run)
         await self.db.flush()

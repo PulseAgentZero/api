@@ -29,7 +29,13 @@ PIPELINE_INTERVAL_HOURS = int(os.getenv("PIPELINE_INTERVAL_HOURS", "4"))
 _scheduler: AsyncIOScheduler | None = None
 
 
-async def _claim_run_slot(org_id: UUID, trigger_source: str) -> UUID | None:
+async def _claim_run_slot(
+    org_id: UUID,
+    trigger_source: str,
+    *,
+    mapping_id: UUID | None = None,
+    triggered_by: UUID | None = None,
+) -> UUID | None:
     """Create a queued PipelineRun if no run is already active for the org.
 
     Returns the new run_id, or None if an active run already exists.
@@ -43,7 +49,12 @@ async def _claim_run_slot(org_id: UUID, trigger_source: str) -> UUID | None:
                 org_id, active.id, active.status,
             )
             return None
-        run = await repo.create_queued(org_id, trigger_source=trigger_source)
+        run = await repo.create_queued(
+            org_id,
+            trigger_source=trigger_source,
+            mapping_id=mapping_id,
+            triggered_by=triggered_by,
+        )
         await session.commit()
         return run.id
 
@@ -116,13 +127,22 @@ def schedule_org(org_id: UUID, org_name: str = "") -> None:
 
 
 async def trigger_pipeline_now(
-    org_id: UUID, *, trigger_source: str = "manual"
+    org_id: UUID,
+    *,
+    trigger_source: str = "manual",
+    mapping_id: UUID | None = None,
+    triggered_by: UUID | None = None,
 ) -> UUID | None:
     """Trigger an immediate pipeline run for an org (non-blocking).
 
     Returns the new run_id, or None if a run is already active for this org.
     """
-    run_id = await _claim_run_slot(org_id, trigger_source)
+    run_id = await _claim_run_slot(
+        org_id,
+        trigger_source,
+        mapping_id=mapping_id,
+        triggered_by=triggered_by,
+    )
     if run_id is None:
         return None
 

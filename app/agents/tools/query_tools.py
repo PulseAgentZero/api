@@ -40,6 +40,16 @@ _DANGEROUS_SQL = re.compile(
 )
 
 
+def _coerce_limit(limit: int | str | None) -> int:
+    if limit is None:
+        return 100
+    try:
+        value = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ClientDBError(f"Invalid limit: {limit!r}") from exc
+    return max(1, min(value, 500))
+
+
 def _validate_where_clause(where: str | None) -> str | None:
     """Validate a WHERE clause for safety before SQL interpolation.
 
@@ -97,10 +107,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
     async def query_entity_table(
         columns: str = "*",
-        limit: int = 100,
+        limit: int | str = 100,
         where: str | None = None,
     ) -> dict[str, Any]:
         """Query the mapped entity table in the client database (READ-ONLY)."""
+        limit = _coerce_limit(limit)
         where = _validate_where_clause(where)
         mapping = await get_schema_mapping(db, org_id)
         engine, conn = await open_client_engine(db, org_id)
@@ -128,7 +139,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 if where:
                     sql += f" WHERE {where}"
                 sql += " LIMIT :lim"
-                params["lim"] = min(limit, 500)
+                params["lim"] = limit
 
                 result = await client_conn.execute(text(sql), params)
                 rows = result.all()
@@ -146,10 +157,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     async def query_related_table(
         table_name: str,
         columns: str = "*",
-        limit: int = 100,
+        limit: int | str = 100,
         where: str | None = None,
     ) -> dict[str, Any]:
         """Query any table in the client database for cross-table analysis (READ-ONLY)."""
+        limit = _coerce_limit(limit)
         where = _validate_where_clause(where)
         engine, conn = await open_client_engine(db, org_id)
         try:
@@ -178,7 +190,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 if where:
                     sql += f" WHERE {where}"
                 sql += " LIMIT :lim"
-                params["lim"] = min(limit, 500)
+                params["lim"] = limit
 
                 result = await client_conn.execute(text(sql), params)
                 rows = result.all()
@@ -334,7 +346,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
             ),
             parameters=[
                 ToolParam("columns", "string", "Comma-separated column names or '*' for all", required=False),
-                ToolParam("limit", "integer", "Max rows to return (capped at 500)", required=False),
+                ToolParam("limit", "string", "Max rows to return (numeric string, capped at 500)", required=False),
                 ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_entity_table,
@@ -349,7 +361,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
             parameters=[
                 ToolParam("table_name", "string", "Name of the table to query"),
                 ToolParam("columns", "string", "Comma-separated column names or '*'", required=False),
-                ToolParam("limit", "integer", "Max rows to return (capped at 500)", required=False),
+                ToolParam("limit", "string", "Max rows to return (numeric string, capped at 500)", required=False),
                 ToolParam("where", "string", "SQL WHERE clause (SELECT-only, no INSERT/UPDATE/DELETE)", required=False),
             ],
             execute=query_related_table,

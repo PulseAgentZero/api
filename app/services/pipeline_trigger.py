@@ -64,7 +64,12 @@ async def claim_and_trigger_pipeline(
             },
         )
 
-    run_id = await trigger_pipeline_now(org_id, trigger_source=trigger_source)
+    run_id = await trigger_pipeline_now(
+        org_id,
+        trigger_source=trigger_source,
+        mapping_id=mapping_id,
+        triggered_by=triggered_by,
+    )
     if run_id is None:
         active = await repo.get_active_for_org(org_id)
         raise HTTPException(
@@ -76,16 +81,6 @@ async def claim_and_trigger_pipeline(
                 "status": active.status if active else "unknown",
             },
         )
-
-    from app.infrastructure.database.models.pipeline_run import PipelineRun
-
-    run = await db.get(PipelineRun, run_id)
-    if run:
-        if triggered_by is not None:
-            run.triggered_by = triggered_by
-        if mapping_id is not None:
-            run.mapping_id = mapping_id
-        await db.commit()
 
     return {
         "run_id": str(run_id),
