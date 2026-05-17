@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 _RESERVED_RECORD_ATTRS = {
     "args", "asctime", "created", "exc_info", "exc_text", "filename",
@@ -65,18 +66,24 @@ def configure_logging(level: str | None = None, fmt: str | None = None) -> None:
             "%(asctime)s %(levelname)s %(name)s: %(message)s"
         )
 
-    handler = logging.StreamHandler(stream=sys.stdout)
-    handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(stream=sys.stdout)
+    stream_handler.setFormatter(formatter)
 
     root = logging.getLogger()
-    # Replace existing handlers so the formatter is consistent.
+
     for existing in list(root.handlers):
         root.removeHandler(existing)
-    root.addHandler(handler)
+    root.addHandler(stream_handler)
     root.setLevel(chosen_level)
 
-    # Uvicorn installs its own handlers — clear them so records bubble up
-    # to our root handler with the chosen formatter.
+    log_file = os.getenv("LOG_FILE", "logs/pulse.log")
+    if log_file and log_file.lower() != "none":
+        file_path = Path(log_file)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(str(file_path), encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
     for noisy in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(noisy)
         for existing in list(lg.handlers):

@@ -346,10 +346,12 @@ class BaseAgent:
         self, system_prompt: str, user_prompt: str,
         *, provider: LLMProvider | None = None,
         model: str | None = None, temperature: float = 0.0,
+        max_tokens: int = 4096,
     ) -> str:
         raw = await self.llm_call(
             system_prompt, user_prompt + "\n\nRespond with ONLY valid JSON.",
             provider=provider, model=model, temperature=temperature,
+            max_tokens=max_tokens,
         )
         return _extract_json(raw)
 
@@ -533,6 +535,13 @@ class BaseAgent:
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
+                        logger.warning(
+                            "[%s] Groq returned malformed tool call arguments for '%s' "
+                            "(len=%d): %s",
+                            self.name, tc.function.name,
+                            len(tc.function.arguments),
+                            tc.function.arguments[:200],
+                        )
                         args = {}
                     call = ToolCall(tool_name=tc.function.name, arguments=args, call_id=tc.id)
                     result = await self.registry.execute(call)

@@ -223,9 +223,20 @@ class RecommendationAgent(BaseAgent):
         raw = await self.llm_json_call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            max_tokens=16384,
         )
 
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            repaired = _repair_truncated_json(raw)
+            if repaired is not None:
+                logger.warning(
+                    "[RecommendationAgent] JSON truncated by LLM, repaired successfully"
+                )
+                result = json.loads(repaired)
+            else:
+                raise
         if isinstance(result, dict) and "recommendations" in result:
             return result["recommendations"]
         if isinstance(result, list):
@@ -317,6 +328,55 @@ def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
     if profile_fields:
         enriched["profile"] = profile_fields
     return enriched
+
+
+def _repair_truncated_json(raw: str) -> str | None:
+    """Attempt to repair JSON truncated mid-generation by the LLM.
+
+    Tries progressively: close an unterminated string, then balance
+    remaining brackets/braces. Returns repaired JSON or None.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return None
+
+    if stripped[-1] == '"':
+        pass
+    elif stripped[-1] not in ("}", "]", '"'):
+        stripped += '"'
+
+    brackets = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in stripped:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in brackets:
+            stack.append(brackets[ch])
+        elif ch == "}":
+            if stack and stack[-1] == "}":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "]":
+                stack.pop()
+
+    closing = "".join(reversed(stack))
+    repaired = stripped + closing
+
+    if len(repaired) < len(raw.strip()):
+        return None
+
+    return repaired
 
 
 async def _load_past_recs_by_entity(
