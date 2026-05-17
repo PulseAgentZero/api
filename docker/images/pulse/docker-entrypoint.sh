@@ -4,11 +4,15 @@ set -e
 # ─────────────────────────────────────────────────────────────────────────────
 # Pulse self-hosted entrypoint
 # Order: start Redis → wait for Postgres → run migrations → start supervisord
+# supervisord manages: API · Worker · Agent · Scheduler · Next.js · nginx
 # ─────────────────────────────────────────────────────────────────────────────
 
 REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
 API_WORKERS="${API_WORKERS:-1}"
 AGENT_WORKERS="${AGENT_WORKERS:-1}"
+
+# ── 0. Remove the nginx default site so ours is the only one ─────────────────
+rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
 # ── 1. Start bundled Redis ────────────────────────────────────────────────────
 echo "[pulse] starting bundled Redis..."

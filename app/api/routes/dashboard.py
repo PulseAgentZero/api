@@ -39,7 +39,9 @@ async def get_overview(
     `*_change_pct` fields are `null` when there is no data from 7 days ago to compare against.
     """
     org_id = current_user.org_id
-    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    now = datetime.now(timezone.utc)
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
 
     # Current entity counts
     total = await db.scalar(
@@ -120,6 +122,35 @@ async def get_overview(
             "entities_scored": lr.entities_scored,
         }
 
+    # Risk trend from EntityProfile — every pipeline run appends new profile records
+    # (old ones get is_latest=False), so created_at accurately reflects when each
+    # entity was scored. Querying ALL records (not just is_latest) gives real history.
+    trend_bucket = func.date_trunc("week", EntityProfile.created_at)
+    trend_rows = (
+        await db.execute(
+            select(
+                trend_bucket.label("bucket"),
+                func.avg(EntityProfile.risk_score).label("avg_score"),
+                func.count(EntityProfile.entity_id.distinct()).label("entity_count"),
+            )
+            .where(
+                EntityProfile.org_id == org_id,
+                EntityProfile.created_at >= month_ago,
+            )
+            .group_by(trend_bucket)
+            .order_by(trend_bucket)
+        )
+    ).all()
+    risk_trend = [
+        {
+            "date": r.bucket.isoformat(),
+            "avg_risk_score": float(r.avg_score or 0),
+            "count": int(r.entity_count or 0),
+        }
+        for r in trend_rows
+        if r.bucket is not None
+    ]
+
     total_int = int(total or 0)
     total_prev_int = int(total_prev or 0)
     high_prev = dist_prev["High"]
@@ -134,4 +165,5 @@ async def get_overview(
         "active_recommendations": open_recs,
         "critical_recommendations": crit,
         "last_pipeline_run": last_pipeline,
+        "risk_trend": risk_trend,
     }

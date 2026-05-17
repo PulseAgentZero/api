@@ -25,6 +25,12 @@ class LastPipelineRun(BaseModel):
     entities_scored: int | None
 
 
+class RiskTrendPoint(BaseModel):
+    date: str
+    avg_risk_score: float
+    count: int
+
+
 class DashboardOverviewResponse(BaseModel):
     total_entities: int
     total_entities_change_pct: float | None
@@ -35,3 +41,4 @@ class DashboardOverviewResponse(BaseModel):
     active_recommendations: int
     critical_recommendations: int
     last_pipeline_run: LastPipelineRun | None
+    risk_trend: list[RiskTrendPoint]

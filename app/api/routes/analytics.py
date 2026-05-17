@@ -43,7 +43,6 @@ async def analytics_overview(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     org_id = current_user.org_id
     since = datetime.now(timezone.utc) - timedelta(days=_period_days(period))
 
@@ -108,7 +107,6 @@ async def analytics_risk_trend(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     org_id = current_user.org_id
     since = datetime.now(timezone.utc) - timedelta(days=_period_days(period))
     series = await risk_trend_series(db, org_id, since=since, granularity=granularity)

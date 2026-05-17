@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
+from app.api.dependencies.plan_gate import check_webhook_channel_limit
 from app.api.errors import not_found
 from app.infrastructure.crypto import encrypt_dsn
 import json
@@ -186,6 +187,8 @@ async def create_channel(
     - Webhook: `{ "url": "https://...", "headers": {} }`
     - Email: `{ "to": "ops@company.com" }`
     """
+    if body.type == "webhook":
+        await check_webhook_channel_limit(db, current_user.org_id)
     enc = encrypt_dsn(json.dumps(body.config)) if body.config else None
     row = NotificationChannel(
         org_id=current_user.org_id,

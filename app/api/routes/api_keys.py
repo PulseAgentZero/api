@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
-from app.api.dependencies.plan_gate import require_feature
+from app.api.dependencies.plan_gate import check_api_key_limit
 from app.api.errors import not_found
 from app.infrastructure.audit import log_audit
 from app.infrastructure.database.models.api_key import ApiKey
@@ -35,7 +35,6 @@ async def list_api_keys(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await require_feature(db, current_user.org_id, "api_keys")
     result = await db.execute(
         select(ApiKey).where(
             ApiKey.org_id == current_user.org_id,
@@ -65,7 +64,7 @@ async def create_api_key(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await require_feature(db, current_user.org_id, "api_keys")
+    await check_api_key_limit(db, current_user.org_id)
     prefix = "pk_live_" if body.scope == "write" else "pk_read_"
     raw = prefix + secrets.token_urlsafe(32)
     digest = hashlib.sha256(raw.encode()).hexdigest()
@@ -109,7 +108,6 @@ async def revoke_api_key(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ):
-    await require_feature(db, current_user.org_id, "api_keys")
     row = await db.get(ApiKey, key_id)
     if not row or row.org_id != current_user.org_id:
         raise not_found()

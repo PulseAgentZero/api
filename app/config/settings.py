@@ -337,6 +337,23 @@ class Settings:
         return bool(cls.get_resend_api_key())
 
     # ------------------------------------------------------------------
+    # Paystack (billing / subscriptions)
+    # ------------------------------------------------------------------
+    PAYSTACK_SECRET_KEY: Optional[str] = os.getenv("PAYSTACK_SECRET_KEY")
+    # Cloud subscription — single "pro" recurring plan
+    PAYSTACK_PRO_PLAN_CODE: Optional[str] = os.getenv("PAYSTACK_PRO_PLAN_CODE")
+    # Self-hosted one-time license purchase price in kobo (e.g. 5000000 = ₦50,000)
+    PAYSTACK_SELFHOSTED_LICENSE_PRICE: int = int(os.getenv("PAYSTACK_SELFHOSTED_LICENSE_PRICE", "0"))
+
+    @classmethod
+    def get_paystack_secret_key(cls) -> Optional[str]:
+        return cls._get_secret("PAYSTACK_SECRET_KEY", "PAYSTACK_SECRET_KEY")
+
+    @classmethod
+    def is_paystack_configured(cls) -> bool:
+        return bool(cls.get_paystack_secret_key())
+
+    # ------------------------------------------------------------------
     # S3 asset uploads (avatars, logos, CSVs)
     # ------------------------------------------------------------------
     ASSETS_S3_BUCKET: Optional[str] = os.getenv("ASSETS_S3_BUCKET")

@@ -9,7 +9,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.role_deps import require_role
-from app.api.dependencies.plan_gate import require_feature
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.models.webhook_delivery import WebhookDelivery
 from app.infrastructure.database.session import get_db
@@ -26,7 +25,6 @@ async def list_deliveries(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await require_feature(db, current_user.org_id, "webhook_deliveries")
     stmt = select(WebhookDelivery).where(WebhookDelivery.org_id == current_user.org_id)
     if channel_id:
         stmt = stmt.where(WebhookDelivery.channel_id == channel_id)
@@ -58,7 +56,6 @@ async def retry_delivery(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await require_feature(db, current_user.org_id, "webhook_deliveries")
     d = await db.get(WebhookDelivery, delivery_id)
     if not d or d.org_id != current_user.org_id:
         from app.api.errors import not_found

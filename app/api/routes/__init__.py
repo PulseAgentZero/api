@@ -1,4 +1,5 @@
 from app.api.routes.agent import router as agent_router
+from app.api.routes.billing import router as billing_router
 from app.api.routes.alerts import router as alerts_router
 from app.api.routes.analytics import router as analytics_router
 from app.api.routes.api_keys import router as api_keys_router
@@ -19,6 +20,7 @@ from app.api.routes.webhooks import router as webhooks_router
 
 __all__ = [
     "agent_router",
+    "billing_router",
     "alerts_router",
     "analytics_router",
     "api_keys_router",

@@ -14,6 +14,7 @@ from app.api.routes import (
     analytics_router,
     api_keys_router,
     audit_logs_router,
+    billing_router,
     connections_router,
     dashboard_router,
     entities_router,
@@ -42,6 +43,14 @@ from app.services.schedulers.license_scheduler import (
     shutdown_license_scheduler,
     start_license_scheduler,
 )
+from app.services.schedulers.billing_scheduler import (
+    shutdown_billing_scheduler,
+    start_billing_scheduler,
+)
+from app.services.schedulers.usage_reset_scheduler import (
+    shutdown_usage_reset_scheduler,
+    start_usage_reset_scheduler,
+)
 from app.services.schedulers.memory_prune_scheduler import (
     shutdown_memory_prune_scheduler,
     start_memory_prune_scheduler,
@@ -59,12 +68,16 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     scheduler = await start_pipeline_scheduler()
     await start_license_scheduler()
     await start_memory_prune_scheduler()
+    await start_billing_scheduler()
+    await start_usage_reset_scheduler()
     try:
         yield
     finally:
         shutdown_scheduler()
         shutdown_license_scheduler()
         shutdown_memory_prune_scheduler()
+        shutdown_billing_scheduler()
+        shutdown_usage_reset_scheduler()
         await close_redis()
 
 
@@ -94,6 +107,7 @@ _internal_tags = [
     {"name": "License",         "description": "Self-hosted license activation (self-hosted only)"},
     {"name": "Settings",        "description": "LLM key management (self-hosted only)"},
     {"name": "Audit Logs",      "description": "Immutable audit trail (Pro only)"},
+    {"name": "Billing",         "description": "Paystack subscription management and webhooks"},
     {"name": "System",          "description": "Service health and readiness"},
 ]
 
@@ -144,6 +158,7 @@ app.include_router(audit_logs_router,      prefix="/api/v1")
 app.include_router(agent_router,           prefix="/api/v1")
 app.include_router(users_router,           prefix="/api/v1")
 app.include_router(pipeline_router,        prefix="/api/v1")
+app.include_router(billing_router,         prefix="/api/v1")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

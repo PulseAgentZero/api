@@ -1,9 +1,11 @@
-"""Plan / license feature gating (BACKEND_ROUTES + SCHEMA + LICENSE_SYSTEM.md)."""
+"""Plan / license feature gating."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from uuid import UUID
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import plan_limit, plan_locked
@@ -11,18 +13,45 @@ from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
 from app.services.self_hosted_license import resolve_self_hosted_entitlements
 
+# ── Plan limits ───────────────────────────────────────────────────────────────
+# None = unlimited. Self-hosted always resolves to pro-equivalent.
+# Unknown plan strings fall back to free limits.
+
+PLAN_LIMITS: dict[str, dict[str, int | None]] = {
+    "free": {
+        "api_keys": 1,
+        "webhook_channels": 1,
+        "users": 3,
+        "pipeline_runs_per_month": 20,
+        "agent_queries_per_month": 100,
+    },
+    "pro": {
+        "api_keys": None,
+        "webhook_channels": None,
+        "users": None,
+        "pipeline_runs_per_month": None,
+        "agent_queries_per_month": None,
+    },
+}
+
+
+def get_plan_limits(plan: str) -> dict[str, int | None]:
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        return PLAN_LIMITS["pro"]
+    return PLAN_LIMITS.get(plan.lower(), PLAN_LIMITS["free"])
+
+
+# ── Cloud: feature -> minimum plans (audit_log still requires pro) ─────────────
+# api_keys and webhook_deliveries are removed — replaced with count-based limits
+# so free users can access them within their quota.
+_CLOUD_FEATURE_PLAN: dict[str, tuple[str, ...]] = {
+    "advanced_analytics": ("pro",),
+    "audit_log": ("pro",),
+}
+
 
 async def _get_org(db: AsyncSession, org_id: UUID) -> Organization | None:
     return await db.get(Organization, org_id)
-
-
-# Cloud: feature -> minimum plan
-_CLOUD_FEATURE_PLAN: dict[str, tuple[str, ...]] = {
-    "advanced_analytics": ("pro", "enterprise"),
-    "api_keys": ("pro", "enterprise"),
-    "webhook_deliveries": ("pro", "enterprise"),
-    "audit_log": ("pro", "enterprise"),
-}
 
 
 async def require_cloud_plan(db: AsyncSession, org_id: UUID, min_plans: tuple[str, ...]) -> None:
@@ -54,10 +83,9 @@ async def require_feature(db: AsyncSession, org_id: UUID, feature: str) -> None:
                 "License is invalid, expired, or must be revalidated with the license server.",
                 upgrade_url=f"{settings.FRONTEND_URL.rstrip('/')}/settings/license",
             )
-        feat_l = feature.lower()
         if ent.plan in ("pro", "enterprise"):
             return
-        if feat_l in ent.features:
+        if feature.lower() in ent.features:
             return
         raise plan_locked(
             feature,
@@ -85,3 +113,137 @@ async def max_cloud_free_connections(db: AsyncSession, org_id: UUID, active_coun
         return
     if (org.plan or "free").lower() == "free" and active_count >= 5:
         raise plan_limit("Active connection limit reached for the free plan (max 5).")
+
+
+# ── Count-based limit helpers ─────────────────────────────────────────────────
+
+async def check_api_key_limit(db: AsyncSession, org_id: UUID) -> None:
+    """Raise PLAN_LIMIT if the org has reached its API key quota."""
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        return
+    from app.infrastructure.database.models.api_key import ApiKey
+
+    org = await _get_org(db, org_id)
+    plan = (org.plan or "free").lower() if org else "free"
+    limit = get_plan_limits(plan).get("api_keys")
+    if limit is None:
+        return
+    count = int(
+        await db.scalar(
+            select(func.count()).select_from(ApiKey).where(
+                ApiKey.org_id == org_id, ApiKey.revoked_at.is_(None)
+            )
+        )
+        or 0
+    )
+    if count >= limit:
+        raise plan_limit(
+            f"API key limit reached for your plan (max {limit}). "
+            "Revoke an existing key or upgrade to Pro.",
+        )
+
+
+async def check_webhook_channel_limit(db: AsyncSession, org_id: UUID) -> None:
+    """Raise PLAN_LIMIT if the org has reached its webhook channel quota."""
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        return
+    from app.infrastructure.database.models.notification_channel import NotificationChannel
+
+    org = await _get_org(db, org_id)
+    plan = (org.plan or "free").lower() if org else "free"
+    limit = get_plan_limits(plan).get("webhook_channels")
+    if limit is None:
+        return
+    count = int(
+        await db.scalar(
+            select(func.count()).select_from(NotificationChannel).where(
+                NotificationChannel.org_id == org_id,
+                NotificationChannel.type == "webhook",
+                NotificationChannel.is_active.is_(True),
+            )
+        )
+        or 0
+    )
+    if count >= limit:
+        raise plan_limit(
+            f"Webhook channel limit reached for your plan (max {limit}). "
+            "Delete an existing webhook channel or upgrade to Pro.",
+        )
+
+
+# ── Usage summary (for GET /organization/usage) ───────────────────────────────
+
+async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
+    """Return current usage counts against plan limits for the org."""
+    from app.infrastructure.database.models.agent_conversation import AgentConversation
+    from app.infrastructure.database.models.api_key import ApiKey
+    from app.infrastructure.database.models.notification_channel import NotificationChannel
+    from app.infrastructure.database.models.pipeline_run import PipelineRun
+    from app.infrastructure.database.models.user import User
+
+    org = await _get_org(db, org_id)
+    raw_plan = (org.plan or "free").lower() if org else "free"
+    plan = "pro" if settings.DEPLOYMENT_MODE == "self_hosted" else raw_plan
+    limits = get_plan_limits(plan)
+
+    now = datetime.now(timezone.utc)
+    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    api_key_count = int(
+        await db.scalar(
+            select(func.count()).select_from(ApiKey).where(
+                ApiKey.org_id == org_id, ApiKey.revoked_at.is_(None)
+            )
+        )
+        or 0
+    )
+    webhook_channel_count = int(
+        await db.scalar(
+            select(func.count()).select_from(NotificationChannel).where(
+                NotificationChannel.org_id == org_id,
+                NotificationChannel.type == "webhook",
+                NotificationChannel.is_active.is_(True),
+            )
+        )
+        or 0
+    )
+    user_count = int(
+        await db.scalar(
+            select(func.count()).select_from(User).where(
+                User.org_id == org_id, User.is_active.is_(True)
+            )
+        )
+        or 0
+    )
+    pipeline_run_count = int(
+        await db.scalar(
+            select(func.count()).select_from(PipelineRun).where(
+                PipelineRun.org_id == org_id,
+                PipelineRun.created_at >= first_of_month,
+            )
+        )
+        or 0
+    )
+    agent_query_count = int(
+        await db.scalar(
+            select(func.count()).select_from(AgentConversation).where(
+                AgentConversation.org_id == org_id,
+                AgentConversation.created_at >= first_of_month,
+            )
+        )
+        or 0
+    )
+
+    def slot(used: int, key: str) -> dict:
+        return {"used": used, "limit": limits.get(key)}
+
+    return {
+        "plan": plan,
+        "limits": {
+            "api_keys": slot(api_key_count, "api_keys"),
+            "webhook_channels": slot(webhook_channel_count, "webhook_channels"),
+            "users": slot(user_count, "users"),
+            "pipeline_runs_this_month": slot(pipeline_run_count, "pipeline_runs_per_month"),
+            "agent_queries_this_month": slot(agent_query_count, "agent_queries_per_month"),
+        },
+    }

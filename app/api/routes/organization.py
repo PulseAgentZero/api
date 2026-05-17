@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
+from app.api.dependencies.plan_gate import get_usage_summary
 from app.api.errors import bad_request, not_found
 from app.api.schemas.organization import AssetUploadResponse, OrgProfileResponse, UpdateOrgRequest
 from app.infrastructure.database.models.user import User
@@ -70,6 +71,34 @@ async def update_organization(
     await db.commit()
     await db.refresh(org)
     return _to_out(org)
+
+
+@router.get("/usage")
+async def get_organization_usage(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return current usage counts versus plan limits for the authenticated org.
+
+    All users can call this — it only shows data for their own org.
+
+    Response shape:
+    ```json
+    {
+      "plan": "free",
+      "limits": {
+        "api_keys":                   { "used": 1, "limit": 1 },
+        "webhook_channels":            { "used": 0, "limit": 1 },
+        "users":                       { "used": 2, "limit": 3 },
+        "pipeline_runs_this_month":    { "used": 3, "limit": 20 },
+        "agent_queries_this_month":    { "used": 12, "limit": 100 }
+      }
+    }
+    ```
+
+    `limit: null` means unlimited (Pro plan or self-hosted).
+    """
+    return await get_usage_summary(db, current_user.org_id)
 
 
 @router.get("/export")

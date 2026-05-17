@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Your Pulse license key is ready</h1>
+<p>Hi there,</p>
+<p>
+  Thank you for your purchase! Below is your Pulse self-hosted license key.
+  Copy it and activate it in your Pulse instance under
+  <strong>Settings → License → Activate</strong>.
+</p>
+
+<div style="background:#f6f8fb;border:1px solid #e5e7eb;border-radius:8px;padding:20px;margin:0 0 24px;word-break:break-all;">
+  <p style="font-size:11px;color:#9ca3af;margin:0 0 8px;text-transform:uppercase;letter-spacing:0.05em;">License Key</p>
+  <code style="font-size:13px;color:#1a1a2e;font-family:monospace;">{{ license_key }}</code>
+</div>
+
+{% if expires_at %}
+<p style="font-size:14px;color:#4b5563;">
+  This license is valid until <strong>{{ expires_at }}</strong>.
+</p>
+{% endif %}
+
+<a href="{{ activate_docs_url }}" class="btn">How to Activate</a>
+
+<hr class="divider" />
+<p class="fallback">
+  Keep this key safe — it is tied to your purchase. If you lose it, contact
+  support to retrieve it. Do not share it publicly.
+</p>
+{% endblock %}

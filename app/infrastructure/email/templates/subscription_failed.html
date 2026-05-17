@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Payment failed for your Pro subscription</h1>
+<p>Hi {{ org_name }},</p>
+<p>
+  We were unable to charge your card for your <strong>Pro plan</strong> renewal.
+  Your subscription is still active for now, but please update your payment method
+  to avoid losing access to Pro features.
+</p>
+
+<a href="{{ manage_url }}" class="btn">Update Payment Method</a>
+
+<hr class="divider" />
+<p style="font-size:14px;color:#4b5563;">
+  Common reasons for failure: expired card, insufficient funds, or a temporary block
+  from your bank. If the issue persists, contact your bank or reach out to us.
+</p>
+<p class="fallback">
+  Questions? Reply to this email or visit our support page.
+</p>
+{% endblock %}
