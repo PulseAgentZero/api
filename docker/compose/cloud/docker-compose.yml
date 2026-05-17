@@ -32,10 +32,9 @@ x-app: &app
     DEPLOYMENT_MODE: cloud
   volumes:
     - ../../../app:/app/app
+    - ../../../logs:/app/logs
   networks:
     - pulse
-  volumes:
-    - ../../../logs:/app/logs
   restart: unless-stopped
   depends_on:
     postgres:

@@ -196,11 +196,35 @@ class PipelineOrchestrator:
             "═══ Pipeline %s started for org '%s' (%s) ═══",
             run.id, state.get("org_name", "unknown"), org_id,
         )
+        _write_run_artifacts(
+            run,
+            status="running",
+            error=None,
+            org_id=org_id,
+            org_name=state.get("org_name"),
+            current_step=state.get("current_step"),
+            duration_ms=0,
+            step_metrics=step_metrics,
+            state=state,
+            rag_metrics=None,
+        )
 
         for step_name, agent in pipeline:
             state["current_step"] = step_name
             step_start = time.monotonic()
             step_error: str | None = None
+            _write_run_artifacts(
+                run,
+                status="running",
+                error=None,
+                org_id=org_id,
+                org_name=state.get("org_name"),
+                current_step=step_name,
+                duration_ms=int((time.monotonic() - pipeline_start) * 1000),
+                step_metrics=step_metrics,
+                state=state,
+                rag_metrics=None,
+            )
 
             for attempt in range(1, _STEP_MAX_RETRIES + 1):
                 try:
@@ -260,6 +284,18 @@ class PipelineOrchestrator:
                 run_repo, run,
                 current_step=step_name,
                 step_metrics=step_metrics,
+            )
+            _write_run_artifacts(
+                run,
+                status="running",
+                error=state.get("error"),
+                org_id=org_id,
+                org_name=state.get("org_name"),
+                current_step=step_name,
+                duration_ms=int((time.monotonic() - pipeline_start) * 1000),
+                step_metrics=step_metrics,
+                state=state,
+                rag_metrics=None,
             )
 
             if step_error:
@@ -685,7 +721,9 @@ def _write_run_artifacts(
     try:
         _RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
         safe_org = _slug(org_name or str(org_id))
-        stem = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{safe_org}_{run.id}"
+        stem = f"{safe_org}_{run.id}"
+        is_terminal = status in {"succeeded", "failed", "cancelled"}
+        now_iso = datetime.now(timezone.utc).isoformat()
         artifact = {
             "run_id": str(run.id),
             "org_id": str(org_id),
@@ -696,7 +734,8 @@ def _write_run_artifacts(
             "current_step": current_step,
             "error": error,
             "started_at": run.started_at.isoformat() if run.started_at else None,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": now_iso,
+            "completed_at": now_iso if is_terminal else None,
             "duration_ms": duration_ms,
             "step_metrics": step_metrics,
             "risk_summary": (state or {}).get("risk_summary") or {},
