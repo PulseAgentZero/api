@@ -206,6 +206,11 @@ def shutdown_scheduler() -> None:
 if __name__ == "__main__":
     import signal
 
+    from app.services.schedulers.studio_refresh_scheduler import (
+        shutdown_studio_refresh_scheduler,
+        start_studio_refresh_scheduler,
+    )
+
     async def _main() -> None:
         loop = asyncio.get_running_loop()
         stop = asyncio.Event()
@@ -214,9 +219,11 @@ if __name__ == "__main__":
             loop.add_signal_handler(sig, stop.set)
 
         await start_pipeline_scheduler()
+        await start_studio_refresh_scheduler()
         logger.info("Scheduler running — waiting for stop signal")
         await stop.wait()
         shutdown_scheduler()
+        shutdown_studio_refresh_scheduler()
         logger.info("Scheduler stopped")
 
     asyncio.run(_main())

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.models.alert_event import AlertEvent
 from app.infrastructure.database.models.alert_rule import AlertRule
+from app.infrastructure.database.models.notification_channel import NotificationChannel
 from app.infrastructure.database.models.entity_profile import EntityProfile
 from app.infrastructure.database.models.recommendation import Recommendation
 from app.services.webhook_dispatch import deliver_webhook_payload
@@ -164,6 +165,18 @@ async def evaluate_alerts_after_pipeline(
                 try:
                     ch_uuid = UUID(str(cid))
                 except (ValueError, TypeError):
+                    continue
+                ch_row = await db.get(NotificationChannel, ch_uuid)
+                if not ch_row or ch_row.org_id != org_id or ch_row.type != "webhook":
+                    continue
+                from app.services.webhook_dispatch import (
+                    channel_subscribes_to_event,
+                    parse_channel_config,
+                )
+
+                if not channel_subscribes_to_event(
+                    parse_channel_config(ch_row), "alert.triggered"
+                ):
                     continue
                 try:
                     await deliver_webhook_payload(

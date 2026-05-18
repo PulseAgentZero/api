@@ -26,6 +26,7 @@ from app.api.routes import (
     recommendations_router,
     schema_mappings_router,
     settings_router,
+    studio_router,
     users_router,
     webhooks_router,
 )
@@ -34,6 +35,7 @@ from app.api.public import (
     public_entities_router,
     public_pipeline_router,
     public_recommendations_router,
+    public_studio_router,
 )
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
@@ -61,6 +63,32 @@ from app.services.schedulers.pipeline_scheduler import (
 )
 
 configure_logging()
+
+# Mount local file storage if LOCAL backend is active
+def _mount_local_storage(app: "FastAPI") -> None:
+    try:
+        from app.infrastructure.storage.factory import get_storage_backend
+        from app.infrastructure.storage.local import LocalBackend
+        backend = get_storage_backend()
+        if not isinstance(backend, LocalBackend):
+            return
+        from fastapi.staticfiles import StaticFiles
+        path = backend.storage_path
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "Local storage: cannot create %s (permission denied). "
+                "Files will still upload but /assets won't be served. "
+                "Set LOCAL_STORAGE_PATH to a writable directory or use STORAGE_BACKEND=s3/minio.",
+                path,
+            )
+            return
+        app.mount("/assets", StaticFiles(directory=str(path)), name="assets")
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("Could not mount local storage: %s", exc)
 
 
 @asynccontextmanager
@@ -108,6 +136,7 @@ _internal_tags = [
     {"name": "Settings",        "description": "LLM key management (self-hosted only)"},
     {"name": "Audit Logs",      "description": "Immutable audit trail (Pro only)"},
     {"name": "Billing",         "description": "Paystack subscription management and webhooks"},
+    {"name": "Studio",          "description": "SQL query editor, visualizations, and custom dashboards"},
     {"name": "System",          "description": "Service health and readiness"},
 ]
 
@@ -159,6 +188,7 @@ app.include_router(agent_router,           prefix="/api/v1")
 app.include_router(users_router,           prefix="/api/v1")
 app.include_router(pipeline_router,        prefix="/api/v1")
 app.include_router(billing_router,         prefix="/api/v1")
+app.include_router(studio_router,          prefix="/api/v1")
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -171,6 +201,7 @@ _public_tags = [
     {"name": "Recommendations", "description": "Read and action recommendations"},
     {"name": "Pipeline",        "description": "Trigger pipeline runs and check status"},
     {"name": "Analytics",       "description": "Aggregate risk and performance data"},
+    {"name": "Studio",          "description": "Public shareable dashboards"},
 ]
 
 public_app = FastAPI(
@@ -197,10 +228,12 @@ public_app.include_router(public_entities_router,        prefix="/v1")
 public_app.include_router(public_recommendations_router, prefix="/v1")
 public_app.include_router(public_pipeline_router,        prefix="/v1")
 public_app.include_router(public_analytics_router,       prefix="/v1")
+public_app.include_router(public_studio_router,          prefix="/v1")
 
 # Mount public_app under /api/public
 # Routes become: /api/public/v1/entities, /api/public/docs, etc.
 app.mount("/api/public", public_app)
+_mount_local_storage(app)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

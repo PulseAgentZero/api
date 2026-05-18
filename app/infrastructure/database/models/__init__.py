@@ -21,6 +21,12 @@ from app.infrastructure.database.models.schema_mapping import SchemaMapping
 from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.usage_event import UsageEvent
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.models.studio_dashboard import StudioDashboard
+from app.infrastructure.database.models.studio_query_run import StudioQueryRun
+from app.infrastructure.database.models.studio_star import StudioStar
+from app.infrastructure.database.models.studio_dashboard_item import StudioDashboardItem
+from app.infrastructure.database.models.studio_query import StudioQuery
+from app.infrastructure.database.models.studio_visualization import StudioVisualization
 from app.infrastructure.database.models.webhook_delivery import WebhookDelivery
 
 __all__ = [
@@ -48,4 +54,10 @@ __all__ = [
     "UsageEvent",
     "User",
     "WebhookDelivery",
+    "StudioQuery",
+    "StudioQueryRun",
+    "StudioStar",
+    "StudioVisualization",
+    "StudioDashboard",
+    "StudioDashboardItem",
 ]

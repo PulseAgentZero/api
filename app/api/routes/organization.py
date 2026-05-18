@@ -119,27 +119,22 @@ async def upload_organization_asset(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
 ) -> AssetUploadResponse:
-    """Upload a file to S3 under this organization's prefix. Requires ``ASSETS_S3_BUCKET``."""
+    """Upload a file using the configured storage backend (S3, MinIO, or local filesystem)."""
     max_bytes = 50 * 1024 * 1024
     data = await file.read()
     if len(data) > max_bytes:
         raise bad_request("BAD_REQUEST", "File too large (max 50MB)")
     filename = file.filename or "upload"
     try:
-        key = build_object_key(
-            org_id=current_user.org_id,
-            category=category,
-            filename=filename,
-        )
-        url = upload_bytes_to_s3(
+        from app.infrastructure.external_services.s3_assets import upload_bytes
+        url, key = await upload_bytes(
             data,
             org_id=current_user.org_id,
             category=category,
             filename=filename,
             content_type=file.content_type,
-            object_key=key,
         )
     except RuntimeError as exc:
         logger.warning("asset upload failed: %s", exc)
-        raise bad_request("S3_NOT_CONFIGURED", str(exc)) from exc
+        raise bad_request("STORAGE_NOT_CONFIGURED", str(exc)) from exc
     return AssetUploadResponse(url=url, category=category, object_key=key)

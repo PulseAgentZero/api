@@ -41,6 +41,27 @@ def oauth_google_state(state: str) -> str:
     return f"oauth_google_state:{state}"
 
 
+def studio_embed(token: str) -> str:
+    return f"studio:embed:{token}"
+
+
+def studio_budget(org_id: str, date_str: str) -> str:
+    return f"studio:budget:{org_id}:{date_str}"
+
+
+def studio_run_result(run_id: str) -> str:
+    """Redis key for storing async studio query run results (TTL 1 hour)."""
+    return f"studio:run_result:{run_id}"
+
+
+def studio_public_rl(ip: str) -> str:
+    return f"studio:public_rl:{ip}"
+
+
+def studio_query_cache(org_id: str, query_hash: str) -> str:
+    return f"studio:qcache:{org_id}:{query_hash}"
+
+
 def user_sessions_pattern(user_id) -> str:
     """Glob pattern to match all refresh tokens for a user.
     NOTE: refresh tokens are stored as refresh:{sha256(raw)} — we can't

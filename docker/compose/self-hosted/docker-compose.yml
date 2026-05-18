@@ -31,52 +31,23 @@ services:
 
   pulse:
     image: pulseai/pulse:${PULSE_VERSION:-latest}
+    env_file: .env   # all user-configurable variables come from .env
     ports:
       # Single public port — nginx routes frontend and API traffic internally.
       # Change 80:80 to e.g. 3000:80 to run on a different host port.
       - "${PORT:-80}:80"
     environment:
-      # ── Database ─────────────────────────────────────────────────────────────
+      # These three override or supplement .env because they depend on the
+      # internal Docker network or must be fixed regardless of user config.
       DATABASE_URL: postgresql+asyncpg://pulse:${POSTGRES_PASSWORD}@db:5432/pulse
-
-      # ── Security ─────────────────────────────────────────────────────────────
-      JWT_SECRET: ${JWT_SECRET:?missing — generate with: openssl rand -hex 32}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?missing — see .env.example for generation command}
-
-      # ── App ──────────────────────────────────────────────────────────────────
-      # Must match the public URL users access (for CORS and email links).
-      # e.g. https://pulse.yourcompany.com  or  http://192.168.1.100
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
-      ENVIRONMENT: production
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
-      # ── LLM keys (required for AI features) ──────────────────────────────────
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-
-      # ── Email (optional — needed for verify/reset/invite flows) ───────────────
-      RESEND_API_KEY: ${RESEND_API_KEY:-}
-      DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:-noreply@example.com}
-
-      # ── OAuth (optional) ─────────────────────────────────────────────────────
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-
-      # ── Vector search (optional — enables semantic entity search) ─────────────
-      VOYAGEAI_API_KEY: ${VOYAGEAI_API_KEY:-}
-      QDRANT_URL: ${QDRANT_URL:-}
-      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
-
-      # ── License (unlocks Pro features) ───────────────────────────────────────
-      PULSE_LICENSE_KEY: ${PULSE_LICENSE_KEY:-}
-
-      # ── Tuning ───────────────────────────────────────────────────────────────
-      API_WORKERS: ${API_WORKERS:-1}
-      AGENT_WORKERS: ${AGENT_WORKERS:-1}
-      REDIS_MAX_MEMORY: ${REDIS_MAX_MEMORY:-256mb}
+      LOCAL_STORAGE_PATH: /app/uploads   # must match the volume mount below
 
     volumes:
-      - pulse_data:/data          # Redis persistence
+      - pulse_data:/data           # Redis persistence
+      - uploads_data:/app/uploads  # file uploads — avatars, logos, CSVs
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     depends_on:
       db:
         condition: service_healthy
@@ -90,4 +61,5 @@ services:
 
 volumes:
   db_data:
-  pulse_data:
+  pulse_data:     # Redis + internal data persistence
+  uploads_data:   # uploaded files — avatars, logos, CSVs (local storage backend)

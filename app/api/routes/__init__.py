@@ -16,6 +16,7 @@ from app.api.routes.recommendations import router as recommendations_router
 from app.api.routes.schema_mappings import router as schema_mappings_router
 from app.api.routes.settings_llm import router as settings_router
 from app.api.routes.users import router as users_router
+from app.api.routes.studio import router as studio_router
 from app.api.routes.webhooks import router as webhooks_router
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "recommendations_router",
     "schema_mappings_router",
     "settings_router",
+    "studio_router",
     "users_router",
     "webhooks_router",
 ]

@@ -30,10 +30,20 @@ x-app: &app
     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
     REDIS_URL: redis://redis:6379/0
     DEPLOYMENT_MODE: cloud
+    # Local file storage path — shared named volume so api + worker see the same files.
+    # Ignored when STORAGE_BACKEND=s3 or minio.
+    LOCAL_STORAGE_PATH: /app/uploads
   volumes:
     - ../../../app:/app/app
+    # Persists uploaded files (avatars, logos, CSVs) across container restarts.
+    # Only used when STORAGE_BACKEND=local (the default when S3/MinIO are not configured).
+    # Switch to STORAGE_BACKEND=s3 or minio for production multi-replica deployments.
+    - uploads_data:/app/uploads
   networks:
     - pulse
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
   restart: unless-stopped
   depends_on:
     postgres:
@@ -234,6 +244,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  uploads_data:    # local asset storage — avatars, logos, CSVs (swap for S3/MinIO in production)
 
 networks:
   pulse:

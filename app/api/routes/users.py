@@ -110,8 +110,8 @@ async def upload_my_avatar(
             detail={"code": "FILE_TOO_LARGE", "message": "Avatar must be 5 MB or smaller"},
         )
     try:
-        from app.infrastructure.external_services.s3_assets import upload_bytes_to_s3
-        url = upload_bytes_to_s3(
+        from app.infrastructure.external_services.s3_assets import upload_bytes
+        url, _ = await upload_bytes(
             data,
             org_id=current_user.org_id,
             category="profile",

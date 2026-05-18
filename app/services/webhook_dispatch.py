@@ -38,6 +38,15 @@ def webhook_url_from_config(cfg: dict[str, Any]) -> str | None:
     return None
 
 
+def channel_subscribes_to_event(cfg: dict[str, Any], event_type: str) -> bool:
+    """If config.events is set, only deliver listed event types; otherwise deliver all."""
+    raw = cfg.get("events")
+    if not isinstance(raw, list) or len(raw) == 0:
+        return True
+    allowed = {str(x) for x in raw}
+    return event_type in allowed
+
+
 async def post_json_webhook(
     url: str,
     payload: dict[str, Any],
@@ -88,6 +97,12 @@ async def execute_pending_delivery(db: AsyncSession, delivery: WebhookDelivery) 
         return
 
     cfg = parse_channel_config(ch)
+    if ch.type == "webhook" and not channel_subscribes_to_event(cfg, delivery.event_type):
+        delivery.status = "skipped"
+        delivery.response_body = "Event not subscribed on this channel"
+        delivery.last_attempt_at = datetime.now(timezone.utc)
+        return
+
     url = webhook_url_from_config(cfg)
     if ch.type != "webhook" or not url:
         delivery.status = "failed"

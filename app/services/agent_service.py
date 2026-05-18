@@ -191,6 +191,41 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "build_custom_dashboard",
+        "description": (
+            "Build a complete Pulse Studio dashboard from a natural language goal. "
+            "Introspects the client database schema, generates SQL queries, picks chart types, "
+            "creates visualizations, and returns a link to the new dashboard. "
+            "Use when the user asks to 'build a dashboard', 'create charts', "
+            "'show me X visually', 'make a report on Y', or 'visualise Z'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "Natural language description of what the dashboard should show",
+                },
+                "dashboard_name": {
+                    "type": "string",
+                    "description": "Name for the new dashboard (optional, defaults to goal summary)",
+                },
+                "is_public": {
+                    "type": "boolean",
+                    "description": "Whether to make the dashboard publicly shareable via a link. Default false.",
+                },
+                "max_charts": {
+                    "type": "integer",
+                    "description": "Maximum number of charts to generate (1–6). Default 4.",
+                    "minimum": 1,
+                    "maximum": 6,
+                },
+            },
+            "required": ["goal"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -446,11 +481,231 @@ async def _action_draft(
         return _action_draft_fallback(detail, entity_id, action_type)
 
 
+async def _build_custom_dashboard(
+    db: AsyncSession,
+    org_id: UUID,
+    current_user: User,
+    goal: str,
+    dashboard_name: str | None,
+    is_public: bool,
+    max_charts: int,
+) -> dict:
+    """Build a Pulse Studio dashboard from a natural language goal.
+
+    Steps:
+    1. Introspect the client database schema
+    2. Ask the LLM to generate SQL queries + chart configs for the goal
+    3. Persist queries → visualizations → dashboard → items
+    4. Return dashboard link
+    """
+    import re as _re
+    import secrets as _secrets
+
+    from app.agents.tools.client_db import open_client_engine, safe_client_connection
+    from app.infrastructure.audit import log_audit
+    from app.infrastructure.database.repositories.studio_dashboard_item_repository import (
+        StudioDashboardItemRepository,
+    )
+    from app.infrastructure.database.repositories.studio_dashboard_repository import (
+        StudioDashboardRepository,
+    )
+    from app.infrastructure.database.repositories.studio_query_repository import (
+        StudioQueryRepository,
+    )
+    from app.infrastructure.database.repositories.studio_visualization_repository import (
+        StudioVisualizationRepository,
+    )
+    from app.services.studio_query_service import _inject_limit, _is_select_only
+    from app.agents.tools.client_db import schema_columns_sql
+
+    max_charts = max(1, min(max_charts, 6))
+
+    # ── Step 1: Introspect schema ────────────────────────────────────────────
+    schema_context = ""
+    try:
+        engine, conn = await open_client_engine(db, org_id)
+        try:
+            async with safe_client_connection(engine, conn) as client_conn:
+                from sqlalchemy import text as _text
+
+                db_type = getattr(conn, "db_type", None)
+                # List tables
+                if db_type == "mysql":
+                    tables_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() LIMIT 20"
+                elif db_type == "mssql":
+                    tables_sql = "SELECT TOP 20 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                elif db_type == "sqlite":
+                    tables_sql = "SELECT name FROM sqlite_master WHERE type='table' LIMIT 20"
+                else:
+                    tables_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' LIMIT 20"
+
+                table_rows = (await client_conn.execute(_text(tables_sql))).all()
+                table_names = [r[0] for r in table_rows]
+
+                cols_sql = schema_columns_sql(db_type)
+                lines = []
+                for tname in table_names[:20]:
+                    try:
+                        col_rows = (
+                            await client_conn.execute(_text(cols_sql), {"tname": tname})
+                        ).all()
+                        cols = [r[0] for r in col_rows[:20]]
+                        lines.append(f"table: {tname} | columns: {', '.join(cols)}")
+                    except Exception:
+                        lines.append(f"table: {tname}")
+                schema_context = "\n".join(lines)
+        finally:
+            await engine.dispose()
+    except Exception as exc:
+        return {"error": f"Could not connect to client database: {exc}"}
+
+    if not schema_context:
+        return {"error": "No tables found in client database"}
+
+    # ── Step 2: LLM planning ─────────────────────────────────────────────────
+    system_prompt = (
+        "You are a SQL expert. Given a database schema and a goal, generate a JSON array "
+        "of chart specifications. Each spec must have: "
+        "\"query_name\" (string), \"description\" (string), \"sql\" (valid SELECT SQL), "
+        "\"chart_type\" (one of: bar, line, area, pie, scatter, table, number), "
+        "\"config\" (object with relevant fields: x_axis, y_axis, color, title, value_column, label_column). "
+        "Output ONLY valid JSON. No markdown. No explanation."
+    )
+    user_prompt = (
+        f"Schema:\n{schema_context}\n\n"
+        f"Goal: {goal}\n\n"
+        f"Generate {max_charts} chart specifications."
+    )
+
+    try:
+        from app.infrastructure.llm.factory import get_llm_client
+        llm = get_llm_client()
+        if not llm.is_configured():
+            return {"error": f"AI provider '{llm.provider_name}' is not configured"}
+        raw_text = await llm.complete(system_prompt, user_prompt, max_tokens=2000, temperature=0.1)
+        plan: list[dict] = json.loads(raw_text)
+        if not isinstance(plan, list):
+            raise ValueError("Expected JSON array")
+    except Exception as exc:
+        logger.warning("[build_dashboard] LLM planning failed: %s", exc)
+        return {"error": "Agent could not generate a dashboard plan from the goal"}
+
+    # Filter out unsafe SQL
+    safe_plan = [
+        spec for spec in plan
+        if isinstance(spec, dict) and spec.get("sql") and _is_select_only(str(spec["sql"]))
+    ]
+    if not safe_plan:
+        return {"error": "Generated SQL was not safe to execute — only SELECT statements are allowed"}
+
+    # ── Step 3: Persist ──────────────────────────────────────────────────────
+    query_repo = StudioQueryRepository(db)
+    viz_repo = StudioVisualizationRepository(db)
+    dash_repo = StudioDashboardRepository(db)
+    item_repo = StudioDashboardItemRepository(db)
+
+    created_vizs = []
+    for spec in safe_plan:
+        safe_sql = _inject_limit(str(spec["sql"]).strip(), 5000)
+        q = await query_repo.create(
+            org_id,
+            current_user.id,
+            name=str(spec.get("query_name", "Query")),
+            description=str(spec.get("description", "")),
+            sql_text=safe_sql,
+            connection_id=None,
+        )
+        viz = await viz_repo.create(
+            org_id,
+            q.id,
+            current_user.id,
+            name=str(spec.get("query_name", "Chart")),
+            chart_type=str(spec.get("chart_type", "table")),
+            config={k: v for k, v in (spec.get("config") or {}).items() if v is not None},
+        )
+        created_vizs.append(viz)
+
+    # Generate slug if public
+    slug: str | None = None
+    if is_public:
+        name_for_slug = dashboard_name or goal
+        base = _re.sub(r"[^a-z0-9]+", "-", name_for_slug.lower()).strip("-")[:60]
+        for _ in range(5):
+            candidate = f"{base}-{_secrets.token_hex(2)}"
+            if not await dash_repo.slug_exists(candidate):
+                slug = candidate
+                break
+
+    dashboard_name_final = dashboard_name or goal[:80]
+    dashboard = await dash_repo.create(
+        org_id,
+        current_user.id,
+        name=dashboard_name_final,
+        description=f"Auto-generated from goal: {goal[:200]}",
+        is_public=is_public,
+        slug=slug,
+        layout=[],
+    )
+
+    layout = []
+    for i, viz in enumerate(created_vizs):
+        item = await item_repo.create(org_id, dashboard.id, viz.id, i)
+        layout.append({
+            "item_id": str(item.id),
+            "x": (i % 2) * 6,
+            "y": (i // 2) * 4,
+            "w": 6,
+            "h": 4,
+        })
+
+    await dash_repo.update(dashboard, layout=layout)
+    await db.commit()
+
+    # ── Step 4: Audit + return ───────────────────────────────────────────────
+    try:
+        await log_audit(
+            db,
+            org_id=org_id,
+            user_id=current_user.id,
+            action="studio.agent_build_dashboard",
+            resource="studio_dashboard",
+            resource_id=dashboard.id,
+            metadata={"goal": goal, "chart_count": len(created_vizs)},
+        )
+    except Exception:
+        pass
+
+    internal_url = f"/studio/dashboards/{dashboard.id}"
+    public_url = f"/api/public/v1/studio/dashboards/{slug}" if slug else None
+
+    return {
+        "dashboard_id": str(dashboard.id),
+        "dashboard_name": dashboard.name,
+        "chart_count": len(created_vizs),
+        "internal_url": internal_url,
+        "public_url": public_url,
+        "charts": [
+            {
+                "query_name": spec.get("query_name", "Chart"),
+                "chart_type": spec.get("chart_type", "table"),
+                "visualization_id": str(viz.id),
+            }
+            for spec, viz in zip(safe_plan, created_vizs)
+        ],
+        "message": (
+            f"Dashboard '{dashboard.name}' created with {len(created_vizs)} chart(s). "
+            + (f"Shareable at: {public_url}" if public_url else "Dashboard is private.")
+        ),
+    }
+
+
 async def _run_tool(
     name: str,
     tool_input: dict,
     db: AsyncSession,
     org_id: UUID,
+    *,
+    current_user: User | None = None,
 ) -> dict:
     try:
         if name == "get_overview":
@@ -485,6 +740,18 @@ async def _run_tool(
                 org_id,
                 str(tool_input["entity_id"]),
                 limit=int(tool_input.get("limit") or 10),
+            )
+        if name == "build_custom_dashboard":
+            if current_user is None:
+                return {"error": "build_custom_dashboard requires an authenticated user"}
+            return await _build_custom_dashboard(
+                db,
+                org_id,
+                current_user,
+                goal=str(tool_input["goal"]),
+                dashboard_name=tool_input.get("dashboard_name"),
+                is_public=bool(tool_input.get("is_public", False)),
+                max_charts=int(tool_input.get("max_charts") or 4),
             )
     except ClientDBError as exc:
         return {"error": str(exc)}
@@ -840,6 +1107,7 @@ async def run(
                 try:
                     tool_result = await _run_tool(
                         tool_name, tool_args, db, current_user.org_id,
+                        current_user=current_user,
                     )
                     base_system = await _system_prompt(
                         db, current_user,
@@ -929,6 +1197,7 @@ async def run(
                     dict(tool_use.input or {}),
                     db,
                     current_user.org_id,
+                    current_user=current_user,
                 )
                 tool_results.append(
                     {
@@ -1029,6 +1298,7 @@ async def run_stream(
                     dict(tool_use.input or {}),
                     db,
                     current_user.org_id,
+                    current_user=current_user,
                 )
                 tool_results.append(
                     {

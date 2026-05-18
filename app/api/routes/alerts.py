@@ -143,6 +143,27 @@ async def delete_rule(
     await db.commit()
 
 
+def _channel_out(c: NotificationChannel) -> dict:
+    from app.services.webhook_dispatch import parse_channel_config, webhook_url_from_config
+
+    out: dict = {
+        "id": str(c.id),
+        "name": c.name,
+        "type": c.type,
+        "is_active": c.is_active,
+        "created_at": c.created_at.isoformat(),
+    }
+    if c.type == "webhook":
+        cfg = parse_channel_config(c)
+        events = cfg.get("events")
+        if isinstance(events, list):
+            out["events"] = [str(x) for x in events]
+        url = webhook_url_from_config(cfg)
+        if url:
+            out["url_hint"] = url if len(url) <= 56 else f"{url[:53]}…"
+    return out
+
+
 @router.get("/channels")
 async def list_channels(
     current_user: User = Depends(require_role("admin", "manager")),
@@ -153,18 +174,7 @@ async def list_channels(
         select(NotificationChannel).where(NotificationChannel.org_id == current_user.org_id)
     )
     rows = list(result.scalars().all())
-    return {
-        "channels": [
-            {
-                "id": str(c.id),
-                "name": c.name,
-                "type": c.type,
-                "is_active": c.is_active,
-                "created_at": c.created_at.isoformat(),
-            }
-            for c in rows
-        ]
-    }
+    return {"channels": [_channel_out(c) for c in rows]}
 
 
 class ChannelBody(BaseModel):

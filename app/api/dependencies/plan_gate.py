@@ -24,6 +24,8 @@ PLAN_LIMITS: dict[str, dict[str, int | None]] = {
         "users": 3,
         "pipeline_runs_per_month": 20,
         "agent_queries_per_month": 100,
+        "studio_dashboards": 5,
+        "studio_query_executions_per_day": 200,
     },
     "pro": {
         "api_keys": None,
@@ -31,6 +33,8 @@ PLAN_LIMITS: dict[str, dict[str, int | None]] = {
         "users": None,
         "pipeline_runs_per_month": None,
         "agent_queries_per_month": None,
+        "studio_dashboards": None,
+        "studio_query_executions_per_day": None,
     },
 }
 
@@ -143,6 +147,64 @@ async def check_api_key_limit(db: AsyncSession, org_id: UUID) -> None:
         )
 
 
+async def check_studio_execution_budget(
+    org_id: UUID, redis, plan: str = "free"
+) -> None:
+    """Raise RATE_LIMITED if the org has exceeded its daily studio query execution budget.
+
+    Only enforced in cloud deployment. Pro plan and self-hosted always pass.
+    Counter stored in Redis: incremented per execution, expires at end of day.
+    """
+    if settings.DEPLOYMENT_MODE != "cloud":
+        return
+    if redis is None:
+        return
+    limit = get_plan_limits(plan).get("studio_query_executions_per_day")
+    if limit is None:
+        return
+    from app.infrastructure.redis.keys import studio_budget
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = studio_budget(str(org_id), today)
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, 86400)
+    if count > limit:
+        raise rate_limited(
+            f"Studio execution budget exceeded ({limit} executions/day on the free plan). "
+            "Upgrade to Pro for unlimited executions.",
+        )
+
+
+async def check_studio_dashboard_limit(db: AsyncSession, org_id: UUID) -> None:
+    """Raise PLAN_LIMIT if the org has reached its studio dashboard quota.
+
+    Free plan (cloud): 5 dashboards max.
+    Pro plan (cloud) and all self-hosted: unlimited.
+    """
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        return
+    from app.infrastructure.database.models.studio_dashboard import StudioDashboard
+
+    org = await _get_org(db, org_id)
+    plan = (org.plan or "free").lower() if org else "free"
+    limit = get_plan_limits(plan).get("studio_dashboards")
+    if limit is None:
+        return
+    count = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(StudioDashboard)
+            .where(StudioDashboard.org_id == org_id)
+        )
+        or 0
+    )
+    if count >= limit:
+        raise plan_limit(
+            f"Studio dashboard limit reached for the free plan (max {limit}). "
+            "Upgrade to Pro for unlimited dashboards.",
+        )
+
+
 async def check_webhook_channel_limit(db: AsyncSession, org_id: UUID) -> None:
     """Raise PLAN_LIMIT if the org has reached its webhook channel quota."""
     if settings.DEPLOYMENT_MODE == "self_hosted":
@@ -179,6 +241,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     from app.infrastructure.database.models.api_key import ApiKey
     from app.infrastructure.database.models.notification_channel import NotificationChannel
     from app.infrastructure.database.models.pipeline_run import PipelineRun
+    from app.infrastructure.database.models.studio_dashboard import StudioDashboard
     from app.infrastructure.database.models.user import User
 
     org = await _get_org(db, org_id)
@@ -233,6 +296,27 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
         )
         or 0
     )
+    studio_dashboard_count = int(
+        await db.scalar(
+            select(func.count()).select_from(StudioDashboard).where(
+                StudioDashboard.org_id == org_id
+            )
+        )
+        or 0
+    )
+
+    # Studio execution budget — read from Redis counter for today
+    from app.infrastructure.redis.client import get_redis
+    from app.infrastructure.redis.keys import studio_budget
+    studio_exec_today = 0
+    try:
+        r = await get_redis()
+        if r is not None:
+            today = now.strftime("%Y-%m-%d")
+            val = await r.get(studio_budget(str(org_id), today))
+            studio_exec_today = int(val or 0)
+    except Exception:
+        pass
 
     def slot(used: int, key: str) -> dict:
         return {"used": used, "limit": limits.get(key)}
@@ -245,5 +329,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
             "users": slot(user_count, "users"),
             "pipeline_runs_this_month": slot(pipeline_run_count, "pipeline_runs_per_month"),
             "agent_queries_this_month": slot(agent_query_count, "agent_queries_per_month"),
+            "studio_dashboards": slot(studio_dashboard_count, "studio_dashboards"),
+            "studio_executions_today": slot(studio_exec_today, "studio_query_executions_per_day"),
         },
     }
