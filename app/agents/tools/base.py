@@ -133,7 +133,7 @@ class ToolRegistry:
 
         expected = {p.name for p in tool.parameters}
         required = {p.name for p in tool.parameters if p.required}
-        provided = set(call.arguments.keys())
+        provided = set((call.arguments or {}).keys())
 
         missing = required - provided
         if missing:

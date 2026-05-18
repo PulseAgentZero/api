@@ -293,7 +293,7 @@ class RecommendationAgent(BaseAgent):
         for entity in batch:
             tier = entity.get("risk_tier", "high")
             signals = entity.get("signal_values", {})
-            top_signal = max(signals, key=lambda k: signals[k]) if signals else "unknown"
+            top_signal = max(signals, key=lambda k: _to_float(signals[k])) if signals else "unknown"
 
             recs.append({
                 "entity_id": entity.get("entity_id", ""),
@@ -313,6 +313,13 @@ class RecommendationAgent(BaseAgent):
                 ),
             })
         return recs
+
+
+def _to_float(v: object) -> float:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _augment_with_profile(entity: dict, profile: dict | None) -> dict:

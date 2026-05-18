@@ -228,26 +228,20 @@ def build_ml_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         # ── Drop any remaining NaN/inf ──
         X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-        # ── Detect data leakage: columns that perfectly predict the target ──
+        # ── Detect data leakage: columns too correlated with the target ──
         leaky_cols: list[str] = []
         for col in X.columns:
-            col_vals = X[col].values
+            col_vals = X[col].values.astype(np.float64)
             # Binary columns: check exact match against target
             if X[col].nunique() <= 2:
                 if np.array_equal(col_vals, y) or np.array_equal(1 - col_vals, y):
                     leaky_cols.append(col)
-            # Continuous columns: check for perfect class separation
-            elif np.issubdtype(X[col].dtype, np.number):
-                col_min = col_vals.min()
-                col_max = col_vals.max()
-                # Perfect separation if every class-0 value < every class-1 value (or vice versa)
-                for cls_val in (0, 1):
-                    cls_mask = y == cls_val
-                    other_mask = y == (1 - cls_val)
-                    if cls_mask.any() and other_mask.any():
-                        if col_vals[cls_mask].min() > col_vals[other_mask].max():
-                            leaky_cols.append(col)
-                            break
+                    continue
+            # Numeric columns: flag near-perfect correlation with target (>0.95)
+            if np.issubdtype(X[col].dtype, np.number):
+                corr = abs(np.corrcoef(col_vals, y)[0, 1]) if col_vals.std() > 0 else 0.0
+                if corr > 0.95:
+                    leaky_cols.append(col)
         if leaky_cols:
             logger.warning(
                 "Dropping %d leaky columns (perfectly correlated with target): %s",

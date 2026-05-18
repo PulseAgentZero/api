@@ -120,7 +120,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 table = validate_identifier(mapping.entity_table, "entity table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
-                if columns == "*":
+                if not columns or columns.strip() == "*":
                     cols_result = await client_conn.execute(
                         text(schema_columns_sql(conn.db_type)),
                         {"tname": mapping.entity_table},
@@ -130,10 +130,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                     col_names = [
                         validate_identifier(c.strip(), "column")
                         for c in columns.split(",")
+                        if c.strip() and c.strip() != "*"
                     ]
 
                 quoted_cols = [quote_identifier(c, conn.db_type) for c in col_names]
-                sql = f"SELECT {', '.join(quoted_cols)} FROM {quoted_table}"
+                sql = f"SELECT {', '.join(quoted_cols) or '*'} FROM {quoted_table}"
 
                 params: dict[str, Any] = {}
                 if where:
@@ -169,7 +170,7 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 table = validate_identifier(table_name, "table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
-                if columns == "*":
+                if not columns or columns.strip() == "*":
                     cols_result = await client_conn.execute(
                         text(schema_columns_sql(conn.db_type)),
                         {"tname": table_name},
@@ -181,10 +182,11 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                     col_names = [
                         validate_identifier(c.strip(), "column")
                         for c in columns.split(",")
+                        if c.strip() and c.strip() != "*"
                     ]
 
                 quoted_cols = [quote_identifier(c, conn.db_type) for c in col_names]
-                sql = f"SELECT {', '.join(quoted_cols)} FROM {quoted_table}"
+                sql = f"SELECT {', '.join(quoted_cols) or '*'} FROM {quoted_table}"
 
                 params: dict[str, Any] = {}
                 if where:
