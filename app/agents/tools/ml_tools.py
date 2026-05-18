@@ -17,6 +17,8 @@ import logging
 import uuid
 from typing import Any
 
+from uuid import UUID
+
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
@@ -30,13 +32,28 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.tools.base import Tool, ToolParam
+from app.agents.tools.client_db import (
+    open_client_engine,
+    quote_identifier,
+    safe_client_connection,
+    validate_identifier,
+)
+from app.infrastructure.database.client_queries import get_schema_mapping
 
 logger = logging.getLogger(__name__)
 
 # Module-level store for trained models. Keyed by model_id (str).
 _MODEL_STORE: dict[str, dict[str, Any]] = {}
+
+# In-memory store for prepared feature data so tools can share by reference instead of ferrying massive JSON strings through LLM tool call arguments.
+_FEATURE_STORE: dict[str, dict[str, Any]] = {}
+
+# Scored entities store — score_entities writes here so the pipeline can read the full entity list without the LLM ferrying it through final JSON output.
+_SCORED_STORE: dict[str, list[dict]] = {}
 
 # ─── Guards and thresholds ──────────────────────────────────────────────
 MIN_SAMPLES = 30           # Minimum rows for meaningful ML
@@ -49,34 +66,44 @@ CV_FOLDS = 5               # Cross-validation folds
 
 
 def _clean_model_store() -> None:
-    """Clear all stored models (call after pipeline run completes)."""
+    """Clear all stored models, features, and scores (call after pipeline run)."""
     _MODEL_STORE.clear()
+    _FEATURE_STORE.clear()
+    _SCORED_STORE.clear()
 
 
-def build_ml_tools() -> list[Tool]:
+def build_ml_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     """Build the set of ML tools available to the Model Training Agent."""
 
     async def prepare_features(
-        raw_data: str,
         target_column: str,
         exclude_columns: str = "",
+        limit: int | str = 10000,
     ) -> dict[str, Any]:
-        """Clean data, encode categoricals, handle nulls, convert datetimes.
+        """Query entity table and prepare feature matrix for ML training.
 
-        Args:
-            raw_data: JSON string of list[dict] — the raw entity rows.
-            target_column: Name of the target/label column.
-            exclude_columns: Comma-separated column names to exclude (IDs, names).
-
-        Returns feature matrix stats and serialised features/target.
+        Fetches rows directly from the client DB — the LLM no longer needs
+        to ferry data through tool call arguments.
         """
+        limit_val = max(1, min(int(limit), 10000))
+        mapping = await get_schema_mapping(db, org_id)
+        engine, conn = await open_client_engine(db, org_id)
         try:
-            records = json.loads(raw_data) if isinstance(raw_data, str) else raw_data
-        except json.JSONDecodeError as e:
-            return {"error": f"Invalid JSON for raw_data: {e}"}
+            async with safe_client_connection(engine, conn) as client_conn:
+                table = validate_identifier(mapping.entity_table, "entity table")
+                quoted_table = quote_identifier(table, conn.db_type)
+                sql = f"SELECT * FROM {quoted_table} LIMIT :lim"
+                result = await client_conn.execute(
+                    text(sql), {"lim": limit_val}
+                )
+                rows = result.all()
+                col_names = list(result.keys())
+                records = [dict(zip(col_names, row)) for row in rows]
+        finally:
+            await engine.dispose()
 
         if not records:
-            return {"error": "No data rows provided"}
+            return {"error": "No data rows found in entity table"}
 
         df = pd.DataFrame(records)
 
@@ -85,6 +112,10 @@ def build_ml_tools() -> list[Tool]:
                 "error": f"Target column '{target_column}' not found in data. "
                          f"Available columns: {list(df.columns)}",
             }
+
+        # Extract entity IDs now — they get dropped from the feature matrix below.
+        entity_id_col = mapping.entity_id_col
+        entity_ids = df[entity_id_col].astype(str).tolist() if entity_id_col in df.columns else []
 
         # ── Validate dataset size ──
         if len(df) < MIN_SAMPLES_HARD:
@@ -197,6 +228,27 @@ def build_ml_tools() -> list[Tool]:
         # ── Drop any remaining NaN/inf ──
         X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
 
+        # ── Detect data leakage: columns too correlated with the target ──
+        leaky_cols: list[str] = []
+        for col in X.columns:
+            col_vals = X[col].values.astype(np.float64)
+            # Binary columns: check exact match against target
+            if X[col].nunique() <= 2:
+                if np.array_equal(col_vals, y) or np.array_equal(1 - col_vals, y):
+                    leaky_cols.append(col)
+                    continue
+            # Numeric columns: flag near-perfect correlation with target (>0.95)
+            if np.issubdtype(X[col].dtype, np.number):
+                corr = abs(np.corrcoef(col_vals, y)[0, 1]) if col_vals.std() > 0 else 0.0
+                if corr > 0.95:
+                    leaky_cols.append(col)
+        if leaky_cols:
+            logger.warning(
+                "Dropping %d leaky columns (perfectly correlated with target): %s",
+                len(leaky_cols), leaky_cols,
+            )
+            X = X.drop(columns=leaky_cols)
+
         # ── Cap total feature count ──
         if X.shape[1] > MAX_FEATURES:
             logger.warning("Feature count %d exceeds cap %d — keeping top %d by variance",
@@ -223,7 +275,17 @@ def build_ml_tools() -> list[Tool]:
                 f"of data. Model will use balanced class weights to compensate."
             )
 
+        data_id = str(uuid.uuid4())
+        _FEATURE_STORE[data_id] = {
+            "features": X.values.astype(np.float64),
+            "target": y.astype(np.int64),
+            "feature_names": feature_names,
+            "target_classes": list(le.classes_),
+            "entity_ids": entity_ids,
+        }
+
         result = {
+            "data_id": data_id,
             "feature_names": feature_names,
             "n_samples": len(X),
             "n_features": len(feature_names),
@@ -237,9 +299,6 @@ def build_ml_tools() -> list[Tool]:
             "high_cardinality_columns": high_card_warning,
             "class_imbalance_warning": imbalance_warning,
             "size_warning": size_warning,
-            # Serialise matrices for train_model
-            "features_json": X.values.tolist(),
-            "target_json": y.tolist(),
         }
 
         logger.info(
@@ -251,30 +310,22 @@ def build_ml_tools() -> list[Tool]:
         return result
 
     async def train_model(
-        features_json: str,
-        target_json: str,
-        feature_names: str,
-        target_classes: str,
+        data_id: str,
         algorithm: str = "random_forest",
     ) -> dict[str, Any]:
         """Train a model with 5-fold CV for reliable metrics + feature importances.
 
-        Args:
-            features_json: JSON string of 2D feature matrix (list of lists).
-            target_json: JSON string of 1D target vector (list of ints).
-            feature_names: JSON string of feature name list.
-            target_classes: JSON string of target class labels.
-            algorithm: Algorithm name (only 'random_forest' supported).
-
-        Returns: CV metrics (accuracy, F1, AUC-ROC), feature importances, model_id.
+        Reads prepared features from the in-memory feature store — no need
+        for the LLM to ferry massive JSON strings through tool calls.
         """
-        try:
-            X = np.array(json.loads(features_json) if isinstance(features_json, str) else features_json, dtype=np.float64)
-            y = np.array(json.loads(target_json) if isinstance(target_json, str) else target_json, dtype=np.int64)
-            f_names = json.loads(feature_names) if isinstance(feature_names, str) else feature_names
-            t_classes = json.loads(target_classes) if isinstance(target_classes, str) else target_classes
-        except (json.JSONDecodeError, ValueError) as e:
-            return {"error": f"Failed to parse input data: {e}"}
+        store = _FEATURE_STORE.get(data_id)
+        if store is None:
+            return {"error": f"Feature data '{data_id}' not found. Call prepare_features first."}
+
+        X = store["features"]
+        y = store["target"]
+        f_names = store["feature_names"]
+        t_classes = store["target_classes"]
 
         if len(X) < MIN_SAMPLES_HARD:
             return {"error": f"Insufficient data: {len(X)} samples (need at least {MIN_SAMPLES_HARD})"}
@@ -413,32 +464,27 @@ def build_ml_tools() -> list[Tool]:
         return result
 
     async def score_entities(
-        features_json: str,
-        entity_ids: str,
+        data_id: str,
         model_id: str,
     ) -> dict[str, Any]:
         """Score all entities with the trained model.
 
-        Args:
-            features_json: JSON string of 2D feature matrix for ALL entities.
-            entity_ids: JSON string of entity ID list (same order as features).
-            model_id: Model ID returned from train_model.
-
-        Returns: list of {entity_id, risk_score, risk_tier} with validated scores.
+        Reads features and entity IDs from the in-memory feature store.
         """
+        feat_store = _FEATURE_STORE.get(data_id)
+        if feat_store is None:
+            return {"error": f"Feature data '{data_id}' not found. Call prepare_features first."}
+
         if model_id not in _MODEL_STORE:
             return {"error": f"Model '{model_id}' not found. Available: {list(_MODEL_STORE.keys())}"}
 
-        store = _MODEL_STORE[model_id]
-        model = store["model"]
-        t_classes = store["target_classes"]
-        expected_features = store["feature_names"]
+        model_store = _MODEL_STORE[model_id]
+        model = model_store["model"]
+        t_classes = model_store["target_classes"]
+        expected_features = model_store["feature_names"]
 
-        try:
-            X = np.array(json.loads(features_json) if isinstance(features_json, str) else features_json, dtype=np.float64)
-            ids = json.loads(entity_ids) if isinstance(entity_ids, str) else entity_ids
-        except (json.JSONDecodeError, ValueError) as e:
-            return {"error": f"Failed to parse input data: {e}"}
+        X = feat_store["features"]
+        ids = feat_store["entity_ids"]
 
         if len(X) != len(ids):
             return {"error": f"Feature rows ({len(X)}) != entity IDs ({len(ids)})"}
@@ -490,8 +536,17 @@ def build_ml_tools() -> list[Tool]:
         for s in scored:
             tier_counts[s["risk_tier"]] += 1
 
-        result = {
-            "scored_entities": scored,
+        # Store full scored entity list in memory — the pipeline reads it
+        # directly so the LLM doesn't have to ferry 7000+ entities through
+        # its final JSON output.
+        _SCORED_STORE[data_id] = scored
+
+        logger.info(
+            "Scored %d entities: critical=%d, high=%d, medium=%d, low=%d (positive_class=%s)",
+            len(scored), tier_counts["critical"], tier_counts["high"],
+            tier_counts["medium"], tier_counts["low"], t_classes[positive_idx],
+        )
+        return {
             "total_scored": len(scored),
             "tier_counts": tier_counts,
             "positive_class": t_classes[positive_idx] if positive_idx < len(t_classes) else "unknown",
@@ -502,32 +557,29 @@ def build_ml_tools() -> list[Tool]:
             },
         }
 
-        logger.info(
-            "Scored %d entities: critical=%d, high=%d, medium=%d, low=%d (positive_class=%s)",
-            len(scored), tier_counts["critical"], tier_counts["high"],
-            tier_counts["medium"], tier_counts["low"], t_classes[positive_idx],
-        )
-        return result
-
     # ─── Build tool definitions ─────────────────────────────────────────
 
     return [
         Tool(
             name="prepare_features",
             description=(
-                "Prepare a feature matrix from raw entity data for ML training. "
+                "Prepare a feature matrix from the entity table for ML training. "
+                "Queries the client DB directly — you do NOT need to fetch data first. "
                 "Cleans data, converts datetimes to numeric, removes zero-variance columns, "
                 "encodes categoricals (one-hot for ≤50 unique, label-encode otherwise), "
                 "handles missing values, drops high-null columns. "
-                "Returns: {features_json, target_json, feature_names, target_classes, feature_count, target_dist, ...} on success, or {error: str} if the target has <2 or >20 classes / no usable features remain. "
-                "IMPORTANT: Pass ALL entity rows as raw_data, including the target column."
+                "Returns: {features_json, target_json, feature_names, target_classes, feature_count, target_dist, ...} on success, or {error: str} if the target has <2 or >20 classes / no usable features remain."
             ),
             parameters=[
-                ToolParam("raw_data", "string", "JSON string of raw entity rows (list of dicts). Must include the target column.", required=True),
                 ToolParam("target_column", "string", "Name of the target/label column to predict", required=True),
                 ToolParam(
                     "exclude_columns", "string",
                     "Comma-separated column names to exclude from features (ALWAYS exclude entity ID and name columns — they are identifiers, not features)",
+                    required=False,
+                ),
+                ToolParam(
+                    "limit", "integer",
+                    "Max rows to fetch from the entity table (default 10000, max 10000)",
                     required=False,
                 ),
             ],
@@ -538,14 +590,12 @@ def build_ml_tools() -> list[Tool]:
             name="train_model",
             description=(
                 "Train a Random Forest classifier on prepared feature data with 5-fold stratified cross-validation. "
+                "Reads features from the in-memory store — just pass the data_id from prepare_features. "
                 "Returns: {model_id, accuracy_mean, accuracy_std, f1, auc_roc, confusion_matrix, feature_importances (top 20), meets_quality_threshold, quality_note} on success, or {error: str} if data is insufficient / single-class / shape mismatch. "
                 "If meets_quality_threshold is false (CV accuracy < 55%), set ml_available=false and fall back to rule-based scoring."
             ),
             parameters=[
-                ToolParam("features_json", "string", "JSON string of 2D feature matrix (from prepare_features 'features_json' field)", required=True),
-                ToolParam("target_json", "string", "JSON string of 1D target vector (from prepare_features 'target_json' field)", required=True),
-                ToolParam("feature_names", "string", "JSON string of feature name list (from prepare_features 'feature_names' field)", required=True),
-                ToolParam("target_classes", "string", "JSON string of target class labels (from prepare_features 'target_classes' field)", required=True),
+                ToolParam("data_id", "string", "Data ID returned by prepare_features", required=True),
                 ToolParam("algorithm", "string", "Algorithm to use (only 'random_forest' supported)", required=False),
             ],
             execute=train_model,
@@ -555,13 +605,12 @@ def build_ml_tools() -> list[Tool]:
             name="score_entities",
             description=(
                 "Score ALL entities using a trained ML model. "
-                "Returns: {scored_entities: list[{entity_id, risk_score (0.0-1.0), risk_tier ∈ {critical,high,medium,low}}], total_scored, tier_counts, positive_class, score_range} on success, or {error: str} if the model_id is unknown or the row/id counts mismatch. "
-                "You MUST pass the SAME features_json used for training (but for ALL entities). "
-                "The scored_entities list MUST be used EXACTLY as-is in your final JSON — do NOT modify, filter, or fabricate scores."
+                "Reads features and entity IDs from the in-memory store — just pass data_id and model_id. "
+                "Returns a summary: {total_scored, tier_counts, positive_class, score_range}. "
+                "The full scored entity list is stored automatically — you do NOT need to include it in your final JSON."
             ),
             parameters=[
-                ToolParam("features_json", "string", "JSON string of 2D feature matrix for ALL entities (same features as training)", required=True),
-                ToolParam("entity_ids", "string", "JSON string of entity ID list (same order as feature rows)", required=True),
+                ToolParam("data_id", "string", "Data ID returned by prepare_features (same one used for train_model)", required=True),
                 ToolParam("model_id", "string", "Model ID returned from train_model", required=True),
             ],
             execute=score_entities,

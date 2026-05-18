@@ -25,12 +25,15 @@ from app.infrastructure.external_services.rag import (
     RagConfig,
     RagRunStats,
     _merge_rag_stats,
+    embed_and_store_profiles,
     enrich_entities_with_similar,
     update_entity_metadata,
 )
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_RAG_INDEX_LIMIT = 1000
 
 
 class RiskScoringAgent(BaseAgent):
@@ -53,6 +56,7 @@ class RiskScoringAgent(BaseAgent):
         """Execute risk scoring with ML predictions or deterministic fallback."""
 
         org_id = UUID(state["org_id"])
+        mapping_id = UUID(str(state["mapping_id"])) if state.get("mapping_id") else None
         use_ml = state.get("ml_available") and state.get("ml_scored_entities")
 
         if use_ml:
@@ -79,7 +83,7 @@ class RiskScoringAgent(BaseAgent):
 
             # Fetch entity names and signal values for display/narratives
             try:
-                mapping = await get_schema_mapping(db, org_id)
+                mapping = await get_schema_mapping(db, org_id, mapping_id=mapping_id)
                 entities = await fetch_entities(db, org_id, mapping)
                 id_col = mapping.entity_id_col
                 name_col = mapping.entity_name_col
@@ -145,7 +149,7 @@ class RiskScoringAgent(BaseAgent):
                 logger.info("[RiskScoringAgent] Using deterministic rule-based scoring")
 
             try:
-                mapping = await get_schema_mapping(db, org_id)
+                mapping = await get_schema_mapping(db, org_id, mapping_id=mapping_id)
                 entities = await fetch_entities(db, org_id, mapping)
                 scored = compute_risk(entities, mapping.signal_columns, mapping.risk_config)
             except Exception as e:
@@ -211,7 +215,7 @@ class RiskScoringAgent(BaseAgent):
             # RAG: attach similar past-profile entities so narratives can reference
             # precedent. Per-org overrides come from schema_mapping.rag_config.
             try:
-                _mapping = await get_schema_mapping(db, org_id)
+                _mapping = await get_schema_mapping(db, org_id, mapping_id=mapping_id)
                 _rag_overrides = getattr(_mapping, "rag_config", None)
             except Exception:
                 _rag_overrides = None
@@ -274,6 +278,15 @@ class RiskScoringAgent(BaseAgent):
         }
         state["reasoning_log"].extend(self._reasoning_entries)
 
+        rag_index_entities = scored_entities[:DEFAULT_RAG_INDEX_LIMIT]
+        try:
+            await embed_and_store_profiles(
+                str(org_id),
+                _profiles_from_scored_entities(rag_index_entities),
+            )
+        except Exception as e:
+            logger.warning("[RiskScoringAgent] RAG profile indexing failed: %s", e)
+
         # Patch Qdrant payloads with risk_tier + last_scored_at so subsequent
         # cycles can filter retrieval by tier and freshness. Non-fatal on error.
         import time as _time
@@ -289,7 +302,7 @@ class RiskScoringAgent(BaseAgent):
                         "last_scored_at": _scored_ts,
                     },
                 )
-                for e in scored_entities
+                for e in rag_index_entities
             ],
         )
 
@@ -357,3 +370,36 @@ def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
     if profile_fields:
         enriched["profile"] = profile_fields
     return enriched
+
+
+def _profiles_from_scored_entities(entities: list[dict]) -> list[dict[str, Any]]:
+    profiles: list[dict[str, Any]] = []
+    for entity in entities:
+        signals = entity.get("signal_values") or {}
+        top_signals = sorted(
+            ((k, v) for k, v in signals.items() if isinstance(v, (int, float))),
+            key=lambda item: abs(item[1]),
+            reverse=True,
+        )[:5]
+        signal_text = ", ".join(f"{k}={v}" for k, v in top_signals)
+        narrative = str(entity.get("risk_narrative") or "").strip()
+        summary_parts = [
+            f"{entity.get('entity_name') or entity.get('entity_id')} is {entity.get('risk_tier', 'unknown')} risk",
+            f"score={entity.get('risk_score', 0)}",
+        ]
+        if signal_text:
+            summary_parts.append(f"top signals: {signal_text}")
+        if narrative:
+            summary_parts.append(narrative)
+        profiles.append({
+            "entity_id": str(entity.get("entity_id", "")),
+            "profile_summary": ". ".join(summary_parts),
+            "behavioural_metrics": signals,
+            "base_attributes": {
+                "entity_name": entity.get("entity_name"),
+                "risk_tier": entity.get("risk_tier"),
+                "risk_score": entity.get("risk_score"),
+                "scoring_method": entity.get("scoring_method"),
+            },
+        })
+    return profiles

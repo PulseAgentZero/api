@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.base import BaseAgent, LLMProvider
 from app.agents.prompts.model_training import MODEL_TRAINING_PROMPT
 from app.agents.state import PipelineState
-from app.agents.tools.ml_tools import build_ml_tools, _clean_model_store
+from app.agents.tools.ml_tools import build_ml_tools, _clean_model_store, _SCORED_STORE
 from app.agents.tools.query_tools import build_query_tools
 from app.config.settings import settings
 
@@ -70,7 +70,7 @@ class ModelTrainingAgent(BaseAgent):
 
         # Register ML tools + query tools (agent needs to fetch data)
         self.registry = type(self.registry)()
-        for tool in build_ml_tools():
+        for tool in build_ml_tools(db, org_id):
             self.registry.register(tool)
         for tool in build_query_tools(db, org_id):
             self.registry.register(tool)
@@ -116,17 +116,22 @@ class ModelTrainingAgent(BaseAgent):
             logger.error("[ModelTrainingAgent] Failed: %s", e)
             state["model_metrics"] = {"error": str(e)}
             state["reasoning_log"].extend(self._reasoning_entries)
-            # Non-fatal — pipeline continues with rule-based scoring
-            return state
-        finally:
-            # Clean up in-memory model store after this run
             _clean_model_store()
+            return state
 
         # ── Extract and VALIDATE results ──
         ml_available = result.get("ml_available", False)
 
         if ml_available:
-            scored_entities = result.get("ml_scored_entities", [])
+            # Scored entities are stored in-memory by score_entities tool as the LLM cannot fit 7000+ entities in its JSON output.
+            scored_entities: list[dict] = []
+            data_id = result.get("data_id", "")
+            # Try the LLM-reported data_id first, then fall back to any non-empty entry in _SCORED_STORE (handles LLM placeholder copying).
+            if data_id and not data_id.startswith("the "):
+                scored_entities = _SCORED_STORE.get(data_id, [])
+            if not scored_entities and _SCORED_STORE:
+                # Take the entry with the most scored entities
+                scored_entities = max(_SCORED_STORE.values(), key=len, default=[])
             model_metrics = result.get("model_metrics", {})
             feature_importances = result.get("feature_importances", [])
 
@@ -196,7 +201,7 @@ class ModelTrainingAgent(BaseAgent):
             state["target_column"] = result.get("target_column")
             state["model_metrics"] = result.get("model_metrics", {})
             state["feature_importances"] = result.get("feature_importances", [])
-            state["ml_scored_entities"] = result.get("ml_scored_entities", [])
+            state["ml_scored_entities"] = scored_entities
 
             logger.info(
                 "[ModelTrainingAgent] ✅ ML model trained: accuracy=%.4f, "
@@ -217,4 +222,5 @@ class ModelTrainingAgent(BaseAgent):
             }
 
         state["reasoning_log"].extend(self._reasoning_entries)
+        _clean_model_store()
         return state

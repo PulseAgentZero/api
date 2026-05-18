@@ -47,7 +47,7 @@ GOOD: "Send personalised upgrade proposal for the Pro plan — current usage (47
 ### Step 6: Use RAG context if present (`similar_entities`)
 If the entity payload includes `similar_entities`, each item may carry:
 - `entity_id`, `similarity` (0..1), `profile_summary`, `risk_tier`
-- `past_recommendations`: list of `{type, urgency, title, suggested_action, status}` previously generated for that similar entity
+- `past_recommendations`: list of `{{type, urgency, title, suggested_action, status}}` previously generated for that similar entity
 
 Reasoning protocol (chain-of-thought, internal):
 1. Scan the `past_recommendations` of the top 1-2 similar entities by `similarity`.

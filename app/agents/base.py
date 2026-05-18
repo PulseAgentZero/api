@@ -346,10 +346,12 @@ class BaseAgent:
         self, system_prompt: str, user_prompt: str,
         *, provider: LLMProvider | None = None,
         model: str | None = None, temperature: float = 0.0,
+        max_tokens: int = 4096,
     ) -> str:
         raw = await self.llm_call(
             system_prompt, user_prompt + "\n\nRespond with ONLY valid JSON.",
             provider=provider, model=model, temperature=temperature,
+            max_tokens=max_tokens,
         )
         return _extract_json(raw)
 
@@ -422,7 +424,11 @@ class BaseAgent:
                         self._metrics.validation_retries += 1
                         logger.warning("[%s] Validation failed (retry %d): %s", self.name, validation_retries, err)
                         messages.append({"role": "assistant", "content": response.content})
-                        messages.append({"role": "user", "content": f"INVALID output: {err}\nFix it. Return ONLY corrected JSON."})
+                        if not final.strip():
+                            retry_msg = "Your response was empty. You MUST output a complete JSON object with all required keys. Return ONLY the JSON object now."
+                        else:
+                            retry_msg = f"INVALID output: {err}\nFix it. Return ONLY corrected JSON."
+                        messages.append({"role": "user", "content": retry_msg})
                         continue
                 logger.info("[%s] Anthropic ReAct done: %d iters", self.name, iteration)
                 return final
@@ -500,7 +506,10 @@ class BaseAgent:
                 kwargs["tool_choice"] = "auto"
 
             t0 = time.monotonic()
-            response = await self.groq_client.chat.completions.create(**kwargs)
+            try:
+                response = await self.groq_client.chat.completions.create(**kwargs)
+            except AttributeError as e:
+                raise RuntimeError(f"Groq SDK response parsing failed (malformed API response): {e}") from e
             elapsed = int((time.monotonic() - t0) * 1000)
 
             choice = response.choices[0]
@@ -533,6 +542,13 @@ class BaseAgent:
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
+                        logger.warning(
+                            "[%s] Groq returned malformed tool call arguments for '%s' "
+                            "(len=%d): %s",
+                            self.name, tc.function.name,
+                            len(tc.function.arguments),
+                            tc.function.arguments[:200],
+                        )
                         args = {}
                     call = ToolCall(tool_name=tc.function.name, arguments=args, call_id=tc.id)
                     result = await self.registry.execute(call)
@@ -552,7 +568,11 @@ class BaseAgent:
                     self._metrics.validation_retries += 1
                     logger.warning("[%s] Validation failed (retry %d): %s", self.name, validation_retries, err)
                     messages.append({"role": "assistant", "content": final})
-                    messages.append({"role": "user", "content": f"INVALID output: {err}\nFix it. Return ONLY corrected JSON."})
+                    if not final.strip():
+                        retry_msg = "Your response was empty. You MUST output a complete JSON object with all required keys. Return ONLY the JSON object now."
+                    else:
+                        retry_msg = f"INVALID output: {err}\nFix it. Return ONLY corrected JSON."
+                    messages.append({"role": "user", "content": retry_msg})
                     continue
             logger.info("[%s] Groq ReAct done: %d iters", self.name, iteration)
             return final

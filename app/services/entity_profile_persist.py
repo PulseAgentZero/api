@@ -22,6 +22,17 @@ def _display_tier(raw: str) -> str:
     return m.get(str(raw).lower(), str(raw).title())
 
 
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively convert Decimal to float for JSONB storage."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    return value
+
+
 async def persist_entity_profiles_from_pipeline(
     session: AsyncSession,
     *,
@@ -54,7 +65,7 @@ async def persist_entity_profiles_from_pipeline(
             entity_id=str(e.get("entity_id", "")),
             entity_name=e.get("entity_name"),
             segment=None,
-            profile_data={"signal_values": e.get("signal_values", {})},
+            profile_data={"signal_values": _sanitize_json_value(e.get("signal_values", {}))},
             risk_score=score,
             risk_tier=tier,
             risk_narrative=e.get("risk_narrative"),

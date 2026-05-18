@@ -56,16 +56,20 @@ class SchemaIntelligenceAgent(BaseAgent):
         memo_repo = AgentMemoryRepository(db)
         cached = await memo_repo.get(org_id, _MEMORY_KEY)
         if cached is not None and cached.fingerprint == fingerprint and cached.data:
-            logger.info(
-                "[SchemaIntelligenceAgent] Cache hit — reusing analysis "
-                "from %s", cached.updated_at,
-            )
             data = cached.data
-            state["schema_analysis"] = data
-            state["validated_columns"] = data.get("validated_columns", []) or []
-            state["related_tables"] = data.get("related_tables", []) or []
-            state["schema_issues"] = data.get("schema_issues", []) or []
-            return state
+            # Treat empty related_tables as a bad cache (context loss during prior analysis).
+            if not data.get("related_tables"):
+                logger.info("[SchemaIntelligenceAgent] Cache has empty related_tables — forcing re-analysis")
+            else:
+                logger.info(
+                    "[SchemaIntelligenceAgent] Cache hit — reusing analysis "
+                    "from %s", cached.updated_at,
+                )
+                state["schema_analysis"] = data
+                state["validated_columns"] = data.get("validated_columns", []) or []
+                state["related_tables"] = data.get("related_tables", []) or []
+                state["schema_issues"] = data.get("schema_issues", []) or []
+                return state
 
         # Fresh tool registry for this run
         self.registry = type(self.registry)()

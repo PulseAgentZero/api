@@ -56,6 +56,7 @@ class RecommendationAgent(BaseAgent):
         """Generate recommendations for elevated-risk entities."""
 
         org_id = UUID(state["org_id"])
+        mapping_id = UUID(str(state["mapping_id"])) if state.get("mapping_id") else None
         scored = state.get("scored_entities", [])
         recommendation_limit = DEFAULT_RECOMMENDATION_LIMIT
 
@@ -108,7 +109,7 @@ class RecommendationAgent(BaseAgent):
 
         # Resolve per-org RAG config once and reuse across batches.
         try:
-            _mapping = await get_schema_mapping(db, org_id)
+            _mapping = await get_schema_mapping(db, org_id, mapping_id=mapping_id)
             _rag_config = RagConfig.resolve(getattr(_mapping, "rag_config", None))
         except Exception:
             _rag_config = RagConfig.from_defaults()
@@ -130,7 +131,8 @@ class RecommendationAgent(BaseAgent):
                 state["rag_run_stats"] = _merge_rag_stats(
                     state.get("rag_run_stats") or {}, _rag_stats.to_dict()
                 )
-                batch_recs = await self._generate_batch(prompt, state, batch)
+                raw_batch_recs = await self._generate_batch(prompt, state, batch)
+                batch_recs = self._normalize_recommendations(raw_batch_recs, batch, state)
                 all_recs.extend(batch_recs)
             except Exception as e:
                 logger.error(
@@ -221,14 +223,66 @@ class RecommendationAgent(BaseAgent):
         raw = await self.llm_json_call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            max_tokens=16384,
         )
 
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            repaired = _repair_truncated_json(raw)
+            if repaired is not None:
+                logger.warning(
+                    "[RecommendationAgent] JSON truncated by LLM, repaired successfully"
+                )
+                result = json.loads(repaired)
+            else:
+                raise
         if isinstance(result, dict) and "recommendations" in result:
             return result["recommendations"]
         if isinstance(result, list):
             return result
         return []
+
+    @staticmethod
+    def _normalize_recommendations(
+        recommendations: list[Any], batch: list[dict], state: PipelineState
+    ) -> list[dict]:
+        """Keep valid LLM recommendations and fill gaps with deterministic fallbacks."""
+        batch_by_id = {
+            str(entity.get("entity_id")): entity
+            for entity in batch
+            if entity.get("entity_id") is not None
+        }
+        normalized: list[dict] = []
+        seen: set[str] = set()
+        for rec in recommendations:
+            if not isinstance(rec, dict):
+                continue
+            entity_id = str(rec.get("entity_id") or "").strip()
+            entity = batch_by_id.get(entity_id)
+            if not entity or entity_id in seen:
+                continue
+            seen.add(entity_id)
+            normalized.append({
+                "entity_id": entity_id,
+                "entity_name": rec.get("entity_name") or entity.get("entity_name"),
+                "risk_score": rec.get("risk_score", entity.get("risk_score", 0)),
+                "risk_tier": rec.get("risk_tier", entity.get("risk_tier", "high")),
+                "type": rec.get("type") or "retention_intervention",
+                "urgency": rec.get("urgency") or "high",
+                "title": rec.get("title") or "Risk intervention required",
+                "reasoning": rec.get("reasoning") or "",
+                "suggested_action": rec.get("suggested_action") or "",
+            })
+
+        missing = [
+            entity
+            for entity in batch
+            if str(entity.get("entity_id")) not in seen
+        ]
+        if missing:
+            normalized.extend(RecommendationAgent._fallback_recommendations(missing, state))
+        return normalized
 
     @staticmethod
     def _fallback_recommendations(
@@ -239,7 +293,7 @@ class RecommendationAgent(BaseAgent):
         for entity in batch:
             tier = entity.get("risk_tier", "high")
             signals = entity.get("signal_values", {})
-            top_signal = max(signals, key=lambda k: signals[k]) if signals else "unknown"
+            top_signal = max(signals, key=lambda k: _to_float(signals[k])) if signals else "unknown"
 
             recs.append({
                 "entity_id": entity.get("entity_id", ""),
@@ -261,6 +315,13 @@ class RecommendationAgent(BaseAgent):
         return recs
 
 
+def _to_float(v: object) -> float:
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
     """Merge profiling fields into an entity payload (in-memory only, not persisted)."""
     if not profile:
@@ -274,6 +335,55 @@ def _augment_with_profile(entity: dict, profile: dict | None) -> dict:
     if profile_fields:
         enriched["profile"] = profile_fields
     return enriched
+
+
+def _repair_truncated_json(raw: str) -> str | None:
+    """Attempt to repair JSON truncated mid-generation by the LLM.
+
+    Tries progressively: close an unterminated string, then balance
+    remaining brackets/braces. Returns repaired JSON or None.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return None
+
+    if stripped[-1] == '"':
+        pass
+    elif stripped[-1] not in ("}", "]", '"'):
+        stripped += '"'
+
+    brackets = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in stripped:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in brackets:
+            stack.append(brackets[ch])
+        elif ch == "}":
+            if stack and stack[-1] == "}":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "]":
+                stack.pop()
+
+    closing = "".join(reversed(stack))
+    repaired = stripped + closing
+
+    if len(repaired) < len(raw.strip()):
+        return None
+
+    return repaired
 
 
 async def _load_past_recs_by_entity(
