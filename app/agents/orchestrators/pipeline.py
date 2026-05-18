@@ -12,10 +12,12 @@ Production-grade orchestration with:
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -45,6 +47,9 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.pipeline_run_repository import (
     PipelineRunRepository,
 )
+from app.infrastructure.database.repositories.schema_mapping_repository import (
+    SchemaMappingRepository,
+)
 from app.services.procedural_memory import (
     extract_and_commit_from_run,
     format_learnings_for_prompt,
@@ -64,6 +69,7 @@ _STEP_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_STEP_TIMEOUT_SECONDS", "600"))
 
 # Client DB preflight timeout (must be short to fail fast)
 _PREFLIGHT_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_PREFLIGHT_TIMEOUT_SECONDS", "10"))
+_RUN_LOG_DIR = Path(os.getenv("PIPELINE_RUN_LOG_DIR", "logs/pipeline_runs"))
 
 
 class PipelineOrchestrator:
@@ -91,7 +97,7 @@ class PipelineOrchestrator:
         await self._safe_commit("mark run running")
 
         try:
-            state = await self._build_initial_state(org_id)
+            state = await self._build_initial_state(org_id, mapping_id=run.mapping_id)
         except Exception as e:
             logger.error("[Pipeline] Failed to build initial state for %s: %s", org_id, e)
             await self._finalize_run(
@@ -103,13 +109,31 @@ class PipelineOrchestrator:
                 step_metrics=[],
                 state=None,
             )
+            _write_run_artifacts(
+                run,
+                status="failed",
+                error=f"State init failed: {e}",
+                org_id=org_id,
+                org_name=None,
+                current_step="initializing",
+                duration_ms=0,
+                step_metrics=[],
+                state=None,
+                rag_metrics=None,
+            )
             return self._empty_state(org_id, error=str(e))
+        if run.mapping_id is None and state.get("mapping_id"):
+            run.mapping_id = UUID(str(state["mapping_id"]))
+            await self._safe_commit("attach run mapping")
 
         pipeline_start = time.monotonic()
         step_metrics: list[dict] = []
 
         # Preflight: confirm the client DB is reachable before any agent runs.
-        preflight_error = await self._client_db_preflight(org_id)
+        preflight_error = await self._client_db_preflight(
+            org_id,
+            connection_id=UUID(str(state["connection_id"])),
+        )
         if preflight_error:
             logger.error(
                 "[Pipeline] Client DB preflight failed for org %s: %s",
@@ -125,6 +149,18 @@ class PipelineOrchestrator:
                 started_at=pipeline_start,
                 step_metrics=step_metrics,
                 state=state,
+            )
+            _write_run_artifacts(
+                run,
+                status="failed",
+                error=f"Client DB unreachable: {preflight_error}",
+                org_id=org_id,
+                org_name=state.get("org_name"),
+                current_step="preflight_failed",
+                duration_ms=0,
+                step_metrics=step_metrics,
+                state=state,
+                rag_metrics=None,
             )
             return state
 
@@ -160,11 +196,35 @@ class PipelineOrchestrator:
             "═══ Pipeline %s started for org '%s' (%s) ═══",
             run.id, state.get("org_name", "unknown"), org_id,
         )
+        _write_run_artifacts(
+            run,
+            status="running",
+            error=None,
+            org_id=org_id,
+            org_name=state.get("org_name"),
+            current_step=state.get("current_step"),
+            duration_ms=0,
+            step_metrics=step_metrics,
+            state=state,
+            rag_metrics=None,
+        )
 
         for step_name, agent in pipeline:
             state["current_step"] = step_name
             step_start = time.monotonic()
             step_error: str | None = None
+            _write_run_artifacts(
+                run,
+                status="running",
+                error=None,
+                org_id=org_id,
+                org_name=state.get("org_name"),
+                current_step=step_name,
+                duration_ms=int((time.monotonic() - pipeline_start) * 1000),
+                step_metrics=step_metrics,
+                state=state,
+                rag_metrics=None,
+            )
 
             for attempt in range(1, _STEP_MAX_RETRIES + 1):
                 try:
@@ -225,6 +285,18 @@ class PipelineOrchestrator:
                 current_step=step_name,
                 step_metrics=step_metrics,
             )
+            _write_run_artifacts(
+                run,
+                status="running",
+                error=state.get("error"),
+                org_id=org_id,
+                org_name=state.get("org_name"),
+                current_step=step_name,
+                duration_ms=int((time.monotonic() - pipeline_start) * 1000),
+                step_metrics=step_metrics,
+                state=state,
+                rag_metrics=None,
+            )
 
             if step_error:
                 if step_name in _NON_FATAL_STEPS:
@@ -256,7 +328,7 @@ class PipelineOrchestrator:
 
         if not state.get("error"):
             try:
-                mapping = await get_schema_mapping(self._session, org_id)
+                mapping = await self._get_schema_mapping(org_id, run.mapping_id)
                 from app.services.entity_profile_persist import (
                     persist_entity_profiles_from_pipeline,
                 )
@@ -291,23 +363,11 @@ class PipelineOrchestrator:
         pipeline_metrics = _aggregate_metrics(step_metrics, pipeline_start)
         state["pipeline_metrics"] = pipeline_metrics
 
-        await self._finalize_run(
-            run_repo, run,
-            status="failed" if state.get("error") else "succeeded",
-            error=state.get("error"),
-            current_step=state.get("current_step"),
-            started_at=pipeline_start,
-            step_metrics=step_metrics,
-            state=state,
-            rag_metrics=rag_metrics_payload,
-        )
-
         # Collect RAG latency stats accumulated by risk/rec agents into state.
         rag_stats_raw: dict[str, Any] = state.get("rag_run_stats") or {}
-
-        # RAG eval regression + TTL cleanup — both non-fatal, run regardless of pipeline outcome.
         rag_metrics_payload: dict[str, Any] = {"latency": rag_stats_raw}
 
+        # RAG eval regression + TTL cleanup — both non-fatal.
         try:
             from app.services.rag_eval import run_rag_eval_regression
 
@@ -328,6 +388,17 @@ class PipelineOrchestrator:
             logger.warning("[Pipeline] Qdrant TTL cleanup failed: %s", e)
 
         state["rag_metrics"] = rag_metrics_payload
+
+        await self._finalize_run(
+            run_repo, run,
+            status="failed" if state.get("error") else "succeeded",
+            error=state.get("error"),
+            current_step=state.get("current_step"),
+            started_at=pipeline_start,
+            step_metrics=step_metrics,
+            state=state,
+            rag_metrics=rag_metrics_payload,
+        )
 
         if not state.get("error"):
             try:
@@ -357,6 +428,18 @@ class PipelineOrchestrator:
             pipeline_metrics["total_tool_calls"],
             pipeline_metrics["total_tokens"],
             pipeline_metrics["provider_fallbacks"],
+        )
+        _write_run_artifacts(
+            run,
+            status="failed" if state.get("error") else "succeeded",
+            error=state.get("error"),
+            org_id=org_id,
+            org_name=state.get("org_name"),
+            current_step=state.get("current_step"),
+            duration_ms=pipeline_metrics["total_duration_ms"],
+            step_metrics=step_metrics,
+            state=state,
+            rag_metrics=rag_metrics_payload,
         )
 
         # Procedural memory commit: extract a durable learning from this run.
@@ -398,6 +481,14 @@ class PipelineOrchestrator:
                 raise ValueError(f"PipelineRun {run_id} not found")
             return existing
         return await repo.create_queued(org_id, trigger_source=trigger_source)
+
+    async def _get_schema_mapping(self, org_id: UUID, mapping_id: UUID | None):
+        if mapping_id is None:
+            return await get_schema_mapping(self._session, org_id)
+        mapping = await SchemaMappingRepository(self._session).get_by_id(mapping_id)
+        if mapping is None or mapping.org_id != org_id:
+            raise ValueError(f"SchemaMapping {mapping_id} not found")
+        return mapping
 
     async def _safe_commit(self, label: str) -> None:
         try:
@@ -474,16 +565,25 @@ class PipelineOrchestrator:
 
     # ─── Preflight ──────────────────────────────────────────────────────
 
-    async def _client_db_preflight(self, org_id: UUID) -> str | None:
+    async def _client_db_preflight(
+        self, org_id: UUID, *, connection_id: UUID | None = None
+    ) -> str | None:
         """Return None on success or a short error string on failure."""
         from sqlalchemy import select
 
         try:
-            result = await self._session.execute(
-                select(Connection).where(Connection.org_id == org_id).limit(1)
+            stmt = select(Connection).where(
+                Connection.org_id == org_id,
+                Connection.deleted_at.is_(None),
             )
+            if connection_id is not None:
+                stmt = stmt.where(Connection.id == connection_id)
+            stmt = stmt.limit(1)
+            result = await self._session.execute(stmt)
             conn = result.scalar_one_or_none()
             if not conn:
+                if connection_id is not None:
+                    return "Mapped connection is missing or has been deleted"
                 return "No connection configured for this organisation"
             dsn = decrypt_dsn(conn.encrypted_dsn)
             if parse_pulse_api_payload(dsn) is not None:
@@ -517,17 +617,20 @@ class PipelineOrchestrator:
 
     # ─── Initial state ──────────────────────────────────────────────────
 
-    async def _build_initial_state(self, org_id: UUID) -> PipelineState:
+    async def _build_initial_state(
+        self, org_id: UUID, *, mapping_id: UUID | None = None
+    ) -> PipelineState:
         org_repo = OrganizationRepository(self._session)
         org = await org_repo.get_by_id(org_id)
         if not org:
             raise ValueError(f"Organisation {org_id} not found")
 
-        mapping = await get_schema_mapping(self._session, org_id)
+        mapping = await self._get_schema_mapping(org_id, mapping_id)
 
         state: PipelineState = {
             "org_id": str(org_id),
             "org_name": org.name,
+            "mapping_id": str(mapping.id),
             "entity_label": org.entity_label or "entities",
             "goal_label": org.goal_label or "improve operations",
             "business_context": org.business_context or "",
@@ -599,3 +702,99 @@ def _aggregate_metrics(step_metrics: list[dict], pipeline_start: float) -> dict[
         "providers_used": sorted(all_providers),
         "steps": step_metrics,
     }
+
+
+def _write_run_artifacts(
+    run: PipelineRun,
+    *,
+    status: str,
+    error: str | None,
+    org_id: UUID,
+    org_name: str | None,
+    current_step: str | None,
+    duration_ms: int,
+    step_metrics: list[dict],
+    state: PipelineState | None,
+    rag_metrics: dict[str, Any] | None,
+) -> None:
+    """Write compact per-run artifacts for local debugging outside Docker logs."""
+    try:
+        _RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_org = _slug(org_name or str(org_id))
+        stem = f"{safe_org}_{run.id}"
+        is_terminal = status in {"succeeded", "failed", "cancelled"}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        artifact = {
+            "run_id": str(run.id),
+            "org_id": str(org_id),
+            "org_name": org_name,
+            "mapping_id": str(run.mapping_id) if run.mapping_id else (state or {}).get("mapping_id"),
+            "trigger_source": run.trigger_source,
+            "status": status,
+            "current_step": current_step,
+            "error": error,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+            "updated_at": now_iso,
+            "completed_at": now_iso if is_terminal else None,
+            "duration_ms": duration_ms,
+            "step_metrics": step_metrics,
+            "risk_summary": (state or {}).get("risk_summary") or {},
+            "recommendation_stats": (state or {}).get("recommendation_stats") or {},
+            "profile_stats": (state or {}).get("profile_stats") or {},
+            "model_metrics": (state or {}).get("model_metrics") or {},
+            "generation_caps": (state or {}).get("generation_caps") or {},
+            "pipeline_metrics": (state or {}).get("pipeline_metrics") or {},
+            "rag_metrics": rag_metrics or {},
+            "procedural_learnings": (state or {}).get("procedural_learnings") or [],
+            "counts": {
+                "entity_profiles": len((state or {}).get("entity_profiles") or []),
+                "scored_entities": len((state or {}).get("scored_entities") or []),
+                "recommendations": len((state or {}).get("recommendations") or []),
+            },
+            "samples": {
+                "scored_entities": ((state or {}).get("scored_entities") or [])[:20],
+                "recommendations": ((state or {}).get("recommendations") or [])[:20],
+                "reasoning_log": ((state or {}).get("reasoning_log") or [])[:20],
+            },
+        }
+        json_path = _RUN_LOG_DIR / f"{stem}.json"
+        txt_path = _RUN_LOG_DIR / f"{stem}.log"
+        json_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
+        txt_path.write_text(_format_run_log(artifact), encoding="utf-8")
+        logger.info("[Pipeline] Wrote run artifacts: %s and %s", json_path, txt_path)
+    except Exception as exc:
+        logger.warning("[Pipeline] Failed to write run artifacts: %s", exc)
+
+
+def _format_run_log(artifact: dict[str, Any]) -> str:
+    lines = [
+        f"Pipeline Run: {artifact['run_id']}",
+        f"Org: {artifact.get('org_name')} ({artifact.get('org_id')})",
+        f"Status: {artifact.get('status')} step={artifact.get('current_step')}",
+        f"Duration: {artifact.get('duration_ms')}ms",
+        f"Error: {artifact.get('error') or '-'}",
+        "",
+        "Step Metrics:",
+    ]
+    for step in artifact.get("step_metrics") or []:
+        lines.append(
+            f"- {step.get('step')}: ok={step.get('success')} "
+            f"ms={step.get('duration_ms')} llm={step.get('llm_calls', 0)} "
+            f"tools={step.get('tool_calls', 0)} tokens={step.get('total_tokens', 0)} "
+            f"error={step.get('error') or '-'}"
+        )
+    lines.extend([
+        "",
+        f"Risk Summary: {json.dumps(artifact.get('risk_summary') or {}, default=str)}",
+        f"Recommendation Stats: {json.dumps(artifact.get('recommendation_stats') or {}, default=str)}",
+        f"Profile Stats: {json.dumps(artifact.get('profile_stats') or {}, default=str)}",
+        f"RAG Metrics: {json.dumps(artifact.get('rag_metrics') or {}, default=str)}",
+        "",
+        "Full samples and reasoning snippets are in the matching JSON artifact.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _slug(value: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")[:48] or "org"

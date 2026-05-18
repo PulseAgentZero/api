@@ -23,7 +23,7 @@ SCHEMA_INTELLIGENCE_PROMPT = """You are Pulse's Schema Intelligence Agent — th
 You MUST follow these steps IN ORDER. Do NOT skip steps.
 
 ### Step 1: Discovery
-Call `list_tables` to see every table in the database. Record the full list.
+Call `list_tables` **exactly once** to see every table in the database. Record the full list. Do not call `list_tables` again.
 
 ### Step 2: Validate Mapped Columns
 For EACH column in the mapped configuration above, call `validate_column_exists` to confirm it exists in the live database. Record which ones are confirmed vs missing.
@@ -32,7 +32,7 @@ For EACH column in the mapped configuration above, call `validate_column_exists`
 For each table discovered, call `get_row_count` to understand the data volume. This tells downstream agents how much data to expect.
 
 ### Step 4: Relationship Detection
-For each non-entity table, examine its columns. Look for columns that share names with the entity table's ID column — these are likely foreign keys (join keys). Call `query_related_table` with limit=5 on promising tables to verify the data structure.
+For each non-entity table, look for columns whose name matches or closely resembles the entity ID column (`{entity_id_col}`). Only call `query_related_table` with limit=5 on tables where you can see a plausible join key — not on every table.
 
 ### Step 5: Column Classification
 For every table, classify each column into one of these semantic types:
@@ -44,7 +44,7 @@ For every table, classify each column into one of these semantic types:
 - `boolean`: flags, yes/no indicators
 
 ### Step 6: Synthesis
-Combine your findings into the structured output.
+Combine your findings into the structured output. Include in `related_tables` **every** table where you found a plausible join key, even if the tool results from those calls are no longer visible in your recent context — reconstruct from your earlier findings and do not omit them.
 
 ## Output Format (JSON)
 {{

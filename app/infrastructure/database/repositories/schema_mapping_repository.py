@@ -41,6 +41,7 @@ class SchemaMappingRepository:
         risk_config: dict | None = None,
         raw_schema: dict | None = None,
         target_column: str | None = None,
+        rag_config: dict | None = None,
     ) -> SchemaMapping:
         mapping = SchemaMapping(
             org_id=org_id,
@@ -53,6 +54,7 @@ class SchemaMappingRepository:
             risk_config=risk_config,
             raw_schema=raw_schema,
             target_column=target_column,
+            rag_config=rag_config,
         )
         self.db.add(mapping)
         await self.db.flush()
