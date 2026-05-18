@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies.api_key_auth import require_api_key
 from app.api.public.envelope import envelope
+from app.api.public.schemas import AnalyticsOverviewResponse, AnalyticsPeriod, PublicErrorResponse
 from app.infrastructure.database.models.entity_profile import EntityProfile
 from app.infrastructure.database.models.pipeline_run import PipelineRun
 from app.infrastructure.database.models.recommendation import Recommendation
@@ -18,17 +20,36 @@ from app.infrastructure.database.session import get_db
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
 
+_READ_ERRORS = {
+    401: {"model": PublicErrorResponse, "description": "Invalid or expired API key"},
+    429: {"model": PublicErrorResponse, "description": "Rate limit exceeded"},
+}
+
 
 @router.get(
     "/overview",
+    response_model=AnalyticsOverviewResponse,
     summary="Analytics overview",
-    description="Returns aggregate risk and performance stats for your org over the requested period.",
+    response_description="Org-level risk and activity aggregates for the selected period.",
+    responses=_READ_ERRORS,
 )
 async def get_overview(
-    period: str = Query("30d", description="7d | 30d | 90d"),
+    period: Annotated[
+        AnalyticsPeriod,
+        Query(description="Rolling window for pipeline run counts."),
+    ] = "30d",
     ctx=Depends(require_api_key("read")),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Returns a snapshot of your organization's intelligence layer:
+
+    - **total_entities** — latest profiled entities
+    - **risk_distribution** — counts per tier (High / Medium / Low / Healthy)
+    - **average_risk_score** — mean score across latest profiles
+    - **open_recommendations** — recommendations with `status=open`
+    - **pipeline_runs_in_period** — runs started within the lookback window
+    """
     org_id = UUID(ctx.org_id)
     days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
     since = datetime.now(timezone.utc) - timedelta(days=days)

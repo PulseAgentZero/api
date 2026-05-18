@@ -37,6 +37,7 @@ from app.api.public import (
     public_recommendations_router,
     public_studio_router,
 )
+from app.api.public.openapi import configure_public_openapi
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
@@ -197,23 +198,16 @@ app.include_router(studio_router,          prefix="/api/v1")
 # Mounted as a sub-application so it has its own /docs, /redoc, /openapi.json.
 
 _public_tags = [
-    {"name": "Entities",        "description": "Read profiled entities and risk scores"},
-    {"name": "Recommendations", "description": "Read and action recommendations"},
-    {"name": "Pipeline",        "description": "Trigger pipeline runs and check status"},
-    {"name": "Analytics",       "description": "Aggregate risk and performance data"},
-    {"name": "Studio",          "description": "Public shareable dashboards"},
+    {"name": "Entities"},
+    {"name": "Recommendations"},
+    {"name": "Pipeline"},
+    {"name": "Analytics"},
+    {"name": "Studio"},
 ]
 
 public_app = FastAPI(
-    title="Pulse — Public API",
-    description=(
-        "Public API for external developers and integrations.\n\n"
-        "**Auth:** `X-API-Key: <your_api_key>` (generate keys in Settings → API Keys)\n\n"
-        "**Scopes:** `read` — GET endpoints only. `write` — GET + POST/PATCH.\n\n"
-        "**Rate limits:** When `REDIS_URL` is set: 30 req/min (read-scoped keys), 10 req/min (write-scoped keys), per API key. Without Redis, limits are not enforced.\n\n"
-        "**Errors:** `{ \"error\": { \"code\": \"string\", \"message\": \"string\" } }`\n\n"
-        "**Response envelope:** All responses wrap data in `{ \"data\": { ... }, \"meta\": { \"org_id\": \"...\" } }`"
-    ),
+    title="Pulse Public API",
+    description="See the overview below for authentication, envelopes, and rate limits.",
     version="1.0.0",
     contact={"name": "Pulse Support", "email": "support@pulseai.io"},
     openapi_tags=_public_tags,
@@ -222,6 +216,7 @@ public_app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+configure_public_openapi(public_app)
 attach_exception_handlers(public_app)
 
 public_app.include_router(public_entities_router,        prefix="/v1")

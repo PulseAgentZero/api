@@ -1,5 +1,5 @@
 def envelope(data: dict | list, org_id: str) -> dict:
-    """Wraps public API responses in a consistent envelope."""
+    """Wrap payload in the public API `{ data, meta }` envelope (see ReDoc overview)."""
     return {
         "data": data,
         "meta": {

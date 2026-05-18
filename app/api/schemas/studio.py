@@ -332,19 +332,44 @@ class StudioDashboardExecuteResponse(BaseModel):
 # ── Public dashboard response ─────────────────────────────────────────────────
 
 class PublicVisualizationResponse(BaseModel):
+    """One chart on a public Studio dashboard, including live query results."""
+
     id: UUID
-    name: str
-    chart_type: str
-    config: dict[str, Any]
-    column_formats: dict[str, Any]
-    query_result: StudioQueryResultResponse | None
+    name: str = Field(..., description="Visualization title shown in the dashboard UI.")
+    chart_type: str = Field(
+        ...,
+        description="Chart renderer key (e.g. bar, line, table, number).",
+    )
+    config: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Axis, color, and display options for the chart type.",
+    )
+    column_formats: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Per-column formatting rules (currency, percent, badges, etc.).",
+    )
+    query_result: StudioQueryResultResponse | None = Field(
+        None,
+        description="Executed query rows for this chart. Null if the query failed at render time.",
+    )
 
 
 class PublicDashboardResponse(BaseModel):
+    """Rendered public Studio dashboard (not wrapped in the API-key `data` envelope)."""
+
     id: UUID
     name: str
-    description: str | None
-    slug: str
-    layout: list[Any]
-    dashboard_params: list[Any]
-    visualizations: list[PublicVisualizationResponse]
+    description: str | None = Field(None, description="Optional dashboard subtitle or context.")
+    slug: str = Field(..., description="Shareable URL slug when the dashboard is public.")
+    layout: list[Any] = Field(
+        ...,
+        description="Grid layout items (`x`, `y`, `w`, `h`) for each panel.",
+    )
+    dashboard_params: list[Any] = Field(
+        default_factory=list,
+        description="Filter definitions visitors can pass as query parameters.",
+    )
+    visualizations: list[PublicVisualizationResponse] = Field(
+        ...,
+        description="Charts on the dashboard, each with up to 500 rows of query data.",
+    )

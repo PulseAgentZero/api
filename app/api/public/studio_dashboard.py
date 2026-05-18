@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Annotated
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Path, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import not_found, rate_limited
+from app.api.public.schemas import PublicErrorResponse
 from app.api.schemas.studio import (
     PublicDashboardResponse,
     PublicVisualizationResponse,
@@ -40,6 +43,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/studio", tags=["Studio"])
 
 _PUBLIC_RL_LIMIT = 60
+
+_STUDIO_ERRORS = {
+    404: {"model": PublicErrorResponse, "description": "Dashboard or token not found"},
+    429: {"model": PublicErrorResponse, "description": "Per-IP rate limit exceeded (60/min)"},
+}
 
 
 async def _apply_rate_limit(request: Request, redis) -> None:
@@ -117,22 +125,46 @@ async def _render_dashboard(
     )
 
 
-@router.get("/dashboards/{slug}", response_model=PublicDashboardResponse, summary="View public dashboard by slug")
+@router.get(
+    "/dashboards/{slug}",
+    response_model=PublicDashboardResponse,
+    summary="View public dashboard by slug",
+    response_description="Rendered dashboard with chart data (no API key).",
+    responses=_STUDIO_ERRORS,
+    openapi_extra={"security": []},
+)
 async def get_public_dashboard(
-    slug: str,
+    slug: Annotated[
+        str,
+        Path(
+            description="Shareable slug from Studio (set when `is_public=true` on the dashboard).",
+            examples=["q4-churn-overview"],
+        ),
+    ],
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> PublicDashboardResponse:
-    """View a public dashboard by its shareable slug. No authentication required.
+    """
+    Load a **public** Pulse Studio dashboard by its slug. **No `X-API-Key` header required.**
 
-    **Query params:** Any dashboard filter values can be passed as query parameters.
-    Example: `?start_date=2025-01-01&region=US` — these are forwarded to all charts.
+    Visitors and embedded iframes use this URL. The dashboard owner must have enabled
+    **Make public** in Studio, which assigns the slug.
 
-    **Rate limit:** 60 requests/minute per IP address.
+    ### Dashboard filters
 
-    **Errors:**
-    - 404 — dashboard not found or is not public.
-    - 429 RATE_LIMITED — too many requests from this IP.
+    Pass filter values as **query parameters** — they are forwarded to every chart query.
+    Parameter names match `dashboard_params[].name` from the dashboard definition.
+
+    Example: `GET /v1/studio/dashboards/q4-churn?region=US&start_date=2025-01-01`
+
+    ### Rate limit
+
+    **60 requests / minute / IP** when Redis is configured.
+
+    ### Errors
+
+    - **404** — unknown slug, or dashboard exists but is not public.
+    - **429** — rate limit exceeded.
     """
     redis = await get_redis()
     await _apply_rate_limit(request, redis)
@@ -145,26 +177,46 @@ async def get_public_dashboard(
     return await _render_dashboard(dashboard, db, redis, param_values=param_values)
 
 
-@router.get("/embed/{token}", response_model=PublicDashboardResponse, summary="View private dashboard via embed token")
+@router.get(
+    "/embed/{token}",
+    response_model=PublicDashboardResponse,
+    summary="View dashboard via embed token",
+    response_description="Rendered private dashboard using a time-limited token (no API key).",
+    responses=_STUDIO_ERRORS,
+    openapi_extra={"security": []},
+)
 async def get_embed_dashboard(
-    token: str,
+    token: Annotated[
+        str,
+        Path(
+            description="Opaque embed token from `POST /api/v1/studio/dashboards/{id}/embed-token`.",
+        ),
+    ],
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> PublicDashboardResponse:
-    """View a private dashboard using a time-limited embed token. No authentication required.
+    """
+    Load a **private** dashboard using a short-lived embed token. **No API key required.**
 
-    Tokens are generated via `POST /api/v1/studio/dashboards/{id}/embed-token`
-    and are valid for the configured duration (default 24h, max 30 days).
+    Tokens are created by authenticated Studio users via:
 
-    Intended for `<iframe>` embedding in internal tools and external portals.
+    `POST /api/v1/studio/dashboards/{dashboard_id}/embed-token`
 
-    **Query params:** Dashboard filter values can be passed as query parameters.
+    Default TTL is **24 hours** (configurable up to 30 days). Use the returned URL in an
+    `<iframe src="https://your-api/api/public/v1/studio/embed/{token}">`.
 
-    **Rate limit:** 60 requests/minute per IP.
+    ### Dashboard filters
 
-    **Errors:**
-    - 404 — token not found, expired, or dashboard was deleted.
-    - 429 RATE_LIMITED — too many requests from this IP.
+    Same as the slug endpoint — pass filter names as query parameters.
+
+    ### Rate limit
+
+    **60 requests / minute / IP** when Redis is configured.
+
+    ### Errors
+
+    - **404** — token missing, expired, invalid, or dashboard deleted. Also returned when Redis is not configured.
+    - **429** — rate limit exceeded.
     """
     redis = await get_redis()
     if redis is None:
@@ -181,7 +233,6 @@ async def get_embed_dashboard(
         expires_at = datetime.fromisoformat(payload["expires_at"])
         if expires_at < datetime.now(timezone.utc):
             raise not_found("Embed token has expired")
-        from uuid import UUID
         dashboard_id = UUID(payload["dashboard_id"])
     except (KeyError, ValueError) as exc:
         raise not_found("Invalid embed token") from exc
