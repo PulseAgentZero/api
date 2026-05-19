@@ -58,6 +58,37 @@ _HELP_PATTERNS = (
     "how to use", "what can i ask",
 )
 
+_PIPELINE_PATTERNS = (
+    "pipeline", "last run", "latest run", "analysis run", "autonomous run",
+    "last analysis", "latest analysis",
+)
+
+_PIPELINE_DETAIL_PATTERNS = (
+    "step", "steps", "how long", "duration", "model accuracy", "model performance",
+    "f1 score", "f1", "auc", "feature importance", "risk driver", "risk drivers",
+    "how many steps", "what steps", "ml model", "machine learning",
+)
+
+_OUTCOME_PATTERNS = (
+    "churn", "churned", "churn rate", "how many.*churn", "retention",
+    "attrition", "lost customer", "customer loss",
+    "default", "defaulted", "fraud", "fraudulent",
+    "readmit", "readmission", "readmitted",
+    "delayed", "failed delivery", "missed",
+    "outcome", "target rate", "positive rate",
+)
+
+_TREND_PATTERNS = (
+    "trend", "over time", "history", "historical", "evolution",
+    "changed over", "trajectory", "progress",
+)
+
+_COMPARE_PATTERNS = (
+    "compare", "comparison", "diff", "difference", "changed since",
+    "vs last", "versus last", "since last run", "delta",
+    "what changed", "any changes",
+)
+
 _OFF_TOPIC_PATTERNS = (
     "weather", "joke", "tell me a story", "are you real", "are you human",
     "your favorite", "what's your name", "who made you", "write code", "write me code",
@@ -65,6 +96,31 @@ _OFF_TOPIC_PATTERNS = (
     "news", "stock price", "bitcoin", "movie", "music", "song", "recipe",
     "what time", "what day", "what year",
 )
+
+_TIME_PRESSURE_PATTERNS = (
+    "48 hour", "48h", "24 hour", "24h", "within", "deadline", "urgent", "asap",
+    "due today", "by tomorrow", "time-sensitive",
+)
+
+
+def message_mentions_pipeline(message: str) -> bool:
+    """True when the user is asking about autonomous pipeline / analysis runs."""
+    lower = message.lower()
+    return any(p in lower for p in _PIPELINE_PATTERNS)
+
+
+def apply_pipeline_intent_override(intent: IntentResult, message: str) -> IntentResult:
+    """Never short-circuit pipeline questions as off_topic."""
+    if intent.intent == "off_topic" and message_mentions_pipeline(message):
+        return IntentResult(
+            intent="lookup_pipeline",
+            confidence=max(intent.confidence, 0.85),
+            entity_ids=intent.entity_ids,
+            tier_filter=intent.tier_filter,
+            urgency_filter=intent.urgency_filter,
+            raw=intent.raw,
+        )
+    return intent
 
 
 def _heuristic_fallback(message: str) -> IntentResult:
@@ -80,6 +136,16 @@ def _heuristic_fallback(message: str) -> IntentResult:
             return IntentResult("greeting", 0.85)
     if any(p in lower for p in _HELP_PATTERNS):
         return IntentResult("help", 0.8)
+    if any(p in lower for p in _PIPELINE_DETAIL_PATTERNS):
+        return IntentResult("lookup_pipeline_detail", 0.80)
+    if message_mentions_pipeline(message):
+        return IntentResult("lookup_pipeline", 0.85)
+    if any(p in lower for p in _OUTCOME_PATTERNS):
+        return IntentResult("lookup_outcome", 0.80, entity_ids=ids)
+    if any(p in lower for p in _COMPARE_PATTERNS):
+        return IntentResult("compare_runs", 0.80)
+    if any(p in lower for p in _TREND_PATTERNS) and ids:
+        return IntentResult("lookup_entity_trend", 0.80, entity_ids=ids)
     if any(p in lower for p in _OFF_TOPIC_PATTERNS):
         return IntentResult("off_topic", 0.75)
 
@@ -92,12 +158,13 @@ def _heuristic_fallback(message: str) -> IntentResult:
     # is a reasoning question, not a lookup.
     if any(kw in lower for kw in ("why", "explain", "compare ", "vs ", "versus", "trend", "drove", "caused")):
         return IntentResult("compare_or_explain", 0.65, entity_ids=ids)
+    if "recommend" in lower or "action" in lower or "plate" in lower:
+        urgency = "high" if any(p in lower for p in _TIME_PRESSURE_PATTERNS) else None
+        return IntentResult("lookup_recommendations", 0.6, urgency_filter=urgency)
     if ids:
         return IntentResult("lookup_entity", 0.7, entity_ids=ids)
     if any(kw in lower for kw in ("overview", "snapshot", "status", "doing", "how are we")):
         return IntentResult("lookup_overview", 0.65)
-    if "recommend" in lower or "action" in lower or "plate" in lower:
-        return IntentResult("lookup_recommendations", 0.6)
     if any(kw in lower for kw in ("critical", "high risk", "high-risk", "at risk", "list", "show")):
         tier = "critical" if "critical" in lower else ("high" if "high" in lower else None)
         return IntentResult("lookup_entities", 0.6, tier_filter=tier)
@@ -179,10 +246,15 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "greeting": None,
     "help": None,
     "off_topic": None,
+    "lookup_pipeline": ("get_pipeline_status",),
+    "lookup_pipeline_detail": ("get_pipeline_detail", "get_pipeline_status"),
     "lookup_overview": ("get_overview",),
     "lookup_entity": ("get_entity_detail", "find_similar_entities"),
     "lookup_entities": ("get_entities", "get_overview"),
     "lookup_recommendations": ("get_recommendations", "get_entity_detail"),
+    "lookup_outcome": ("get_outcome_analysis", "get_overview"),
+    "lookup_entity_trend": ("get_entity_trend", "get_entity_detail"),
+    "compare_runs": ("compare_pipeline_runs", "get_pipeline_status"),
     "find_similar": ("find_similar_entities", "get_entity_detail"),
     "generate_draft": ("generate_action_draft", "get_entity_detail"),
     "compare_or_explain": None,
@@ -193,15 +265,23 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
 # When confidence >= threshold AND params are sufficient, skip the ReAct loop
 # entirely and call this single tool directly.
 _FASTPATH_TOOL: dict[str, str] = {
+    "lookup_pipeline": "get_pipeline_status",
+    "lookup_pipeline_detail": "get_pipeline_detail",
     "lookup_overview": "get_overview",
     "lookup_entity": "get_entity_detail",
     "lookup_recommendations": "get_recommendations",
+    "lookup_outcome": "get_outcome_analysis",
+    "lookup_entity_trend": "get_entity_trend",
+    "compare_runs": "compare_pipeline_runs",
     "find_similar": "find_similar_entities",
     "generate_draft": "generate_action_draft",
 }
 
 
-def build_fastpath_args(intent: IntentResult) -> Optional[tuple[str, dict]]:
+def build_fastpath_args(
+    intent: IntentResult,
+    user_message: str | None = None,
+) -> Optional[tuple[str, dict]]:
     """For a high-confidence intent, return (tool_name, args) to execute directly.
 
     Returns None when fast-path isn't applicable (intent doesn't map, or required
@@ -210,14 +290,25 @@ def build_fastpath_args(intent: IntentResult) -> Optional[tuple[str, dict]]:
     tool = _FASTPATH_TOOL.get(intent.intent)
     if not tool:
         return None
+    if tool == "get_pipeline_status":
+        return tool, {}
+    if tool == "get_pipeline_detail":
+        return tool, {}
     if tool == "get_overview":
         return tool, {}
+    if tool == "get_outcome_analysis":
+        return tool, {}
+    if tool == "compare_pipeline_runs":
+        return tool, {}
     if tool == "get_recommendations":
-        args: dict = {}
+        args: dict = {"limit": 15}
+        lower = (user_message or "").lower()
         if intent.urgency_filter:
             args["urgency"] = intent.urgency_filter
+        elif any(p in lower for p in _TIME_PRESSURE_PATTERNS):
+            args["urgency"] = "high"
         return tool, args
-    if tool in ("get_entity_detail", "find_similar_entities"):
+    if tool in ("get_entity_detail", "find_similar_entities", "get_entity_trend"):
         if not intent.entity_ids:
             return None
         return tool, {"entity_id": intent.entity_ids[0]}
@@ -225,6 +316,101 @@ def build_fastpath_args(intent: IntentResult) -> Optional[tuple[str, dict]]:
         if not intent.entity_ids:
             return None
         return tool, {"entity_id": intent.entity_ids[0], "action_type": "message"}
+    return None
+
+
+_AFFIRMATIVE_TOKENS = frozenset({
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please", "do it",
+    "go ahead", "sounds good", "let's do it", "lets do it", "y",
+})
+
+_VAGUE_FOLLOWUP_PHRASES = (
+    "tell me about it", "tell me more", "more about that", "what about it",
+    "go on", "continue", "and?", "so?",
+)
+
+
+def _last_assistant_text(conversation_messages: list[dict]) -> str:
+    for msg in reversed(conversation_messages):
+        if msg.get("role") == "assistant":
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
+
+
+def resolve_followup_query(
+    conversation_messages: list[dict],
+    user_message: str,
+) -> str | None:
+    """Rewrite short affirmations / vague follow-ups into a concrete data query.
+
+    Extracts the specific offer or action from the assistant's last message
+    and rewrites the user's 'yes' / 'sure' / 'tell me more' into the
+    concrete query that fulfills that offer.
+    """
+    if not user_message or not conversation_messages:
+        return None
+    lower = user_message.lower().strip()
+    assistant = _last_assistant_text(conversation_messages).lower()
+
+    is_affirmative = (
+        lower in _AFFIRMATIVE_TOKENS
+        or lower.startswith("yes ")
+        or lower == "yes"
+    )
+    is_vague = (
+        lower in _VAGUE_FOLLOWUP_PHRASES
+        or (lower.startswith("okay") and len(lower) < 40)
+        or (len(lower) < 20 and "about it" in lower)
+    )
+    if not is_affirmative and not is_vague:
+        return None
+
+    # Priority 1: The assistant offered to dig into a specific entity.
+    # Patterns like "dig into 628", "zoom in on 1613", "pull up 42".
+    entity_offer = re.search(
+        r"(?:dig into|zoom in on|pull up|look at|check on|details (?:for|on))\s+"
+        r"(?:entity\s+|customer\s+|#)?(\d{1,6}|[A-Z]{2,}-?\d{2,})",
+        assistant,
+    )
+    if entity_offer:
+        return f"tell me about entity {entity_offer.group(1)}"
+
+    # Priority 2: The assistant mentioned specific entities by ID in an offer.
+    # e.g. "Want me to pull 628's full profile?"
+    id_in_offer = re.search(
+        r"(?:want me to|shall i|i can|let me)\s+.{0,40}?\b(\d{2,6}|[A-Z]{2,}-?\d{2,})\b",
+        assistant,
+    )
+    if id_in_offer:
+        return f"tell me about entity {id_in_offer.group(1)}"
+
+    # Priority 3: The assistant offered to pull a specific list.
+    if "top 3" in assistant or "top three" in assistant:
+        return "show the top 3 at-risk entities"
+    if re.search(r"pull\s+(?:the\s+)?(?:broader\s+)?overview", assistant):
+        return "what's our status?"
+    if re.search(r"pull\s+(?:the\s+)?(?:full\s+)?list", assistant):
+        return "show all high-risk entities"
+
+    # Priority 4: Topic-level matching.
+    if "critical" in assistant and ("entit" in assistant or "customer" in assistant):
+        return "show critical entities"
+    if "high" in assistant and "risk" in assistant:
+        return "show high-risk entities"
+    if "recommendation" in assistant or "action" in assistant:
+        return "what recommendations can you give me?"
+    if "pipeline" in assistant or "last run" in assistant or "latest run" in assistant:
+        return "what was my latest pipeline run about?"
+    if "similar" in assistant or "lookalike" in assistant:
+        return "find similar entities"
+    if "status" in assistant or "overview" in assistant or "entity list" in assistant:
+        return "what's our status?"
+
+    # Default for uncategorized affirmatives: overview.
+    if is_affirmative or is_vague:
+        return "what's our status?"
     return None
 
 

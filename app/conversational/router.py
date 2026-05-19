@@ -184,11 +184,15 @@ async def chat(
             media_type="text/event-stream",
         )
 
-    reply_text = await run_agent(db, current_user, messages)
+    reply_text = await run_agent(db, current_user, messages, conversation_id=conv_id)
 
     assistant_msg = {"role": "assistant", "content": reply_text}
     await repo.append_messages(conv_id, assistant_msg)
     await db.commit()
+    logger.info(
+        "[Chat] turn complete conversation_id=%s user_id=%s",
+        conv_id, current_user.id,
+    )
 
     return ChatResponse(reply=reply_text, conversation_id=conv_id)
 
@@ -225,7 +229,7 @@ async def chat_without_path_conversation(
             media_type="text/event-stream",
         )
 
-    reply_text = await run_agent(db, current_user, messages)
+    reply_text = await run_agent(db, current_user, messages, conversation_id=conv.id)
 
     assistant_msg = {"role": "assistant", "content": reply_text}
     await repo.append_messages(conv.id, assistant_msg)

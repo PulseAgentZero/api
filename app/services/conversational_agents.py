@@ -1,12 +1,8 @@
 """Specialized conversational agents — Query + Synthesis split.
 
-Implements the hierarchical pattern from the Weaviate Agentic Architectures e-book:
-a Query Agent does retrieval (read-only data tools) and produces a structured
-data dict; a Synthesis Agent consumes that data + the user's question and writes
-the final natural-language reply.
+Implements a hierarchical pattern. A Query Agent does retrieval (read-only data tools) and produces a structured data dict; a Synthesis Agent consumes that data + the user's question and writes the final natural-language reply.
 
-Feature-flagged via settings.CONV_AGENT_SPLIT_ENABLED. When off, agent_service.run
-uses the existing single-agent path. Streaming stays single-agent for now."""
+Feature-flagged via settings.CONV_AGENT_SPLIT_ENABLED. When off, agent_service.run uses the existing single-agent path. Streaming stays single-agent for now."""
 
 from __future__ import annotations
 
@@ -28,9 +24,14 @@ logger = logging.getLogger(__name__)
 # agent when the split is disabled).
 QUERY_TOOLS_NAMES = (
     "get_overview",
+    "get_pipeline_status",
+    "get_pipeline_detail",
     "get_entities",
     "get_entity_detail",
     "get_recommendations",
+    "get_outcome_analysis",
+    "get_entity_trend",
+    "compare_pipeline_runs",
     "find_similar_entities",
 )
 
@@ -130,6 +131,7 @@ async def synthesis_agent_run(
     retrieved_data: dict,
     *,
     base_system_prompt: str,
+    extra_instruction: str = "",
 ) -> str:
     """Run the Synthesis agent: produce a natural-language reply from retrieved data."""
     if not settings.is_anthropic_configured():
@@ -150,8 +152,12 @@ async def synthesis_agent_run(
     user_msg = (
         f"User question: {user_question}\n\n"
         f"Data gathered by the Query agent:\n{payload_json}\n\n"
-        "Write the reply now."
+        "Write a natural, conversational reply now as Pulse AI, an intelligent copilot. "
+        "Warm and helpful, grounded only in the data above. Never use em dashes (—) or "
+        "en dashes (–); use commas, colons, or periods instead."
     )
+    if extra_instruction.strip():
+        user_msg += f"\n\nAdditional instruction: {extra_instruction.strip()}"
     system = base_system_prompt + "\n" + _SYNTHESIS_SYSTEM
 
     try:
@@ -159,6 +165,7 @@ async def synthesis_agent_run(
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
+            temperature=0.75,
             system=system,
             messages=[{"role": "user", "content": user_msg}],
         )
