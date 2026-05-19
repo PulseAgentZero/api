@@ -17,6 +17,11 @@
 #   docker compose up                          start everything
 #   docker compose up --scale worker=4        run 4 pipeline workers
 #   docker compose up api worker              start only api + worker
+#
+# Nginx upstream DNS (reverse-proxy_nginx-network aliases):
+#   api      → pulse-api
+#   license  → pulse-license
+#   dashboard frontend (separate compose) → pulse-frontend — see docker/compose/dashboard/
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-app: &app
@@ -118,6 +123,11 @@ services:
 
   api:
     <<: *app
+    networks:
+      pulse:
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-api
     command: api
     environment:
       PULSE_SERVICE: api
@@ -239,8 +249,10 @@ services:
     ports:
       - "${LICENSE_PORT:-8072}:8002"
     networks:
-      - reverse-proxy_nginx-network 
-      - pulse
+      pulse:
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-license
     depends_on:
       postgres:
         condition: service_healthy
