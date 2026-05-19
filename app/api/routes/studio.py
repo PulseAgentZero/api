@@ -92,6 +92,19 @@ def _layout_slot_id(slot: dict) -> str:
     return str(slot.get("item_id", ""))
 
 
+def _layout_for_db(layout: list) -> list:
+    """JSON-serializable layout for JSONB (item_id must be str, not UUID)."""
+    out: list = []
+    for item in layout:
+        if hasattr(item, "model_dump"):
+            out.append(item.model_dump(mode="json"))
+        else:
+            row = dict(item)
+            row["item_id"] = str(row["item_id"])
+            out.append(row)
+    return out
+
+
 def _next_layout_y(layout: list) -> int:
     if not layout:
         return 0
@@ -1101,7 +1114,7 @@ async def create_dashboard(
         current_user.org_id, current_user.id,
         name=body.name, description=body.description,
         is_public=body.is_public, slug=slug,
-        layout=[item.model_dump() for item in body.layout],
+        layout=_layout_for_db(body.layout),
         dashboard_params=[p.model_dump() for p in body.dashboard_params],
         tags=body.tags,
         refresh_interval_seconds=body.refresh_interval_seconds,
@@ -1238,7 +1251,7 @@ async def update_dashboard(
     if body.description is not None:
         updates["description"] = body.description
     if body.layout is not None:
-        updates["layout"] = [item.model_dump() for item in body.layout]
+        updates["layout"] = _layout_for_db(body.layout)
     if body.dashboard_params is not None:
         updates["dashboard_params"] = [p.model_dump() for p in body.dashboard_params]
     if body.tags is not None:
