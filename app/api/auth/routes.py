@@ -24,7 +24,7 @@ from app.api.auth.jwt_utils import (
     parse_uuid_sub,
 )
 from app.api.auth.passwords import hash_password, verify_password
-from app.api.errors import bad_request, conflict, not_found, unauthorized
+from app.api.errors import bad_request, conflict, not_found, rate_limited, unauthorized
 from app.api.schemas.auth import (
     AcceptInviteRequest,
     ForgotPasswordRequest,
@@ -54,6 +54,20 @@ from app.services.email_queue import queue_email
 from app.infrastructure.redis import keys as redis_keys
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis import tokens as redis_tokens
+from app.infrastructure.redis.rate_limit import (
+    ACCEPT_INVITE_IP_PER_MIN,
+    FORGOT_PASSWORD_EMAIL_PER_HOUR,
+    FORGOT_PASSWORD_IP_PER_MIN,
+    LOGIN_IP_PER_MIN,
+    OAUTH_START_IP_PER_MIN,
+    REFRESH_IP_PER_MIN,
+    RESET_PASSWORD_IP_PER_MIN,
+    SIGNUP_EMAIL_PER_HOUR,
+    SIGNUP_IP_PER_MIN,
+    VERIFY_EMAIL_IP_PER_MIN,
+    enforce_auth_email_limit,
+    enforce_auth_ip_limit,
+)
 from app.services.self_hosted_instance import (
     ensure_can_create_organization,
     instance_registration_open,
@@ -122,6 +136,15 @@ async def signup(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "signup", limit=SIGNUP_IP_PER_MIN,
+        message="Too many signup attempts from this network. Try again shortly.",
+    )
+    await enforce_auth_email_limit(
+        r, str(body.email), "signup", limit=SIGNUP_EMAIL_PER_HOUR, window_sec=3600,
+        message="Too many signup attempts for this email. Try again later.",
+    )
     await ensure_can_create_organization(db)
     existing = await UserRepository(db).get_by_email(body.email)
     if existing:
@@ -190,6 +213,15 @@ async def login(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "login", limit=LOGIN_IP_PER_MIN,
+        message="Too many login attempts. Try again in a minute.",
+    )
+    await enforce_auth_email_limit(
+        r, str(body.email), "login", limit=LOGIN_IP_PER_MIN, window_sec=60,
+        message="Too many login attempts for this email. Try again in a minute.",
+    )
     user = await UserRepository(db).get_by_email(body.email)
     if not user or not user.password_hash or not verify_password(body.password, user.password_hash):
         raise unauthorized("INVALID_CREDENTIALS", "Invalid email or password")
@@ -224,8 +256,16 @@ async def login(
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def refresh(
+    body: RefreshRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
     r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "refresh", limit=REFRESH_IP_PER_MIN,
+        message="Too many token refresh attempts. Try again shortly.",
+    )
     if r is not None:
         data = await redis_tokens.get_refresh_token(body.refresh_token)
         if not data:
@@ -283,8 +323,16 @@ async def logout(
 
 
 @router.get("/verify-email")
-async def verify_email(token: str = Query(...), db: AsyncSession = Depends(get_db)) -> dict:
+async def verify_email(
+    request: Request,
+    token: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "verify_email", limit=VERIFY_EMAIL_IP_PER_MIN,
+        message="Too many verification attempts. Try again shortly.",
+    )
     if r is None:
         raise bad_request("INVALID_TOKEN", "Verification unavailable")
     uid = await redis_tokens.get_email_verify_token(token)
@@ -313,11 +361,9 @@ async def resend_verification(current_user: User = Depends(get_current_user)) ->
             "message": "Email verification requires Redis; it is not configured. "
             "Configure REDIS_URL to send verification emails.",
         }
-    # Rate limit: block if a token was set in the last 60 seconds
-    from app.infrastructure.redis.keys import email_verify_rate
-    rate_key = email_verify_rate(current_user.id)
+    rate_key = redis_keys.email_verify_rate(current_user.id)
     if await r.get(rate_key):
-        raise bad_request("RATE_LIMITED", "Please wait before requesting another verification email")
+        raise rate_limited("Please wait before requesting another verification email")
     await r.set(rate_key, "1", ex=60)
     token = await redis_tokens.set_email_verify_token(current_user.id)
     await queue_email("verification", to=current_user.email, token=token)
@@ -325,7 +371,21 @@ async def resend_verification(current_user: User = Depends(get_current_user)) ->
 
 
 @router.post("/forgot-password")
-async def forgot_password(body: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)) -> dict:
+async def forgot_password(
+    body: ForgotPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "forgot_password", limit=FORGOT_PASSWORD_IP_PER_MIN,
+        message="Too many password reset requests. Try again shortly.",
+    )
+    await enforce_auth_email_limit(
+        r, str(body.email), "forgot_password",
+        limit=FORGOT_PASSWORD_EMAIL_PER_HOUR, window_sec=3600,
+        message="Too many password reset requests for this email. Try again later.",
+    )
     user = await UserRepository(db).get_by_email(body.email)
     if user and user.is_active and await get_redis() is not None:
         try:
@@ -337,8 +397,17 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncSession = Depend
 
 
 @router.post("/reset-password")
-async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(get_db)) -> dict:
-    if await get_redis() is None:
+async def reset_password(
+    body: ResetPasswordRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "reset_password", limit=RESET_PASSWORD_IP_PER_MIN,
+        message="Too many password reset attempts. Try again shortly.",
+    )
+    if r is None:
         raise bad_request("INVALID_TOKEN", "Reset unavailable")
     uid = await redis_tokens.get_pw_reset_token(body.token)
     if not uid:
@@ -352,8 +421,6 @@ async def reset_password(body: ResetPasswordRequest, db: AsyncSession = Depends(
     user.password_hash = hash_password(body.new_password)
     await redis_tokens.delete_pw_reset_token(body.token)
     await db.commit()
-    # Invalidate all active sessions so old tokens can't be reused
-    r = await get_redis()
     if r is not None:
         from app.infrastructure.redis.keys import user_sessions_pattern
         pattern = user_sessions_pattern(user.id)
@@ -469,15 +536,20 @@ async def _load_pending_json(r, key: str) -> dict | None:
 
 @router.get("/oauth/google")
 async def oauth_google_start(
+    request: Request,
     redirect_uri: str | None = Query(None),
     intent: str = Query("login"),
 ) -> RedirectResponse:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "oauth_google", limit=OAUTH_START_IP_PER_MIN,
+        message="Too many sign-in attempts. Try again shortly.",
+    )
     if not settings.is_google_oauth_configured():
         raise HTTPException(
             status_code=501,
             detail={"code": "NOT_CONFIGURED", "message": "Google OAuth not configured"},
         )
-    r = await get_redis()
     if r is None:
         raise HTTPException(
             status_code=503,
@@ -739,8 +811,17 @@ async def oauth_google_complete_signup(
 
 
 @router.post("/accept-invite", response_model=TokenResponse)
-async def accept_invite(body: AcceptInviteRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+async def accept_invite(
+    body: AcceptInviteRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> TokenResponse:
     """Create user on ``Invitation.org_id`` with the role stored on the invitation row."""
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "accept_invite", limit=ACCEPT_INVITE_IP_PER_MIN,
+        message="Too many invite acceptance attempts. Try again shortly.",
+    )
     result = await db.execute(select(Invitation).where(Invitation.token == body.token))
     inv = result.scalar_one_or_none()
     if not inv or inv.accepted_at is not None:

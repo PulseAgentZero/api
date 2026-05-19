@@ -2,14 +2,14 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.passwords import hash_password, verify_password
 from app.api.auth.role_deps import require_role
-from app.api.errors import bad_request, conflict, not_found
+from app.api.errors import bad_request, conflict, not_found, rate_limited
 from app.api.schemas.user import (
     InviteUserRequest,
     InviteUserResponse,
@@ -26,6 +26,13 @@ from app.infrastructure.database.repositories.user_repository import UserReposit
 from app.infrastructure.database.session import get_db
 from app.services.email_queue import queue_email
 from app.infrastructure.redis import tokens as redis_tokens
+from app.infrastructure.redis.client import get_redis
+from app.infrastructure.redis.keys import invite_rl_invitation, invite_rl_org
+from app.infrastructure.redis.rate_limit import (
+    INVITE_ORG_PER_HOUR,
+    INVITE_RESEND_COOLDOWN_SEC,
+    enforce_fixed_window_limit,
+)
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -174,6 +181,14 @@ async def invite_user(
     create their account. Roles available: `manager`, `analyst`, `viewer` (admin cannot be invited).
     Returns 409 if a pending invitation already exists for that email.
     """
+    r = await get_redis()
+    await enforce_fixed_window_limit(
+        r,
+        key=invite_rl_org(current_user.org_id),
+        limit=INVITE_ORG_PER_HOUR,
+        window_sec=3600,
+        message="Too many invitations sent for this organization. Try again later.",
+    )
     if body.role == "admin":
         raise bad_request("BAD_REQUEST", "Cannot invite as admin via this endpoint")
     repo = UserRepository(db)
@@ -275,6 +290,18 @@ async def resend_invitation(
     if not inv or inv.org_id != current_user.org_id or inv.accepted_at is not None:
         raise not_found("Invitation not found or already accepted")
 
+    r = await get_redis()
+    await enforce_fixed_window_limit(
+        r,
+        key=invite_rl_org(current_user.org_id),
+        limit=INVITE_ORG_PER_HOUR,
+        window_sec=3600,
+        message="Too many invitations sent for this organization. Try again later.",
+    )
+    cooldown_key = invite_rl_invitation(invitation_id)
+    if r is not None and await r.get(cooldown_key):
+        raise rate_limited("Please wait before resending this invitation")
+
     inv.token = secrets.token_hex(32)
     inv.expires_at = datetime.now(timezone.utc) + timedelta(hours=72)
     await db.flush()
@@ -287,6 +314,8 @@ async def resend_invitation(
         org_name=org.name if org else "your organization",
         role=inv.role,
     )
+    if r is not None:
+        await r.set(cooldown_key, "1", ex=INVITE_RESEND_COOLDOWN_SEC)
     await db.commit()
     await db.refresh(inv)
     return InviteUserResponse(

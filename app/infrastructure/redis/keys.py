@@ -32,6 +32,22 @@ def rate_limit(ip: str, endpoint: str) -> str:
     return f"rate_limit:{ip}:{endpoint}"
 
 
+def auth_rl_ip(ip: str, action: str) -> str:
+    return f"auth_rl:ip:{ip}:{action}"
+
+
+def auth_rl_email(email: str, action: str) -> str:
+    return f"auth_rl:email:{email.strip().lower()}:{action}"
+
+
+def invite_rl_org(org_id) -> str:
+    return f"invite_rl:org:{org_id}"
+
+
+def invite_rl_invitation(invitation_id) -> str:
+    return f"invite_rl:inv:{invitation_id}"
+
+
 def email_verify_rate(user_id) -> str:
     """Rate limit key for resend-verification — TTL 60s."""
     return f"email_verify_rate:{user_id}"

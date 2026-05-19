@@ -43,7 +43,11 @@ Every table the application will ever need. Tables marked **[ALTER]** exist in m
 | `session:{user_id}` | 24 h | Optional: cached user session data |
 | `pipeline:lock:{org_id}` | 10 min | Distributed lock — prevents concurrent pipeline runs |
 | `pipeline:progress:{run_id}` | 1 h | SSE progress events for a run |
-| `rate_limit:{ip}:{endpoint}` | 1 min | Sliding window rate limit counters |
+| `auth_rl:ip:{ip}:{action}` | 60s (varies) | Auth endpoint per-IP counters (login, signup, etc.) |
+| `auth_rl:email:{email}:{action}` | 60s–1h | Auth per-email counters (signup, forgot-password) |
+| `invite_rl:org:{org_id}` | 1h | Invitation emails per org |
+| `invite_rl:inv:{invitation_id}` | 60s | Resend-invitation cooldown |
+| `rate_limit:{ip}:{endpoint}` | 1 min | Legacy/generic rate limit key (reserved) |
 | `org:context:{org_id}` | 5 min | Cached org + schema mapping for agents |
 
 ---
