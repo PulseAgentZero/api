@@ -9,7 +9,7 @@ from sqlalchemy import DateTime, ForeignKey, Numeric, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.infrastructure.database.base import Base, UUIDMixin
+from app.infrastructure.database.base import Base, UUIDMixin, utcnow
 
 if TYPE_CHECKING:
     from app.infrastructure.database.models.organization import Organization
@@ -29,7 +29,10 @@ class EntityRiskHistory(Base, UUIDMixin):
     risk_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False)
     risk_tier: Mapped[str] = mapped_column(Text, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=utcnow,
+        server_default=func.now(),
+        nullable=False,
     )
 
     organization: Mapped[Organization] = relationship("Organization", lazy="raise")

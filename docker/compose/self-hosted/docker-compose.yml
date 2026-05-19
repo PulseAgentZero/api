@@ -40,7 +40,8 @@ services:
       # These three override or supplement .env because they depend on the
       # internal Docker network or must be fixed regardless of user config.
       DATABASE_URL: postgresql+asyncpg://pulse:${POSTGRES_PASSWORD}@db:5432/pulse
-      LOCAL_STORAGE_PATH: /app/uploads   # must match the volume mount below
+      # Entrypoint chowns this path to uid 1001 on startup (see docker-entrypoint.sh).
+      LOCAL_STORAGE_PATH: /app/uploads
 
     volumes:
       - pulse_data:/data           # Redis persistence

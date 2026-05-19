@@ -47,9 +47,16 @@ class CreateConnectionRequest(BaseModel):
     # Airtable
     airtable_pat: str | None = None
     airtable_base_id: str | None = None
-    # Google Sheets (API key flow)
+    # Google Sheets — API key or service account JSON
+    google_auth_method: str | None = Field(
+        None,
+        description="api_key | service_account (optional; inferred from fields if omitted)",
+    )
     google_sheets_api_key: str | None = None
     google_spreadsheet_id: str | None = None
+    google_service_account_json: str | None = None
+    # BigQuery — URL plus optional service account JSON
+    bigquery_service_account_json: str | None = None
     # MongoDB
     mongodb_uri: str | None = None
     # ClickHouse HTTP alternative
@@ -61,6 +68,7 @@ class CreateConnectionRequest(BaseModel):
     s3_access_key_id: str | None = None
     s3_secret_access_key: str | None = None
     s3_region: str | None = Field("us-east-1", max_length=64)
+    s3_prefix: str | None = None
     # GCS
     gcs_bucket: str | None = None
     gcs_service_account_json: str | None = None
@@ -94,11 +102,23 @@ class CreateConnectionRequest(BaseModel):
             raise ValueError("ClickHouse requires connection_url (native DSN) or clickhouse_https_url")
         if ct == "airtable" and not (self.airtable_pat or "").strip():
             raise ValueError("airtable_pat is required")
-        if ct == "google_sheets" and (
-            not (self.google_sheets_api_key or "").strip()
-            or not (self.google_spreadsheet_id or "").strip()
-        ):
-            raise ValueError("google_sheets_api_key and google_spreadsheet_id are required")
+        if ct == "google_sheets":
+            sid = (self.google_spreadsheet_id or "").strip()
+            api = (self.google_sheets_api_key or "").strip()
+            sa = (self.google_service_account_json or "").strip()
+            if not sid:
+                raise ValueError("google_spreadsheet_id is required")
+            if not api and not sa:
+                raise ValueError(
+                    "Provide google_sheets_api_key or google_service_account_json for Google Sheets"
+                )
+        if ct == "bigquery" and (self.bigquery_service_account_json or "").strip():
+            try:
+                import json
+
+                json.loads(self.bigquery_service_account_json.strip())
+            except json.JSONDecodeError as exc:
+                raise ValueError("bigquery_service_account_json must be valid JSON") from exc
         if ct == "mongodb" and not (self.mongodb_uri or "").strip():
             raise ValueError("mongodb_uri is required")
         if ct == "s3" and (

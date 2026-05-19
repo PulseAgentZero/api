@@ -98,6 +98,7 @@ class PipelineOrchestrator:
 
         try:
             state = await self._build_initial_state(org_id, mapping_id=run.mapping_id)
+            state["pipeline_run_id"] = str(run.id)
         except Exception as e:
             logger.error("[Pipeline] Failed to build initial state for %s: %s", org_id, e)
             await self._finalize_run(

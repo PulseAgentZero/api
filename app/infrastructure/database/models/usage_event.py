@@ -8,7 +8,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.infrastructure.database.base import Base, UUIDMixin
+from app.infrastructure.database.base import Base, UUIDMixin, utcnow
 
 if TYPE_CHECKING:
     from app.infrastructure.database.models.organization import Organization
@@ -24,7 +24,10 @@ class UsageEvent(Base, UUIDMixin):
     quantity: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSONB, default=dict, server_default="{}")
     recorded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=utcnow,
+        server_default=func.now(),
+        nullable=False,
     )
 
     organization: Mapped[Organization] = relationship("Organization", lazy="raise")

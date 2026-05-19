@@ -8,7 +8,7 @@ from sqlalchemy import DateTime, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.infrastructure.database.base import Base, UUIDMixin
+from app.infrastructure.database.base import Base, UUIDMixin, utcnow
 
 if TYPE_CHECKING:
     from app.infrastructure.database.models.organization import Organization
@@ -34,7 +34,10 @@ class OrgNotification(Base, UUIDMixin):
     source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=utcnow,
+        server_default=func.now(),
+        nullable=False,
     )
 
     organization: Mapped[Organization] = relationship("Organization", lazy="raise")

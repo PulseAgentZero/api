@@ -1,7 +1,7 @@
 import logging
-from typing import Literal
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,7 +9,13 @@ from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.dependencies.plan_gate import get_usage_summary
 from app.api.errors import bad_request, not_found
-from app.api.schemas.organization import AssetUploadResponse, OrgProfileResponse, UpdateOrgRequest
+from app.api.schemas.organization import (
+    AssetUploadResponse,
+    CompleteSetupResponse,
+    MemberSettingsRequest,
+    OrgProfileResponse,
+    UpdateOrgRequest,
+)
 from app.infrastructure.database.models.user import User
 from app.infrastructure.external_services.s3_assets import build_object_key, upload_bytes_to_s3
 from app.infrastructure.database.repositories.organization_repository import (
@@ -17,11 +23,21 @@ from app.infrastructure.database.repositories.organization_repository import (
 )
 from app.infrastructure.database.session import get_db
 from app.services.org_export_service import build_organization_export
+from app.services.org_setup_service import complete_org_setup, try_auto_complete_setup
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/organization", tags=["Organization"])
 
 AssetCategory = Literal["profile", "logo", "data", "csv", "attachment"]
+
+_MEMBER_FIELDS = ("industry", "business_context", "entity_label", "goal_label")
+
+
+def _merge_tour_guide(existing: dict[str, Any] | None, patch: dict[str, Any] | None) -> dict[str, Any]:
+    base = dict(existing or {})
+    if patch:
+        base.update(patch)
+    return base
 
 
 def _to_out(org) -> OrgProfileResponse:
@@ -73,6 +89,61 @@ async def update_organization(
     return _to_out(org)
 
 
+@router.patch("/member-settings", response_model=OrgProfileResponse)
+async def patch_member_settings(
+    body: MemberSettingsRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OrgProfileResponse:
+    """Update business context or tour state — any org member."""
+    payload = body.model_dump(exclude_unset=True)
+    if not payload:
+        raise bad_request("BAD_REQUEST", "No fields provided")
+    org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    if not org:
+        raise not_found("Organization not found")
+
+    tour_patch = payload.pop("tour_guide", None)
+    for key in _MEMBER_FIELDS:
+        if key in payload:
+            setattr(org, key, payload[key])
+    if tour_patch is not None:
+        org.tour_guide = _merge_tour_guide(getattr(org, "tour_guide", None), tour_patch)
+
+    await db.commit()
+    await db.refresh(org)
+
+    if not org.onboarding_done and (org.business_context or "").strip():
+        try:
+            await try_auto_complete_setup(db, current_user.org_id)
+            await db.refresh(org)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Auto complete-setup failed for org %s", current_user.org_id)
+
+    return _to_out(org)
+
+
+@router.post("/complete-setup", response_model=CompleteSetupResponse)
+async def post_complete_setup(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> CompleteSetupResponse:
+    """Finalize org setup and trigger the first pipeline run when ready."""
+    result = await complete_org_setup(db, current_user.org_id)
+    if result.already_complete:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Setup is already complete for this organization",
+        )
+    return CompleteSetupResponse(
+        message=result.message,
+        onboarding_done=result.onboarding_done,
+        generated_recommendations=result.generated_recommendations,
+    )
+
+
 @router.get("/usage")
 async def get_organization_usage(
     current_user: User = Depends(get_current_user),
@@ -88,6 +159,7 @@ async def get_organization_usage(
       "plan": "free",
       "limits": {
         "api_keys":                   { "used": 1, "limit": 1 },
+        "connections":                 { "used": 2, "limit": 5 },
         "webhook_channels":            { "used": 0, "limit": 1 },
         "users":                       { "used": 2, "limit": 3 },
         "pipeline_runs_this_month":    { "used": 3, "limit": 20 },

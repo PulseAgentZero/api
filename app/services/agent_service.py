@@ -481,6 +481,26 @@ async def _action_draft(
         return _action_draft_fallback(detail, entity_id, action_type)
 
 
+def _extract_json_array(raw_text: str) -> list[dict]:
+    """Parse a JSON array from LLM output, tolerating markdown fences."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("Expected JSON array")
+    return [x for x in data if isinstance(x, dict)]
+
+
 async def _build_custom_dashboard(
     db: AsyncSession,
     org_id: UUID,
@@ -515,10 +535,22 @@ async def _build_custom_dashboard(
     from app.infrastructure.database.repositories.studio_visualization_repository import (
         StudioVisualizationRepository,
     )
+    from app.api.dependencies.plan_gate import check_studio_dashboard_limit
     from app.services.studio_query_service import _inject_limit, _is_select_only
     from app.agents.tools.client_db import schema_columns_sql
 
     max_charts = max(1, min(max_charts, 6))
+
+    try:
+        await check_studio_dashboard_limit(db, org_id)
+    except Exception as exc:
+        from app.api.errors import PulseHTTPException
+
+        if isinstance(exc, PulseHTTPException):
+            detail = exc.detail
+            msg = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
+            return {"error": msg}
+        return {"error": str(exc)}
 
     # ── Step 1: Introspect schema ────────────────────────────────────────────
     schema_context = ""
@@ -583,9 +615,7 @@ async def _build_custom_dashboard(
         if not llm.is_configured():
             return {"error": f"AI provider '{llm.provider_name}' is not configured"}
         raw_text = await llm.complete(system_prompt, user_prompt, max_tokens=2000, temperature=0.1)
-        plan: list[dict] = json.loads(raw_text)
-        if not isinstance(plan, list):
-            raise ValueError("Expected JSON array")
+        plan = _extract_json_array(raw_text)
     except Exception as exc:
         logger.warning("[build_dashboard] LLM planning failed: %s", exc)
         return {"error": "Agent could not generate a dashboard plan from the goal"}
@@ -675,7 +705,7 @@ async def _build_custom_dashboard(
     except Exception:
         pass
 
-    internal_url = f"/studio/dashboards/{dashboard.id}"
+    internal_url = f"/dashboard/studio/dashboards/{dashboard.id}"
     public_url = f"/api/public/v1/studio/dashboards/{slug}" if slug else None
 
     return {
@@ -1032,7 +1062,8 @@ def _conversational_reply_template(intent_name: str, state: dict) -> str:
             f"- Active recommendations (\"what should I action today?\")\n"
             f"- Find similar {entity_label} (\"5 more like NG-00075\")\n"
             f"- Draft an outreach (\"draft a message for NG-00075\")\n"
-            f"- Explain trends (\"why is NG-00075 critical?\")\n\n"
+            f"- Explain trends (\"why is NG-00075 critical?\")\n"
+            f"- Build a Studio dashboard (\"build a dashboard showing revenue by month\")\n\n"
             f"What would you like to start with?"
         )
 
@@ -1097,7 +1128,7 @@ async def run(
             return await _conversational_reply(db, current_user, intent.intent, latest_user)
 
         if intent and intent.confidence >= settings.CHAT_INTENT_FASTPATH_CONFIDENCE:
-            fp = build_fastpath_args(intent)
+            fp = build_fastpath_args(intent, user_message=latest_user)
             if fp is not None:
                 tool_name, tool_args = fp
                 logger.info(

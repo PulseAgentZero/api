@@ -11,6 +11,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.alert_event import AlertEvent
 from app.infrastructure.database.models.alert_rule import AlertRule
 from app.infrastructure.database.models.notification_channel import NotificationChannel
@@ -20,8 +21,14 @@ from app.services.webhook_dispatch import deliver_webhook_payload
 
 logger = logging.getLogger(__name__)
 
-_HIGH_TIERS = ("High", "Critical")
-_MEDIUM_PLUS = ("Medium", "High", "Critical")
+def _tier_in(*tiers: str):
+    """Case-insensitive risk_tier match (profiles may use High/High or high/critical)."""
+    lowered = [t.lower() for t in tiers]
+    return func.lower(EntityProfile.risk_tier).in_(lowered)
+
+
+_HIGH_TIER_FILTER = _tier_in("high", "critical")
+_MEDIUM_PLUS_FILTER = _tier_in("medium", "high", "critical")
 
 
 def _compare(op: str, value: Decimal, threshold: Decimal) -> bool:
@@ -58,7 +65,7 @@ async def _metric_snapshot(
     m = (metric or "").strip().lower().replace(" ", "_")
 
     if m in ("high_risk_entities", "high_risk_entity_count", "count_high_risk"):
-        cond = base + [EntityProfile.risk_tier.in_(_HIGH_TIERS)]
+        cond = base + [_HIGH_TIER_FILTER]
         cnt = int(await db.scalar(select(func.count()).select_from(EntityProfile).where(*cond)) or 0)
         q = (
             select(EntityProfile.entity_id)
@@ -70,16 +77,26 @@ async def _metric_snapshot(
         return Decimal(cnt), ids, cnt
 
     if m in ("medium_plus_risk_entities",):
-        cond = base + [EntityProfile.risk_tier.in_(_MEDIUM_PLUS)]
+        cond = base + [_MEDIUM_PLUS_FILTER]
         cnt = int(await db.scalar(select(func.count()).select_from(EntityProfile).where(*cond)) or 0)
         q = select(EntityProfile.entity_id).where(*cond).limit(200)
         ids = [r[0] for r in (await db.execute(q)).all()]
         return Decimal(cnt), ids, cnt
 
-    if m in ("avg_risk_score", "average_risk_score", "mean_risk_score"):
+    if m in (
+        "avg_risk_score",
+        "average_risk_score",
+        "mean_risk_score",
+        "risk_score",
+    ):
         avg = await db.scalar(select(func.avg(EntityProfile.risk_score)).where(*base))
         n = int(await db.scalar(select(func.count()).select_from(EntityProfile).where(*base)) or 0)
         return Decimal(str(avg or 0)), [], n
+
+    if m in ("max_risk_score", "peak_risk_score"):
+        peak = await db.scalar(select(func.max(EntityProfile.risk_score)).where(*base))
+        n = int(await db.scalar(select(func.count()).select_from(EntityProfile).where(*base)) or 0)
+        return Decimal(str(peak or 0)), [], n
 
     if m in ("total_entities", "entity_count", "profiled_entities"):
         cnt = int(await db.scalar(select(func.count()).select_from(EntityProfile).where(*base)) or 0)
@@ -145,6 +162,7 @@ async def evaluate_alerts_after_pipeline(
             await db.flush()
 
             rule.last_triggered_at = now
+            touch_updated_at(rule)
 
             payload = {
                 "event": "pulse.alert.triggered",
@@ -167,13 +185,16 @@ async def evaluate_alerts_after_pipeline(
                 except (ValueError, TypeError):
                     continue
                 ch_row = await db.get(NotificationChannel, ch_uuid)
-                if not ch_row or ch_row.org_id != org_id or ch_row.type != "webhook":
+                if not ch_row or ch_row.org_id != org_id:
                     continue
                 from app.services.webhook_dispatch import (
                     channel_subscribes_to_event,
+                    is_deliverable_http_channel,
                     parse_channel_config,
                 )
 
+                if not is_deliverable_http_channel(ch_row):
+                    continue
                 if not channel_subscribes_to_event(
                     parse_channel_config(ch_row), "alert.triggered"
                 ):

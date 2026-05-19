@@ -289,6 +289,25 @@ async def execute_studio_query(
         except Exception:
             logger.warning("Studio cache read failed for org=%s", org_id, exc_info=True)
 
+    # --- File sources (CSV, Google Sheets, S3) ---
+    if connection_id is not None:
+        from app.services.studio_file_source_service import (
+            execute_file_source_query,
+            get_connection_for_studio,
+            supports_studio_file_queries,
+        )
+
+        file_conn = await get_connection_for_studio(db, org_id, connection_id)
+        if supports_studio_file_queries(file_conn):
+            return await execute_file_source_query(
+                file_conn,
+                limited_sql,
+                param_defs=param_defs,
+                param_values=param_values,
+                page=page,
+                page_size=page_size,
+            )
+
     # --- Execute against client DB ---
     engine: AsyncEngine | None = None
     try:

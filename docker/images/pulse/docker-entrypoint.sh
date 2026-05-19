@@ -11,10 +11,17 @@ REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
 API_WORKERS="${API_WORKERS:-1}"
 AGENT_WORKERS="${AGENT_WORKERS:-1}"
 
-# ── 0. Remove the nginx default site so ours is the only one ─────────────────
+# ── 0. Writable storage for the `pulse` app user (uid 1001) ───────────────────
+# Named volumes (e.g. uploads_data:/app/uploads) are often created root-owned.
+storage="${LOCAL_STORAGE_PATH:-/app/uploads}"
+mkdir -p "$storage"
+chown -R pulse:pulse "$storage"
+chown -R pulse:pulse /var/log/pulse
+
+# ── 1. Remove the nginx default site so ours is the only one ─────────────────
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-# ── 1. Start bundled Redis ────────────────────────────────────────────────────
+# ── 2. Start bundled Redis ────────────────────────────────────────────────────
 echo "[pulse] starting bundled Redis..."
 redis-server \
   --daemonize yes \
@@ -31,7 +38,7 @@ for i in $(seq 1 10); do
 done
 echo "[pulse] Redis ready"
 
-# ── 2. Wait for Postgres ──────────────────────────────────────────────────────
+# ── 3. Wait for Postgres ──────────────────────────────────────────────────────
 if [ -n "$DATABASE_URL" ]; then
   echo "[pulse] waiting for database..."
   python - <<'EOF'
@@ -62,15 +69,15 @@ asyncio.run(wait())
 EOF
 fi
 
-# ── 3. Run database migrations ────────────────────────────────────────────────
+# ── 4. Run database migrations ────────────────────────────────────────────────
 echo "[pulse] running migrations..."
-alembic upgrade head
+gosu pulse alembic upgrade head
 echo "[pulse] migrations done"
 
-# ── 4. Export env vars for supervisord programs ───────────────────────────────
+# ── 5. Export env vars for supervisord programs ───────────────────────────────
 export API_WORKERS
 export AGENT_WORKERS
 
-# ── 5. Hand off to supervisord ────────────────────────────────────────────────
+# ── 6. Hand off to supervisord ────────────────────────────────────────────────
 echo "[pulse] starting all services via supervisord..."
 exec supervisord -c /etc/supervisor/conf.d/pulse.conf

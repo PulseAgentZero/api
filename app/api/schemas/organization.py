@@ -5,6 +5,22 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 
+class MemberSettingsRequest(BaseModel):
+    """Updatable by any org member (business context + product tour state)."""
+
+    industry: str | None = Field(None, max_length=100)
+    business_context: str | None = Field(None, max_length=20_000)
+    entity_label: str | None = Field(None, max_length=100)
+    goal_label: str | None = Field(None, max_length=255)
+    tour_guide: dict[str, Any] | None = None
+
+
+class CompleteSetupResponse(BaseModel):
+    message: str
+    onboarding_done: bool
+    generated_recommendations: int = 0
+
+
 class UpdateOrgRequest(BaseModel):
     name: str | None = None
     industry: str | None = None

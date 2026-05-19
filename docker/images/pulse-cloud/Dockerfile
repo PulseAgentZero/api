@@ -48,9 +48,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1001 -s /bin/sh pulse \
-    && chown -R pulse:pulse /app
+    && chown -R pulse:pulse /app \
+    && mkdir -p /app/uploads \
+    && chown pulse:pulse /app/uploads
 
 COPY --from=builder /install /usr/local
 
@@ -61,8 +64,7 @@ COPY --chown=pulse:pulse scripts/    ./scripts/
 COPY docker/images/pulse-cloud/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
-USER pulse
-
+# Entrypoint starts as root to fix volume permissions, then drops to `pulse` via gosu.
 EXPOSE 8000
 
 HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \

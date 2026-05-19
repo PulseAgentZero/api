@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.errors import bad_request, not_found, validation_error
+from app.infrastructure.database.base import touch_updated_at, utcnow
 from app.infrastructure.database.models.pipeline_run import PipelineRun
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.user import User
@@ -234,6 +235,8 @@ async def cancel_pipeline_run(
     if run.status in ("succeeded", "failed", "cancelled"):
         raise bad_request("BAD_REQUEST", "Run already completed")
     run.status = "cancelled"
+    run.completed_at = utcnow()
+    touch_updated_at(run)
     await db.commit()
     return {"message": "Cancellation requested"}
 

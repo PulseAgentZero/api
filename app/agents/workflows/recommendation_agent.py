@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.base import BaseAgent, LLMProvider
 from app.agents.prompts.recommendation import RECOMMENDATION_PROMPT
 from app.agents.state import PipelineState
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
@@ -151,7 +152,15 @@ class RecommendationAgent(BaseAgent):
                 existing = await repo.list_by_org(org_id, status="open")
                 for rec in existing:
                     rec.status = "superseded"
+                    touch_updated_at(rec)
                 superseded = len(existing)
+
+                pipeline_run_id: UUID | None = None
+                if state.get("pipeline_run_id"):
+                    try:
+                        pipeline_run_id = UUID(str(state["pipeline_run_id"]))
+                    except (ValueError, TypeError):
+                        pipeline_run_id = None
 
                 for rec_data in all_recs:
                     await repo.create(
@@ -164,6 +173,7 @@ class RecommendationAgent(BaseAgent):
                         reasoning=rec_data.get("reasoning", ""),
                         suggested_action=rec_data.get("suggested_action", ""),
                         status="open",
+                        pipeline_run_id=pipeline_run_id,
                     )
                     created += 1
 

@@ -20,7 +20,6 @@ from app.api.routes import (
     entities_router,
     license_router,
     notifications_router,
-    onboarding_router,
     org_router,
     pipeline_router,
     recommendations_router,
@@ -122,7 +121,6 @@ _internal_tags = [
     {"name": "Users",           "description": "User management, invitations, roles"},
     {"name": "Connections",     "description": "Data source connectors — databases, spreadsheets, cloud warehouses, file uploads"},
     {"name": "Schema Mappings", "description": "Map entity tables, signal columns, and risk config"},
-    {"name": "Onboarding",      "description": "Step-by-step setup wizard"},
     {"name": "Pipeline",        "description": "Trigger and monitor AI intelligence pipeline runs"},
     {"name": "Agent",           "description": "Dashboard conversational AI over org intelligence"},
     {"name": "Dashboard",       "description": "High-level org overview and KPIs"},
@@ -173,7 +171,6 @@ app.include_router(auth_router,            prefix="/api/v1")
 app.include_router(org_router,             prefix="/api/v1")
 app.include_router(connections_router,     prefix="/api/v1")
 app.include_router(schema_mappings_router, prefix="/api/v1")
-app.include_router(onboarding_router,      prefix="/api/v1")
 app.include_router(dashboard_router,       prefix="/api/v1")
 app.include_router(entities_router,        prefix="/api/v1")
 app.include_router(recommendations_router, prefix="/api/v1")

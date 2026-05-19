@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
-from app.api.dependencies.plan_gate import require_cloud_plan
+from app.api.dependencies.plan_gate import require_feature
 from app.config.settings import Settings
 from app.infrastructure.database.models.audit_log import AuditLog
 from app.infrastructure.database.models.user import User
@@ -32,7 +32,7 @@ async def list_audit_logs(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await require_cloud_plan(db, current_user.org_id, ("pro", "enterprise"))
+    await require_feature(db, current_user.org_id, "audit_log")
     conds = [AuditLog.org_id == current_user.org_id]
     if action:
         conds.append(AuditLog.action == action)

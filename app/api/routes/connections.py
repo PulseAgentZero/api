@@ -26,6 +26,7 @@ from app.api.schemas.connection import (
     UpdateConnectionRequest,
 )
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.connectors.factory import _make_sql_dsn, build_encrypted_secret_and_row_fields
 from app.infrastructure.connectors.payload import parse_pulse_api_payload
 from app.infrastructure.database.connection_tester import (
@@ -127,10 +128,16 @@ _CONNECTOR_CATALOG = [
         "display_name": "Google BigQuery",
         "category": "Cloud Warehouse",
         "icon_slug": "bigquery",
-        "description": "Connect to Google BigQuery.",
+        "description": "Connect to Google BigQuery with a project URL and optional service account JSON.",
         "fields": [
             {"key": "connection_url", "label": "Connection URL", "type": "string", "required": True,
-             "placeholder": "bigquery://project/dataset"},
+             "placeholder": "bigquery://my-project/my_dataset",
+             "help": "Format: bigquery://project_id/dataset_id"},
+            {"key": "bigquery_service_account_json", "label": "Service Account JSON",
+             "type": "textarea", "required": False,
+             "placeholder": '{"type": "service_account", "project_id": "...", ...}',
+             "help": "Paste the full JSON key from GCP (IAM → Service Accounts → Keys). "
+                      "Required unless Application Default Credentials are configured on the Pulse host."},
         ],
     },
     {
@@ -188,11 +195,22 @@ _CONNECTOR_CATALOG = [
         "display_name": "Google Sheets",
         "category": "SaaS / Spreadsheet",
         "icon_slug": "google_sheets",
-        "description": "Connect to a Google Spreadsheet using an API key.",
+        "description": "Connect to a Google Spreadsheet with an API key or a service account.",
         "fields": [
-            {"key": "google_sheets_api_key", "label": "Google API Key", "type": "password", "required": True},
+            {"key": "google_auth_method", "label": "Authentication", "type": "select",
+             "required": True, "default": "api_key",
+             "options": ["api_key", "service_account"]},
             {"key": "google_spreadsheet_id", "label": "Spreadsheet ID", "type": "string", "required": True,
-             "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"},
+             "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+             "help": "From the sheet URL: docs.google.com/spreadsheets/d/{id}/edit"},
+            {"key": "google_sheets_api_key", "label": "Google API Key", "type": "password",
+             "required": True, "when": {"google_auth_method": "api_key"},
+             "help": "GCP Console → APIs & Services → Credentials → API key (Sheets API enabled)"},
+            {"key": "google_service_account_json", "label": "Service Account JSON",
+             "type": "textarea", "required": True,
+             "when": {"google_auth_method": "service_account"},
+             "placeholder": '{"type": "service_account", "client_email": "...", ...}',
+             "help": "Share the spreadsheet with the service account email (Editor or Viewer)."},
         ],
     },
     {
@@ -206,6 +224,8 @@ _CONNECTOR_CATALOG = [
             {"key": "s3_access_key_id", "label": "Access Key ID", "type": "string", "required": True},
             {"key": "s3_secret_access_key", "label": "Secret Access Key", "type": "password", "required": True},
             {"key": "s3_region", "label": "Region", "type": "string", "required": False, "default": "us-east-1"},
+            {"key": "s3_prefix", "label": "Object prefix (optional)", "type": "string", "required": False,
+             "placeholder": "data/exports/", "help": "Only list CSV files under this prefix."},
         ],
     },
     {
@@ -213,10 +233,15 @@ _CONNECTOR_CATALOG = [
         "display_name": "Google Cloud Storage",
         "category": "Object Storage",
         "icon_slug": "gcs",
-        "description": "Connect to a Google Cloud Storage bucket containing CSV or Parquet files.",
+        "description": "Connect to a GCS bucket with a service account JSON key.",
         "fields": [
-            {"key": "gcs_bucket", "label": "Bucket Name", "type": "string", "required": True},
-            {"key": "gcs_service_account_json", "label": "Service Account JSON", "type": "textarea", "required": True},
+            {"key": "gcs_bucket", "label": "Bucket Name", "type": "string", "required": True,
+             "placeholder": "my-data-bucket"},
+            {"key": "gcs_service_account_json", "label": "Service Account JSON",
+             "type": "textarea", "required": True,
+             "placeholder": '{"type": "service_account", "project_id": "...", ...}',
+             "help": "GCP → IAM → Service Accounts → Keys → Add key → JSON. "
+                      "Grant Storage Object Viewer on the bucket."},
         ],
     },
     {
@@ -306,6 +331,7 @@ async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     conn.last_test_error = None if success else message
+    touch_updated_at(conn)
     return success, message, db_version
 
 
@@ -360,6 +386,7 @@ async def upload_connection_file(
     )
     conn.config = {"upload_path": dest_path, "original_filename": file.filename}
     conn.status = "pending"
+    touch_updated_at(conn)
     await db.commit()
     await db.refresh(conn)
     return _connection_to_response(conn)

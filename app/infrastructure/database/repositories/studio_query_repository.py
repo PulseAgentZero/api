@@ -8,6 +8,7 @@ from sqlalchemy import cast, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.studio_query import StudioQuery
 
 
@@ -133,6 +134,7 @@ class StudioQueryRepository:
     async def update(self, query: StudioQuery, **fields) -> StudioQuery:
         for key, value in fields.items():
             setattr(query, key, value)
+        touch_updated_at(query)
         await self.db.flush()
         return query
 
@@ -143,4 +145,5 @@ class StudioQueryRepository:
     async def touch_last_run(self, query: StudioQuery, row_count: int) -> None:
         query.last_run_at = datetime.now(timezone.utc)
         query.last_run_row_count = row_count
+        touch_updated_at(query)
         await self.db.flush()

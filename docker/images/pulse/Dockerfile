@@ -95,11 +95,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     redis-server \
     curl \
+    gosu \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data/redis /var/log/pulse \
-    && chmod 777 /data/redis /var/log/pulse
+    && useradd -m -u 1001 -s /bin/sh pulse \
+    && mkdir -p /data/redis /var/log/pulse /app/uploads \
+    && chown -R pulse:pulse /var/log/pulse /app/uploads \
+    && chmod 775 /data/redis /var/log/pulse
 
 # Python packages from builder
 COPY --from=py-builder /install /usr/local
@@ -108,6 +111,7 @@ COPY --from=py-builder /install /usr/local
 COPY app/        ./app/
 COPY alembic.ini .
 COPY scripts/    ./scripts/
+RUN chown -R pulse:pulse /app
 
 # Next.js standalone output
 #   .next/standalone/ → the minimal Node.js server (server.js + compiled app)
@@ -116,6 +120,7 @@ COPY scripts/    ./scripts/
 COPY --from=frontend-builder /frontend/.next/standalone/   /frontend/
 COPY --from=frontend-builder /frontend/.next/static/       /frontend/.next/static/
 COPY --from=frontend-builder /frontend/public/             /frontend/public/
+RUN chown -R pulse:pulse /frontend
 
 # nginx config — replace the default site with ours
 RUN rm -f /etc/nginx/sites-enabled/default

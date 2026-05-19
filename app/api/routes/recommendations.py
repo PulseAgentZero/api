@@ -12,6 +12,7 @@ from app.api.auth.role_deps import require_role
 from app.api.errors import bad_request, not_found
 from app.infrastructure.database.models.org_notification import OrgNotification
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
@@ -121,6 +122,7 @@ async def action_recommendation(
     rec.actioned_at = datetime.now(timezone.utc)
     if body and body.outcome_notes:
         rec.outcome_notes = body.outcome_notes
+    touch_updated_at(rec)
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
@@ -148,6 +150,7 @@ async def dismiss_recommendation(
     if rec.status in ("actioned", "dismissed"):
         raise bad_request("BAD_REQUEST", "Already actioned or dismissed")
     rec.status = "dismissed"
+    touch_updated_at(rec)
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
@@ -170,6 +173,7 @@ async def escalate_recommendation(
     if rec.status in ("actioned", "dismissed", "escalated"):
         raise bad_request("BAD_REQUEST", "Recommendation cannot be escalated in its current state")
     rec.status = "escalated"
+    touch_updated_at(rec)
     await db.flush()
     mgrs = await db.execute(
         select(User).where(

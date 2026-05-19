@@ -1,6 +1,18 @@
 #!/bin/sh
 set -e
 
+# When the container starts as root, ensure mounted storage paths are writable by
+# the `pulse` user (uid 1001). Named volumes are often created root-owned.
+if [ "$(id -u)" = "0" ]; then
+  storage="${LOCAL_STORAGE_PATH:-/app/uploads}"
+  mkdir -p "$storage"
+  chown -R pulse:pulse "$storage"
+  if [ -d /app/logs ]; then
+    chown -R pulse:pulse /app/logs
+  fi
+  exec gosu pulse "$0" "$@"
+fi
+
 SERVICE="${1:-${PULSE_SERVICE:-api}}"
 
 echo "[pulse:$SERVICE] starting..."

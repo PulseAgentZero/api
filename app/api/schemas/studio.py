@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 ChartType = Literal[
     "bar", "line", "area", "pie", "scatter", "table", "number",
     "funnel", "heatmap", "gauge", "waterfall", "trend",
+    "stat", "bar_gauge", "histogram",
 ]
 
 
@@ -38,13 +39,49 @@ class ColumnFormatRule(BaseModel):
 
 # ── Embedded config / layout types ───────────────────────────────────────────
 
+LegendPosition = Literal["top", "bottom", "left", "right"]
+
+
+class ChartDisplayOptions(BaseModel):
+    """Presentation options (Grafana/Superset-style). Stored in visualization config JSON."""
+    show_legend: bool | None = True
+    legend_position: LegendPosition | None = "bottom"
+    show_grid: bool | None = True
+    stacked: bool | None = False
+    horizontal: bool | None = False
+    x_label_rotate: int | None = Field(None, ge=-90, le=90)
+    x_label_max_chars: int | None = Field(None, ge=8, le=64)
+    max_points: int | None = Field(None, ge=5, le=500)
+
+
+class ChartAxesLabels(BaseModel):
+    x_label: str | None = Field(None, max_length=200)
+    y_label: str | None = Field(None, max_length=200)
+
+
 class VisualizationConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     x_axis: str | None = None
     y_axis: str | list[str] | None = None
     color: str | None = None
     title: str | None = None
     value_column: str | None = None
     label_column: str | None = None
+    min_value: float | None = None
+    max_value: float | None = None
+    unit: str | None = None
+    sparkline_column: str | None = None
+    colors: list[str] | None = Field(
+        None,
+        description="Series color palette (hex). Applied in order to Y series / pie slices.",
+    )
+    series_colors: dict[str, str] | None = Field(
+        None,
+        description="Per-series or per-category hex overrides keyed by column or label name.",
+    )
+    display: ChartDisplayOptions | None = None
+    axes: ChartAxesLabels | None = None
 
 
 class DashboardLayoutItem(BaseModel):

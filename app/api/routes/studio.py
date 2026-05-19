@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.dependencies.plan_gate import check_studio_dashboard_limit
-from app.api.errors import bad_request, conflict, forbidden, not_found
+from app.api.errors import PulseHTTPException, bad_request, conflict, forbidden, not_found
 from app.api.schemas.studio import (
     ChartType,
     DashboardExecuteItemResult,
@@ -89,6 +89,77 @@ router = APIRouter(prefix="/studio", tags=["Studio"])
 
 _MAX_DASHBOARD_ITEMS = 20
 _SLUG_MAX_ATTEMPTS = 5
+
+
+def _layout_slot_id(slot: dict) -> str:
+    return str(slot.get("item_id", ""))
+
+
+def _next_layout_y(layout: list) -> int:
+    if not layout:
+        return 0
+    return max(int(s.get("y", 0)) + int(s.get("h", 4)) for s in layout)
+
+
+def _append_layout_slot(layout: list | None, item_id: UUID, panel_type: str) -> list:
+    """Append a default grid position for a new dashboard panel."""
+    layout = list(layout or [])
+    w, h = (12, 3) if panel_type == "text" else (6, 4)
+    x, y = 0, _next_layout_y(layout)
+    if panel_type != "text" and layout:
+        last = layout[-1]
+        last_w = int(last.get("w", 6))
+        last_x = int(last.get("x", 0))
+        last_y = int(last.get("y", 0))
+        last_h = int(last.get("h", 4))
+        if last_w < 12 and last_x + last_w + w <= 12:
+            x, y = last_x + last_w, last_y
+    layout.append({
+        "item_id": str(item_id),
+        "x": x,
+        "y": y,
+        "w": w,
+        "h": h,
+    })
+    return layout
+
+
+def _dashboard_viz_error_message(exc: Exception) -> str:
+    """User-facing message for a failed dashboard visualization query."""
+    if isinstance(exc, PulseHTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict) and detail.get("message"):
+            return str(detail["message"])
+    logger.warning("Dashboard visualization query failed", exc_info=exc)
+    return "Query failed. Check the underlying saved query and connection."
+
+
+def _remove_layout_slot(layout: list | None, item_id: UUID) -> list:
+    target = str(item_id)
+    return [s for s in (layout or []) if _layout_slot_id(s) != target]
+
+
+def _remap_layout_item_ids(
+    source_layout: list | None,
+    source_items: list,
+    new_items: list,
+) -> list:
+    """Rebuild layout after fork when item UUIDs change."""
+    old_to_new = {str(old.id): str(new.id) for old, new in zip(source_items, new_items)}
+    slots_by_old = {_layout_slot_id(s): s for s in (source_layout or [])}
+    layout: list = []
+    y = 0
+    for old, new in zip(source_items, new_items):
+        old_id = str(old.id)
+        slot = slots_by_old.get(old_id)
+        if slot:
+            entry = {**slot, "item_id": str(new.id)}
+        else:
+            w, h = (12, 3) if getattr(old, "panel_type", "visualization") == "text" else (6, 4)
+            entry = {"item_id": str(new.id), "x": 0, "y": y, "w": w, "h": h}
+        layout.append(entry)
+        y = int(entry.get("y", 0)) + int(entry.get("h", 4))
+    return layout
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -167,22 +238,39 @@ _SCHEMA_CACHE_PREFIX = "studio:schema:"
 async def _fetch_live_schema(
     db: AsyncSession, org_id: UUID, connection_id: UUID | None
 ) -> IntrospectResponse:
-    """Fetch tables + columns directly from the client DB."""
+    """Fetch tables + columns directly from the client DB or file sources."""
     from sqlalchemy import text as _text
 
     from app.agents.tools.client_db import open_client_engine, safe_client_connection
     from app.infrastructure.database.client_queries import ClientDBError
     from app.infrastructure.database.connection_tester import introspect_schema
     from app.infrastructure.crypto import decrypt_dsn
+    from app.services.studio_file_source_service import (
+        fetch_file_source_schema,
+        get_connection_for_studio,
+        supports_studio_file_queries,
+    )
     from app.services.studio_query_service import _get_specific_engine
 
     if connection_id is not None:
-        engine, conn = await _get_specific_engine(db, org_id, connection_id)
-        try:
-            dsn_plain = decrypt_dsn(conn.encrypted_dsn)
-            tables = await introspect_schema(dsn_plain, sslmode=conn.sslmode)
-        finally:
-            await engine.dispose()
+        conn_row = await get_connection_for_studio(db, org_id, connection_id)
+        if supports_studio_file_queries(conn_row):
+            tables = await fetch_file_source_schema(conn_row)
+            return IntrospectResponse(tables=tables)
+
+    from app.infrastructure.connectors.payload import parse_pulse_api_payload
+
+    if connection_id is not None:
+        conn_row = await get_connection_for_studio(db, org_id, connection_id)
+        dsn_plain = decrypt_dsn(conn_row.encrypted_dsn) if conn_row.encrypted_dsn else ""
+        if parse_pulse_api_payload(dsn_plain) is not None:
+            tables = await introspect_schema(dsn_plain, sslmode=conn_row.sslmode)
+        else:
+            engine, conn = await _get_specific_engine(db, org_id, connection_id)
+            try:
+                tables = await introspect_schema(dsn_plain, sslmode=conn.sslmode)
+            finally:
+                await engine.dispose()
     else:
         from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
         conns = await ConnectionRepository(db).list_by_org(org_id)
@@ -800,6 +888,43 @@ async def recommend_viz(
 
 # ── Visualizations ────────────────────────────────────────────────────────────
 
+@router.get("/visualizations", summary="List org visualizations or bulk-fetch by IDs")
+async def list_org_visualizations(
+    ids: str | None = Query(None, description="Comma-separated visualization UUIDs"),
+    query_id: UUID | None = Query(None, description="Filter by parent query"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """List visualizations for the org, or fetch specific IDs in one request.
+
+    When `ids` is provided, returns only matching visualizations (unknown IDs are omitted).
+    Otherwise returns a paginated org-wide list, optionally filtered by `query_id`.
+    """
+    repo = StudioVisualizationRepository(db)
+    if ids:
+        id_list: list[UUID] = []
+        for part in ids.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                id_list.append(UUID(part))
+            except ValueError:
+                continue
+        vizs = await repo.list_by_ids(current_user.org_id, id_list)
+        return {"visualizations": [StudioVisualizationResponse.model_validate(v) for v in vizs]}
+    offset = (page - 1) * limit
+    vizs = await repo.list_by_org(
+        current_user.org_id,
+        limit=limit,
+        offset=offset,
+        query_id=query_id,
+    )
+    return {"visualizations": [StudioVisualizationResponse.model_validate(v) for v in vizs]}
+
+
 @router.get("/queries/{query_id}/visualizations", summary="List visualizations for a query")
 async def list_visualizations(
     query_id: UUID,
@@ -1064,7 +1189,7 @@ async def execute_dashboard(
         except Exception as exc:
             results.append(DashboardExecuteItemResult(
                 visualization_id=item.visualization_id,
-                error=str(exc),
+                error=_dashboard_viz_error_message(exc),
             ))
 
     return StudioDashboardExecuteResponse(results=results)
@@ -1175,12 +1300,22 @@ async def fork_dashboard(
 
     items = await StudioDashboardItemRepository(db).list_by_dashboard(dashboard_id, current_user.org_id)
     item_repo = StudioDashboardItemRepository(db)
+    forked_items = []
     for item in items:
-        await item_repo.create(
-            current_user.org_id, new_dashboard.id,
-            item.visualization_id, item.position,
-            panel_type=item.panel_type, content=item.content,
+        forked_items.append(
+            await item_repo.create(
+                current_user.org_id,
+                new_dashboard.id,
+                item.visualization_id,
+                item.position,
+                panel_type=item.panel_type,
+                content=item.content,
+            )
         )
+    await repo.update(
+        new_dashboard,
+        layout=_remap_layout_item_ids(source.layout, items, forked_items),
+    )
 
     await log_audit(
         db, org_id=current_user.org_id, user_id=current_user.id,
@@ -1310,6 +1445,11 @@ async def add_dashboard_item(
         current_user.org_id, dashboard_id, viz_id, body.position,
         panel_type=body.panel_type, content=body.content,
     )
+    dash_repo = StudioDashboardRepository(db)
+    await dash_repo.update(
+        dashboard,
+        layout=_append_layout_slot(dashboard.layout, item.id, body.panel_type),
+    )
     await db.commit()
     await db.refresh(item)
     return StudioDashboardItemResponse.model_validate(item)
@@ -1337,4 +1477,8 @@ async def remove_dashboard_item(
         raise not_found("Dashboard item not found")
 
     await item_repo.delete(item)
+    await StudioDashboardRepository(db).update(
+        dashboard,
+        layout=_remove_layout_slot(dashboard.layout, item_id),
+    )
     await db.commit()

@@ -9,7 +9,6 @@ from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.entities import router as entities_router
 from app.api.routes.license import router as license_router
 from app.api.routes.notifications import router as notifications_router
-from app.api.routes.onboarding import router as onboarding_router
 from app.api.routes.organization import router as org_router
 from app.api.routes.pipeline import router as pipeline_router
 from app.api.routes.recommendations import router as recommendations_router
@@ -31,7 +30,6 @@ __all__ = [
     "entities_router",
     "license_router",
     "notifications_router",
-    "onboarding_router",
     "org_router",
     "pipeline_router",
     "recommendations_router",

@@ -7,6 +7,7 @@ from sqlalchemy import cast, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.studio_dashboard import StudioDashboard
 
 
@@ -148,6 +149,7 @@ class StudioDashboardRepository:
     async def update(self, dashboard: StudioDashboard, **fields) -> StudioDashboard:
         for key, value in fields.items():
             setattr(dashboard, key, value)
+        touch_updated_at(dashboard)
         await self.db.flush()
         return dashboard
 

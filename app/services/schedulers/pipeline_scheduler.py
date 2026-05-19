@@ -226,10 +226,13 @@ def shutdown_scheduler() -> None:
 if __name__ == "__main__":
     import signal
 
+    from app.infrastructure.logging import configure_logging
     from app.services.schedulers.studio_refresh_scheduler import (
         shutdown_studio_refresh_scheduler,
         start_studio_refresh_scheduler,
     )
+
+    configure_logging()
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()

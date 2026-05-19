@@ -18,11 +18,12 @@ read the user's message and output a single JSON object classifying it.
 4. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
 5. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
 6. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
-7. Does the message ask "why", "explain", "compare", "vs", "trend", "what drove"? -> compare_or_explain
-8. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
-9. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
-10. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
-11. Otherwise truly ambiguous? -> unknown
+7. Does the message ask to BUILD a dashboard, charts, visualization, or report (not just read data)? -> build_dashboard
+8. Does the message ask "why", "explain", "compare", "vs", "trend", "what drove"? -> compare_or_explain
+9. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
+10. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
+11. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
+12. Otherwise truly ambiguous? -> unknown
 
 ## Intent reference
 
@@ -63,6 +64,10 @@ MUST extract entity_id. Examples: "draft an outreach for NG-00075", \
 **compare_or_explain** — Comparison, trend analysis, causal reasoning. \
 Examples: "this month vs last", "why is NG-00075 critical?", \
 "compare Lagos vs Kano", "what drove the churn spike".
+
+**build_dashboard** — Build a Pulse Studio dashboard or charts from natural language. \
+Examples: "build a dashboard showing revenue by month", "create charts for churn", \
+"visualize subscriber growth", "make a report on support tickets".
 
 ### Fallback
 
@@ -105,7 +110,7 @@ confidence ~0.5 and let the caller ask which entity.
 ## Output JSON shape (every field required)
 
 {
-  "intent": "<one of the 11 names>",
+  "intent": "<one of the 12 names>",
   "confidence": 0.0-1.0,
   "entity_ids": ["ENT-001"],
   "tier_filter": "critical" | "high" | "medium" | "low" | null,

@@ -101,6 +101,21 @@ def _heuristic_fallback(message: str) -> IntentResult:
     if any(kw in lower for kw in ("critical", "high risk", "high-risk", "at risk", "list", "show")):
         tier = "critical" if "critical" in lower else ("high" if "high" in lower else None)
         return IntentResult("lookup_entities", 0.6, tier_filter=tier)
+    if any(
+        kw in lower
+        for kw in (
+            "dashboard",
+            "build a chart",
+            "build me a chart",
+            "visuali",
+            "visualize",
+            "visualise",
+            "report on",
+            "make a report",
+            "create charts",
+        )
+    ):
+        return IntentResult("build_dashboard", 0.75)
     return IntentResult("unknown", 0.3)
 
 
@@ -171,7 +186,7 @@ async def classify_intent(
 
 # Conversational intents bypass the ReAct loop entirely — handled by
 # agent_service._conversational_reply with no tool calls.
-CONVERSATIONAL_INTENTS = frozenset({"greeting", "help", "off_topic", "unknown"})
+CONVERSATIONAL_INTENTS = frozenset({"greeting", "help", "off_topic"})
 
 # Tool subset the ReAct loop should see when this intent fires.
 # None = no prefilter (give the agent all tools).
@@ -186,6 +201,7 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "find_similar": ("find_similar_entities", "get_entity_detail"),
     "generate_draft": ("generate_action_draft", "get_entity_detail"),
     "compare_or_explain": None,
+    "build_dashboard": ("build_custom_dashboard",),
     "unknown": None,
 }
 
@@ -198,10 +214,13 @@ _FASTPATH_TOOL: dict[str, str] = {
     "lookup_recommendations": "get_recommendations",
     "find_similar": "find_similar_entities",
     "generate_draft": "generate_action_draft",
+    "build_dashboard": "build_custom_dashboard",
 }
 
 
-def build_fastpath_args(intent: IntentResult) -> Optional[tuple[str, dict]]:
+def build_fastpath_args(
+    intent: IntentResult, *, user_message: str = ""
+) -> Optional[tuple[str, dict]]:
     """For a high-confidence intent, return (tool_name, args) to execute directly.
 
     Returns None when fast-path isn't applicable (intent doesn't map, or required
@@ -225,6 +244,11 @@ def build_fastpath_args(intent: IntentResult) -> Optional[tuple[str, dict]]:
         if not intent.entity_ids:
             return None
         return tool, {"entity_id": intent.entity_ids[0], "action_type": "message"}
+    if tool == "build_custom_dashboard":
+        goal = user_message.strip()
+        if not goal:
+            return None
+        return tool, {"goal": goal, "max_charts": 4}
     return None
 
 

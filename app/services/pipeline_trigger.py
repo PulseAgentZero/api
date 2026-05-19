@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -9,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database.repositories.pipeline_run_repository import PipelineRunRepository
 from app.services.schedulers.pipeline_scheduler import trigger_pipeline_now
+
+logger = logging.getLogger(__name__)
 
 def serialize_pipeline_run(run) -> dict:
     def _iso(dt) -> str | None:
@@ -87,3 +90,32 @@ async def claim_and_trigger_pipeline(
         "status": "queued",
         "message": "Pipeline queued",
     }
+
+
+async def maybe_trigger_initial_pipeline(
+    db: AsyncSession,
+    org_id: UUID,
+    *,
+    mapping_id: UUID,
+    triggered_by: UUID,
+) -> tuple[bool, str | None]:
+    """Queue the org's first pipeline run after their first schema mapping is saved."""
+    repo = PipelineRunRepository(db)
+    prior = await repo.list_by_org(org_id, limit=1)
+    if prior:
+        return False, None
+
+    try:
+        run_id = await trigger_pipeline_now(
+            org_id,
+            trigger_source="initial_mapping",
+            mapping_id=mapping_id,
+            triggered_by=triggered_by,
+        )
+    except Exception:
+        logger.exception("Auto-trigger pipeline failed for org %s", org_id)
+        return False, None
+
+    if run_id is None:
+        return False, None
+    return True, str(run_id)

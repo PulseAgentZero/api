@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.settings import settings
+from app.infrastructure.database.base import utcnow
 from app.infrastructure.database.models.audit_log import AuditLog
 from app.infrastructure.database.models.organization import Organization
 
@@ -44,6 +45,7 @@ async def log_audit(
             metadata_=metadata or {},
             ip_address=ip_address,
             user_agent=user_agent,
+            created_at=utcnow(),
         )
         db.add(row)
         await db.flush()

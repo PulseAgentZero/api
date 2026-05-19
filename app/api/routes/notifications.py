@@ -19,21 +19,29 @@ router = APIRouter(prefix="/notifications", tags=["Notifications"])
 @router.get("")
 async def list_notifications(
     unread_only: bool = Query(False),
+    page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    base_conds = [
+        OrgNotification.org_id == current_user.org_id,
+        (OrgNotification.user_id == current_user.id) | (OrgNotification.user_id.is_(None)),
+    ]
+    if unread_only:
+        base_conds.append(OrgNotification.read_at.is_(None))
+
+    total = await db.scalar(
+        select(func.count()).select_from(OrgNotification).where(*base_conds)
+    ) or 0
+
     stmt = (
         select(OrgNotification)
-        .where(OrgNotification.org_id == current_user.org_id)
-        .where(
-            (OrgNotification.user_id == current_user.id) | (OrgNotification.user_id.is_(None))
-        )
+        .where(*base_conds)
         .order_by(OrgNotification.created_at.desc())
+        .offset((page - 1) * limit)
         .limit(limit)
     )
-    if unread_only:
-        stmt = stmt.where(OrgNotification.read_at.is_(None))
     result = await db.execute(stmt)
     rows = list(result.scalars().all())
     unread = await db.scalar(
@@ -60,6 +68,9 @@ async def list_notifications(
             for n in rows
         ],
         "unread_count": int(unread or 0),
+        "total": int(total),
+        "page": page,
+        "limit": limit,
     }
 
 

@@ -28,3 +28,9 @@ class TimestampMixin:
         default=utcnow,
         server_default=func.now(),
     )
+
+
+def touch_updated_at(instance: object, *, at: datetime | None = None) -> None:
+    """Set ``updated_at`` when the model defines it (reliable vs SQLAlchemy onupdate alone)."""
+    if hasattr(instance, "updated_at"):
+        instance.updated_at = at or utcnow()  # type: ignore[attr-defined]

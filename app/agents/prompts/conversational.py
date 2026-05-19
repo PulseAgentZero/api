@@ -114,13 +114,14 @@ bullet with a concrete example the user could literally paste.
 5. Find entities similar to a reference one (semantic search)
 6. Draft an action / outreach message for a specific entity
 7. Compare or explain trends and risk drivers
+8. Build a Studio dashboard from a natural language goal (charts + SQL)
 
 ## Hard rules
 - Plain text. Bullets with "- " prefix. NO em-dashes. NO bold/italics.
 - Use the entity_label naturally (singular vs plural — say "subscribers" for the list \
   intents, "a subscriber" for the single-entity intents).
 - Each bullet: capability name in plain words, then a parenthetical example in quotes.
-- 7 bullets max. Total length 100-180 words.
+- 8 bullets max. Total length 100-200 words.
 - End with ONE sentence inviting them to try one.
 
 ## Example

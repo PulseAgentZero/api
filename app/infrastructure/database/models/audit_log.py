@@ -8,7 +8,7 @@ from sqlalchemy import DateTime, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.infrastructure.database.base import Base, UUIDMixin
+from app.infrastructure.database.base import Base, UUIDMixin, utcnow
 
 if TYPE_CHECKING:
     from app.infrastructure.database.models.organization import Organization
@@ -31,7 +31,10 @@ class AuditLog(Base, UUIDMixin):
     ip_address: Mapped[str | None] = mapped_column(INET)
     user_agent: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=utcnow,
+        server_default=func.now(),
+        nullable=False,
     )
 
     organization: Mapped[Organization] = relationship("Organization", lazy="raise")

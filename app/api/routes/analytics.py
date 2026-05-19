@@ -14,8 +14,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
-from app.api.dependencies.plan_gate import require_feature
 from app.api.errors import bad_request, not_found
+from app.infrastructure.database.base import utcnow
 from app.infrastructure.database.models.analytics_export import AnalyticsExport
 from app.infrastructure.database.models.entity_profile import EntityProfile
 from app.infrastructure.database.models.pipeline_run import PipelineRun
@@ -118,7 +118,6 @@ async def analytics_segments(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     org_id = current_user.org_id
     q = await db.execute(
         select(EntityProfile.segment, func.count(), func.avg(EntityProfile.risk_score))
@@ -159,7 +158,6 @@ async def analytics_cohorts(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     org_id = current_user.org_id
     since = datetime.now(timezone.utc) - timedelta(days=_period_days(period))
     movements = await cohort_tier_movements(db, org_id, since)
@@ -171,7 +169,6 @@ async def analytics_pipeline_performance(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     org_id = current_user.org_id
     rows = await db.execute(
         select(PipelineRun.status, func.count()).where(PipelineRun.org_id == org_id).group_by(PipelineRun.status)
@@ -197,7 +194,6 @@ async def analytics_export(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     row = AnalyticsExport(org_id=current_user.org_id, status="processing", format="csv")
     db.add(row)
     await db.flush()
@@ -220,7 +216,7 @@ async def analytics_export(
             raise ValueError("Export exceeds 15 MiB limit")
         row.content = raw
         row.status = "completed"
-        row.completed_at = datetime.now(timezone.utc)
+        row.completed_at = utcnow()
     except Exception as e:
         row.status = "failed"
         row.error_message = str(e)[:2000]
@@ -234,7 +230,6 @@ async def analytics_export_download(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     try:
         eid = UUID(export_id)
     except ValueError as exc:
@@ -257,7 +252,6 @@ async def analytics_export_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await require_feature(db, current_user.org_id, "advanced_analytics")
     try:
         eid = UUID(export_id)
     except ValueError as exc:

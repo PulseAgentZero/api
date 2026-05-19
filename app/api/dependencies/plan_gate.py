@@ -8,7 +8,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.errors import plan_limit, plan_locked
+from app.api.errors import plan_limit, plan_locked, rate_limited
 from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
 from app.services.self_hosted_license import resolve_self_hosted_entitlements
@@ -22,15 +22,17 @@ PLAN_LIMITS: dict[str, dict[str, int | None]] = {
         "api_keys": 1,
         "webhook_channels": 1,
         "users": 3,
+        "connections": 5,
         "pipeline_runs_per_month": 20,
         "agent_queries_per_month": 100,
         "studio_dashboards": 5,
-        "studio_query_executions_per_day": 200,
+        "studio_query_executions_per_day": 600,
     },
     "pro": {
         "api_keys": None,
         "webhook_channels": None,
         "users": None,
+        "connections": None,
         "pipeline_runs_per_month": None,
         "agent_queries_per_month": None,
         "studio_dashboards": None,
@@ -49,7 +51,6 @@ def get_plan_limits(plan: str) -> dict[str, int | None]:
 # api_keys and webhook_deliveries are removed — replaced with count-based limits
 # so free users can access them within their quota.
 _CLOUD_FEATURE_PLAN: dict[str, tuple[str, ...]] = {
-    "advanced_analytics": ("pro",),
     "audit_log": ("pro",),
 }
 
@@ -115,8 +116,13 @@ async def max_cloud_free_connections(db: AsyncSession, org_id: UUID, active_coun
     org = await _get_org(db, org_id)
     if org is None:
         return
-    if (org.plan or "free").lower() == "free" and active_count >= 5:
-        raise plan_limit("Active connection limit reached for the free plan (max 5).")
+    plan = (org.plan or "free").lower()
+    limit = get_plan_limits(plan).get("connections")
+    if limit is not None and active_count >= limit:
+        raise plan_limit(
+            f"Active connection limit reached for your plan (max {limit}). "
+            "Remove an existing connection or upgrade to Pro.",
+        )
 
 
 # ── Count-based limit helpers ─────────────────────────────────────────────────
@@ -243,6 +249,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     from app.infrastructure.database.models.pipeline_run import PipelineRun
     from app.infrastructure.database.models.studio_dashboard import StudioDashboard
     from app.infrastructure.database.models.user import User
+    from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
 
     org = await _get_org(db, org_id)
     raw_plan = (org.plan or "free").lower() if org else "free"
@@ -252,6 +259,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     now = datetime.now(timezone.utc)
     first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+    connection_count = await ConnectionRepository(db).count_active(org_id)
     api_key_count = int(
         await db.scalar(
             select(func.count()).select_from(ApiKey).where(
@@ -325,6 +333,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
         "plan": plan,
         "limits": {
             "api_keys": slot(api_key_count, "api_keys"),
+            "connections": slot(connection_count, "connections"),
             "webhook_channels": slot(webhook_channel_count, "webhook_channels"),
             "users": slot(user_count, "users"),
             "pipeline_runs_this_month": slot(pipeline_run_count, "pipeline_runs_per_month"),
