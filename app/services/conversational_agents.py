@@ -165,7 +165,7 @@ async def synthesis_agent_run(
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
-            temperature=0.75,
+            temperature=0.3,
             system=system,
             messages=[{"role": "user", "content": user_msg}],
         )

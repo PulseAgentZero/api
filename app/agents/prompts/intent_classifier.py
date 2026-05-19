@@ -14,14 +14,18 @@ read the user's message and output a single JSON object classifying it.
    when pipeline finished / what the last run produced? -> lookup_pipeline
 4. Is the message NOT about the user's operational data (weather, jokes, code, \
    world events, abuse)? -> off_topic
-5. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
-6. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
-7. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
-8. Does the message ask "why", "explain", "compare", "vs", "trend", "what drove"? -> compare_or_explain
-9. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
-10. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
-11. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
-12. Otherwise truly ambiguous? -> unknown
+5. Does the message ask about churn, fraud, default, readmission, outcome analysis, \
+   or target rates? -> lookup_outcome
+6. Does the message ask about a specific entity's trend/history over time? -> lookup_entity_trend
+7. Does the message ask to compare pipeline runs or what changed since last run? -> compare_runs
+8. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
+9. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
+10. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
+11. Does the message ask "why", "explain", "compare", "vs", "what drove"? -> compare_or_explain
+12. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
+13. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
+14. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
+15. Otherwise truly ambiguous? -> unknown
 
 ## Intent reference
 
@@ -64,9 +68,22 @@ Examples: "5 more like 628", "customers similar to 914", "find lookalikes".
 MUST extract entity_id. Examples: "draft an outreach for 628", \
 "write a message to customer 914", "compose an email to Acme".
 
-**compare_or_explain** — Comparison, trend analysis, causal reasoning. \
+**compare_or_explain** — Comparison, causal reasoning. \
 Examples: "this month vs last", "why is 628 critical?", \
 "compare Lagos vs Kano", "what drove the churn spike".
+
+**lookup_outcome** — Outcome analysis: churn rates, fraud rates, default rates, \
+readmission rates, target column analysis. Examples: "how many customers have churned?", \
+"what's the churn rate?", "show me fraud analysis", "how many defaulted?", \
+"what's the outcome breakdown?", "retention rate".
+
+**lookup_entity_trend** — Historical trend for a SPECIFIC entity over time. MUST have \
+an entity_id. Examples: "show me 628's trend over time", "how has 914 changed?", \
+"history for entity 1613", "evolution of customer 40".
+
+**compare_runs** — Cross-run comparison, diffs between pipeline runs. \
+Examples: "what changed since last run?", "compare the last two runs", \
+"any changes from the previous pipeline?", "run delta", "what's different now?".
 
 ### Fallback
 
@@ -110,7 +127,7 @@ confidence ~0.5 and let the caller ask which entity.
 ## Output JSON shape (every field required)
 
 {
-  "intent": "<one of the 12 names>",
+  "intent": "<one of the 15 names>",
   "confidence": 0.0-1.0,
   "entity_ids": ["628"],
   "tier_filter": "critical" | "high" | "medium" | "low" | null,
@@ -160,4 +177,13 @@ Output: {"intent":"lookup_overview","confidence":0.7,"entity_ids":[],"tier_filte
 
 Input: "???"
 Output: {"intent":"unknown","confidence":0.4,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
+
+Input: "how many customers have churned?"
+Output: {"intent":"lookup_outcome","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
+
+Input: "show me 628's trend over time"
+Output: {"intent":"lookup_entity_trend","confidence":0.95,"entity_ids":["628"],"tier_filter":null,"urgency_filter":null}
+
+Input: "what changed since last run?"
+Output: {"intent":"compare_runs","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
 """

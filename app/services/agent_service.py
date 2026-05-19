@@ -283,6 +283,7 @@ def _condense_tool_result(result: Any, max_chars: int = 500) -> Any:
 
     Keeps the structure but truncates long strings and limits list sizes
     so the persisted context is compact enough to inject into future prompts.
+    Never produces invalid JSON — progressively drops keys if still too large.
     """
     if isinstance(result, dict):
         condensed = {}
@@ -292,11 +293,22 @@ def _condense_tool_result(result: Any, max_chars: int = 500) -> Any:
             elif isinstance(v, list) and len(v) > 5:
                 condensed[k] = v[:5]
                 condensed[f"{k}_total"] = len(v)
+            elif isinstance(v, dict):
+                # Nested dicts: convert to string if too large.
+                nested = json.dumps(v, default=str)
+                if len(nested) > 200:
+                    condensed[k] = nested[:200] + "..."
+                else:
+                    condensed[k] = v
             else:
                 condensed[k] = v
+        # If still too large, progressively drop the heaviest keys.
         raw = json.dumps(condensed, default=str)
-        if len(raw) > max_chars:
-            return json.loads(raw[:max_chars - 1] + "}")
+        while len(raw) > max_chars and condensed:
+            # Find the key whose serialized value is largest and drop it.
+            heaviest = max(condensed, key=lambda k: len(json.dumps(condensed[k], default=str)))
+            del condensed[heaviest]
+            raw = json.dumps(condensed, default=str)
         return condensed
     if isinstance(result, str) and len(result) > max_chars:
         return result[:max_chars]
@@ -915,8 +927,14 @@ async def _run_tool(
     org_id: UUID,
 ) -> dict:
     try:
+        result = None
         if name == "get_overview":
-            return await _overview(db, org_id)
+            result = await _overview(db, org_id)
+            logger.info(
+                "[_run_tool] get_overview: total=%s breakdown=%s",
+                result.get("total_entities"), result.get("risk_breakdown"),
+            )
+            return result
         if name == "get_pipeline_status":
             return await _pipeline_status(db, org_id)
         if name == "get_pipeline_detail":
