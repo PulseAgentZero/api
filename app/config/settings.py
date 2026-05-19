@@ -68,6 +68,15 @@ def _resolve_license_jwt_issuer() -> Optional[str]:
     raw = os.getenv("LICENSE_JWT_ISSUER", _DEFAULT_LICENSE_SERVER_URL).strip()
     return raw or None
 
+
+def _resolve_license_public_key() -> Optional[str]:
+    baked = _pulse_build_config().get("license_public_key")
+    if baked:
+        raw = str(baked).strip()
+        return raw or None
+    raw = os.getenv("PULSE_LICENSE_PUBLIC_KEY", "").strip()
+    return raw or None
+
 VOYAGE_EMBEDDING_MODEL = "voyage-4-large"
 VOYAGE_EMBEDDING_DIMENSION = 1024
 
@@ -204,8 +213,8 @@ class Settings:
     AGENT_SERVICE_URL: Optional[str] = os.getenv("AGENT_SERVICE_URL", "").strip() or None
     LICENSE_SERVER_URL: str = _resolve_license_server_url()
     LICENSE_SERVER_API_KEY: Optional[str] = os.getenv("LICENSE_SERVER_API_KEY", "").strip() or None
-    # RSA PEM for offline plc_* JWT verification (LICENSE_SYSTEM.md)
-    PULSE_LICENSE_PUBLIC_KEY: Optional[str] = os.getenv("PULSE_LICENSE_PUBLIC_KEY", "").strip() or None
+    # RSA PEM for offline plc_* JWT verification — baked into self-hosted image or .env override
+    PULSE_LICENSE_PUBLIC_KEY: Optional[str] = _resolve_license_public_key()
     LICENSE_JWT_ISSUER: Optional[str] = _resolve_license_jwt_issuer()
     LICENSE_OFFLINE_GRACE_DAYS: int = int(os.getenv("LICENSE_OFFLINE_GRACE_DAYS", "7"))
     LICENSE_REVALIDATION_INTERVAL_HOURS: int = int(os.getenv("LICENSE_REVALIDATION_INTERVAL_HOURS", "24"))
@@ -436,6 +445,8 @@ class Settings:
 
     # ------------------------------------------------------------------
     # S3 asset uploads (avatars, logos, CSVs)
+    # S3Backend uses boto3; credentials come from AWS_ACCESS_KEY_ID /
+    # AWS_SECRET_ACCESS_KEY or the instance IAM role (see .env.example).
     # ------------------------------------------------------------------
     ASSETS_S3_BUCKET: Optional[str] = os.getenv("ASSETS_S3_BUCKET")
     ASSETS_S3_PREFIX: str = os.getenv("ASSETS_S3_PREFIX", "pulse/assets")

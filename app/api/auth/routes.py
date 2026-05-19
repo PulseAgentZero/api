@@ -50,11 +50,7 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.audit import log_audit, request_audit_context
 from app.infrastructure.database.session import get_db
-from app.infrastructure.email import (
-    send_password_reset_email,
-    send_verification_email,
-    send_welcome_email,
-)
+from app.services.email_queue import queue_email
 from app.infrastructure.redis import keys as redis_keys
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis import tokens as redis_tokens
@@ -167,17 +163,15 @@ async def signup(
     try:
         if await get_redis() is not None:
             token = await redis_tokens.set_email_verify_token(user.id)
-            await send_verification_email(user.email, token)
+            await queue_email("verification", to=user.email, token=token)
     except Exception:
         logger.exception("verification email skipped for %s", user.email)
-    try:
-        await send_welcome_email(
-            user.email,
-            full_name=user.full_name or "",
-            org_name=org.name,
-        )
-    except Exception:
-        logger.exception("welcome email skipped for %s", user.email)
+    await queue_email(
+        "welcome",
+        to=user.email,
+        full_name=user.full_name or "",
+        org_name=org.name,
+    )
     await db.refresh(user)
     await db.refresh(org)
 
@@ -326,10 +320,7 @@ async def resend_verification(current_user: User = Depends(get_current_user)) ->
         raise bad_request("RATE_LIMITED", "Please wait before requesting another verification email")
     await r.set(rate_key, "1", ex=60)
     token = await redis_tokens.set_email_verify_token(current_user.id)
-    try:
-        await send_verification_email(current_user.email, token)
-    except Exception:
-        logger.exception("resend verification email failed for %s", current_user.email)
+    await queue_email("verification", to=current_user.email, token=token)
     return {"message": "Verification email sent"}
 
 
@@ -339,9 +330,9 @@ async def forgot_password(body: ForgotPasswordRequest, db: AsyncSession = Depend
     if user and user.is_active and await get_redis() is not None:
         try:
             token = await redis_tokens.set_pw_reset_token(user.id)
-            await send_password_reset_email(user.email, token)
+            await queue_email("password_reset", to=user.email, token=token)
         except Exception:
-            logger.exception("pw reset email failed for %s", body.email)
+            logger.exception("pw reset email enqueue failed for %s", body.email)
     return {"message": "If that email exists, a reset link has been sent"}
 
 
@@ -732,14 +723,12 @@ async def oauth_google_complete_signup(
     await db.commit()
     await db.refresh(user)
     await db.refresh(org)
-    try:
-        await send_welcome_email(
-            user.email,
-            full_name=user.full_name or "",
-            org_name=org.name,
-        )
-    except Exception:
-        logger.exception("welcome email skipped for %s", user.email)
+    await queue_email(
+        "welcome",
+        to=user.email,
+        full_name=user.full_name or "",
+        org_name=org.name,
+    )
     access, refresh = await _issue_tokens(user, org.id)
     return TokenResponse(
         access_token=access,

@@ -24,7 +24,7 @@ from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.session import get_db
-from app.infrastructure.email import send_invitation_email
+from app.services.email_queue import queue_email
 from app.infrastructure.redis import tokens as redis_tokens
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -214,17 +214,14 @@ async def invite_user(
     await db.commit()
     await db.refresh(inv)
     org = await db.get(Organization, current_user.org_id)
-    try:
-        await send_invitation_email(
-            to=inv.email,
-            token=token,
-            invited_by=current_user.full_name or current_user.email,
-            org_name=org.name if org else "your organization",
-            role=inv.role,
-        )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).exception("invitation email failed for %s", inv.email)
+    await queue_email(
+        "invitation",
+        to=inv.email,
+        token=token,
+        invited_by=current_user.full_name or current_user.email,
+        org_name=org.name if org else "your organization",
+        role=inv.role,
+    )
     return InviteUserResponse(
         invitation_id=inv.id,
         email=inv.email,
@@ -282,17 +279,14 @@ async def resend_invitation(
     inv.expires_at = datetime.now(timezone.utc) + timedelta(hours=72)
     await db.flush()
     org = await db.get(Organization, current_user.org_id)
-    try:
-        await send_invitation_email(
-            to=inv.email,
-            token=inv.token,
-            invited_by=current_user.full_name or current_user.email,
-            org_name=org.name if org else "your organization",
-            role=inv.role,
-        )
-    except Exception:
-        import logging as _logging
-        _logging.getLogger(__name__).exception("resend invitation email failed for %s", inv.email)
+    await queue_email(
+        "invitation",
+        to=inv.email,
+        token=inv.token,
+        invited_by=current_user.full_name or current_user.email,
+        org_name=org.name if org else "your organization",
+        role=inv.role,
+    )
     await db.commit()
     await db.refresh(inv)
     return InviteUserResponse(

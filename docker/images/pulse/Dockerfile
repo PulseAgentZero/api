@@ -11,6 +11,7 @@
 #     --build-context frontend=../dashboard \
 #     --build-arg PULSE_LICENSE_SERVER_URL=https://license.pulseai.io \
 #     --build-arg PULSE_LICENSE_JWT_ISSUER=https://license.pulseai.io \
+#     --build-arg PULSE_LICENSE_PUBLIC_KEY="$(cat license_public.pem)" \
 #     -t pulseai/pulse:latest \
 #     .
 #
@@ -75,9 +76,10 @@ RUN npm run build
 # ── Stage 3: Runtime image ───────────────────────────────────────────────────
 FROM python:3.12-slim
 
-# License + deployment mode: set only at image build (not via .env or compose at runtime).
+# License + deployment mode: set only at image build (not via customer .env at runtime).
 ARG PULSE_LICENSE_SERVER_URL=https://license.pulseai.io
 ARG PULSE_LICENSE_JWT_ISSUER=https://license.pulseai.io
+ARG PULSE_LICENSE_PUBLIC_KEY=
 
 LABEL org.opencontainers.image.title="Pulse (Self-Hosted)"
 LABEL org.opencontainers.image.vendor="AgentZero"
@@ -89,9 +91,21 @@ ENV PYTHONUNBUFFERED=1 \
     # Tell the backend to allow requests from localhost (nginx in the same container)
     FRONTEND_URL=http://localhost
 
-RUN mkdir -p /etc/pulse && printf '%s\n' \
-    "{\"deployment_mode\":\"self_hosted\",\"license_server_url\":\"${PULSE_LICENSE_SERVER_URL}\",\"license_jwt_issuer\":\"${PULSE_LICENSE_JWT_ISSUER}\"}" \
-    > /etc/pulse/build-config.json
+ENV PULSE_LICENSE_SERVER_URL=${PULSE_LICENSE_SERVER_URL} \
+    PULSE_LICENSE_JWT_ISSUER=${PULSE_LICENSE_JWT_ISSUER} \
+    PULSE_LICENSE_PUBLIC_KEY=${PULSE_LICENSE_PUBLIC_KEY}
+
+RUN mkdir -p /etc/pulse && python3 -c "\
+import json, os; \
+cfg = { \
+    'deployment_mode': 'self_hosted', \
+    'license_server_url': os.environ.get('PULSE_LICENSE_SERVER_URL', '').rstrip('/'), \
+    'license_jwt_issuer': os.environ.get('PULSE_LICENSE_JWT_ISSUER', '').rstrip('/') or None, \
+}; \
+pk = (os.environ.get('PULSE_LICENSE_PUBLIC_KEY') or '').strip(); \
+if pk: cfg['license_public_key'] = pk; \
+open('/etc/pulse/build-config.json', 'w').write(json.dumps(cfg)) \
+"
 
 WORKDIR /app
 

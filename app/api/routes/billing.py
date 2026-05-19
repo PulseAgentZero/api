@@ -74,11 +74,7 @@ from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.session import get_db
-from app.infrastructure.email.sender import (
-    send_license_key_email,
-    send_subscription_failed_email,
-    send_subscription_success_email,
-)
+from app.services.email_queue import queue_email
 from app.services.billing_entitlements import (
     get_effective_cloud_plan,
     paystack_plan_code_for_tier,
@@ -387,7 +383,12 @@ async def verify_payment(
     else:
         next_date = "—"
     org_display = org.name if org else "your organisation"
-    await send_subscription_success_email(current_user.email, org_display, next_date)
+    await queue_email(
+        "subscription_success",
+        to=current_user.email,
+        org_name=org_display,
+        next_payment_date=next_date,
+    )
 
     return await _subscription_payload(db, sub)
 
@@ -587,7 +588,12 @@ async def _on_charge_success(db: AsyncSession, data: dict) -> None:
             org = await _org_name(db, sub.org_id)
             if email and sub.next_payment_date:
                 next_date = sub.next_payment_date.strftime("%B %d, %Y")
-                await send_subscription_success_email(email, org, next_date)
+                await queue_email(
+                    "subscription_success",
+                    to=email,
+                    org_name=org,
+                    next_payment_date=next_date,
+                )
 
 
 async def _on_subscription_create(db: AsyncSession, data: dict) -> None:
@@ -632,7 +638,12 @@ async def _on_subscription_create(db: AsyncSession, data: dict) -> None:
     if email:
         next_date = next_payment.strftime("%B %d, %Y") if next_payment else "—"
         org_display = org.name if org else "your organisation"
-        await send_subscription_success_email(email, org_display, next_date)
+        await queue_email(
+            "subscription_success",
+            to=email,
+            org_name=org_display,
+            next_payment_date=next_date,
+        )
 
 
 async def _on_subscription_disable(db: AsyncSession, data: dict) -> None:
@@ -675,7 +686,7 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
     email = await _org_admin_email(db, sub.org_id)
     org = await _org_name(db, sub.org_id)
     if email:
-        await send_subscription_failed_email(email, org)
+        await queue_email("subscription_failed", to=email, org_name=org)
 
 
 # ── Self-hosted license purchase endpoints ────────────────────────────────────
@@ -787,7 +798,12 @@ async def verify_selfhosted_purchase(
     )
 
     if license_key:
-        await send_license_key_email(delivery_email, license_key, expires_at)
+        await queue_email(
+            "license_key",
+            to=delivery_email,
+            license_key=license_key,
+            expires_at=expires_at,
+        )
         return {
             "status": "success",
             "message": f"License key delivered to {delivery_email}",

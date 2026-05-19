@@ -15,7 +15,7 @@ Config: [`docker-compose.yml`](docker-compose.yml) · env template: [`.env.examp
 ```bash
 cp .env.example .env
 # Edit .env — at minimum set POSTGRES_PASSWORD, JWT_SECRET, ENCRYPTION_KEY,
-# ANTHROPIC_API_KEY or GROQ_API_KEY, and PULSE_LICENSE_PUBLIC_KEY
+# and ANTHROPIC_API_KEY or GROQ_API_KEY
 
 docker compose pull
 docker compose up -d
@@ -44,7 +44,7 @@ Compose sets these for you — do not put them in `.env` unless you know why:
 - `QDRANT_URL` → `http://qdrant:6333`
 - `REDIS_URL` → bundled Redis inside `pulse`
 
-Deployment mode and license server URL are baked into the `pulseai/pulse` image at build time.
+Deployment mode, license server URL, and license verification public key are baked into the `pulseai/pulse` image at build time. Activate Pro with your `plc_…` key in the dashboard after install.
 
 ## Custom port
 

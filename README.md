@@ -33,7 +33,7 @@ Pull and run — similar to n8n: one pre-built **pulse** image (UI, API, worker,
 
 ```bash
 cd docker/compose/self-hosted
-cp .env.example .env   # fill POSTGRES_PASSWORD, JWT_SECRET, ENCRYPTION_KEY, LLM keys, PULSE_LICENSE_PUBLIC_KEY
+cp .env.example .env   # fill POSTGRES_PASSWORD, JWT_SECRET, ENCRYPTION_KEY, LLM keys
 docker compose pull
 docker compose up -d
 open http://localhost
@@ -85,7 +85,7 @@ Copy `.env.example` to `.env` and fill in:
 | `QDRANT_URL` | Self-hosted compose | Set automatically to `http://qdrant:6333` — optional for local dev |
 | `FRONTEND_URL` | No | CORS origin — default `http://localhost:3000` |
 | `LICENSE_SERVER_URL` | Self-hosted image | Set at **image build** via `--build-arg PULSE_LICENSE_SERVER_URL=...` (baked into `/etc/pulse/build-config.json`; not in `.env`) |
-| `PULSE_LICENSE_PUBLIC_KEY` | Self-hosted | RSA public PEM matching `LICENSE_SIGNING_PRIVATE_KEY` on the license server (set in `.env` at deploy) |
+| `PULSE_LICENSE_PUBLIC_KEY` | Self-hosted image build | RSA public PEM via `--build-arg` when building `pulseai/pulse` (baked into `/etc/pulse/build-config.json`; customers do not set this) |
 | `LICENSE_SIGNING_PRIVATE_KEY` | License service (cloud compose) | RSA private PEM — license container only |
 | `LICENSE_SERVER_API_KEY` | Cloud `.env` + license service | Shared secret for Paystack → `POST /api/v1/keys/purchase` (cloud API does not need this for normal SaaS tenants) |
 | `DEPLOYMENT_MODE` | Cloud compose | `cloud` — enables Paystack subscriptions; `self_hosted` hides `/billing` subscription routes |

@@ -1,4 +1,4 @@
-"""Background worker — consumes pipeline and introspection jobs from Redis (docker `command: worker`)."""
+"""Background worker — consumes email, pipeline, introspection, and studio jobs from Redis."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
 from app.infrastructure.redis.client import close_redis, get_redis
+from app.services.email_queue import EMAIL_QUEUE_KEY, dispatch_email_job
 from app.services.pipeline_queue import (
     INTROSPECTION_QUEUE_KEY,
     PIPELINE_QUEUE_KEY,
@@ -22,7 +23,12 @@ from app.services.pipeline_queue import (
 configure_logging()
 logger = logging.getLogger(__name__)
 
-_ALL_QUEUES = [PIPELINE_QUEUE_KEY, INTROSPECTION_QUEUE_KEY, STUDIO_QUERY_QUEUE_KEY]
+_ALL_QUEUES = [
+    EMAIL_QUEUE_KEY,
+    PIPELINE_QUEUE_KEY,
+    INTROSPECTION_QUEUE_KEY,
+    STUDIO_QUERY_QUEUE_KEY,
+]
 
 
 async def _handle_pipeline(data: dict) -> None:
@@ -61,6 +67,10 @@ async def _handle_introspection(data: dict) -> None:
         )
         await session.commit()
     logger.info("Introspection complete connection_id=%s org_id=%s", connection_id, org_id)
+
+
+async def _handle_email(data: dict) -> None:
+    await dispatch_email_job(data)
 
 
 async def _handle_studio_query(data: dict) -> None:
@@ -161,7 +171,9 @@ async def _loop() -> None:
 
         job_type = data.get("job_type", "pipeline" if queue_key == PIPELINE_QUEUE_KEY else None)
         try:
-            if job_type == "studio_query" or queue_key == STUDIO_QUERY_QUEUE_KEY:
+            if job_type == "email" or queue_key == EMAIL_QUEUE_KEY:
+                await _handle_email(data)
+            elif job_type == "studio_query" or queue_key == STUDIO_QUERY_QUEUE_KEY:
                 await _handle_studio_query(data)
             elif job_type == "introspection" or queue_key == INTROSPECTION_QUEUE_KEY:
                 await _handle_introspection(data)

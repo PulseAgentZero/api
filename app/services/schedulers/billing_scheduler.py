@@ -14,7 +14,7 @@ from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.session import async_session_factory
-from app.infrastructure.email.sender import send_subscription_renewal_reminder_email
+from app.services.email_queue import queue_email
 from app.services.billing_entitlements import downgrade_org_after_grace, is_grace_expired
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,8 @@ async def _send_renewal_reminders() -> None:
                     else "tomorrow"
                 )
 
-                await send_subscription_renewal_reminder_email(
+                await queue_email(
+                    "subscription_renewal_reminder",
                     to=admin_row[0],
                     org_name=org_name,
                     renewal_date=renewal_date,

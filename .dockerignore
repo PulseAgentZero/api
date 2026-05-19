@@ -17,3 +17,15 @@ venv
 .DS_Store
 docker/compose
 deploy/
+
+BACKEND_ROUTES.md
+LICENSE_SYSTEM.md
+BUG_AUDIT.md
+STUDIO_README.md
+license_public.pem
+license_private.pem
+
+.kube/
+skills-lock.json
+.postman
+postman
