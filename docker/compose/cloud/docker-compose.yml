@@ -239,6 +239,7 @@ services:
       - "${LICENSE_PORT:-8072}:8002"
     networks:
       - pulse
+      - reverse-proxy_nginx-network 
     depends_on:
       postgres:
         condition: service_healthy
