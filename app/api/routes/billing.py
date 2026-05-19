@@ -687,6 +687,12 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
     org = await _org_name(db, sub.org_id)
     if email:
         await queue_email("subscription_failed", to=email, org_name=org)
+    try:
+        from app.services.notification_service import notify_payment_failed
+
+        await notify_payment_failed(db, sub.org_id)
+    except Exception:
+        logger.exception("In-app payment-failed notification skipped for org %s", sub.org_id)
 
 
 # ── Self-hosted license purchase endpoints ────────────────────────────────────

@@ -401,7 +401,24 @@ class PipelineOrchestrator:
             rag_metrics=rag_metrics_payload,
         )
 
-        if not state.get("error"):
+        if state.get("error"):
+            try:
+                from app.services.notification_service import notify_pipeline_failed
+
+                await notify_pipeline_failed(
+                    self._session,
+                    org_id,
+                    pipeline_run_id=run.id,
+                    error_message=state.get("error"),
+                )
+                await self._session.commit()
+            except Exception as e:
+                logger.warning("[Pipeline] Failure notification skipped: %s", e)
+                try:
+                    await self._session.rollback()
+                except Exception:
+                    pass
+        else:
             try:
                 from app.services.alert_evaluation import evaluate_alerts_after_pipeline
 

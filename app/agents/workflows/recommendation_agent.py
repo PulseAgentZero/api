@@ -196,6 +196,34 @@ class RecommendationAgent(BaseAgent):
             rtype = rec.get("type", "other")
             by_type[rtype] = by_type.get(rtype, 0) + 1
 
+        if created > 0:
+            critical_n = by_urgency.get("critical", 0)
+            high_n = by_urgency.get("high", 0)
+            if critical_n or high_n:
+                pipeline_run_id: UUID | None = None
+                if state.get("pipeline_run_id"):
+                    try:
+                        pipeline_run_id = UUID(str(state["pipeline_run_id"]))
+                    except (ValueError, TypeError):
+                        pipeline_run_id = None
+                try:
+                    from app.services.notification_service import (
+                        notify_high_priority_recommendations,
+                    )
+
+                    await notify_high_priority_recommendations(
+                        db,
+                        org_id,
+                        critical_count=critical_n,
+                        high_count=high_n,
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                except Exception as notify_exc:
+                    logger.warning(
+                        "[RecommendationAgent] In-app notification failed: %s",
+                        notify_exc,
+                    )
+
         state["recommendations"] = all_recs
         state["recommendation_stats"] = {
             "total_generated": created,

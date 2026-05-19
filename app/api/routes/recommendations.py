@@ -4,13 +4,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.errors import bad_request, not_found
-from app.infrastructure.database.models.org_notification import OrgNotification
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.repositories.recommendation_repository import (
@@ -194,25 +192,18 @@ async def escalate_recommendation(
     rec.status = "escalated"
     touch_updated_at(rec)
     await db.flush()
-    mgrs = await db.execute(
-        select(User).where(
-            User.org_id == current_user.org_id,
-            User.is_active.is_(True),
-            User.role.in_(("admin", "manager")),
-        )
+    from app.services.notification_service import dashboard_url, notify_admins_and_managers
+
+    await notify_admins_and_managers(
+        db,
+        current_user.org_id,
+        title="Recommendation escalated",
+        body=rec.title,
+        type="warning",
+        source="recommendation",
+        source_id=rec.id,
+        action_url=dashboard_url(f"/dashboard/recommendations"),
     )
-    for u in mgrs.scalars().all():
-        db.add(
-            OrgNotification(
-                org_id=current_user.org_id,
-                user_id=u.id,
-                title="Recommendation escalated",
-                body=rec.title,
-                type="warning",
-                source="recommendation",
-                source_id=rec.id,
-            )
-        )
     await log_audit(
         db,
         org_id=current_user.org_id,

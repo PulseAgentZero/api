@@ -17,6 +17,8 @@ from app.infrastructure.database.models.pipeline_schedule import PipelineSchedul
 from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
 from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.database.repositories.schema_mapping_repository import SchemaMappingRepository
+from app.infrastructure.database.repositories.user_repository import UserRepository
+from app.services.email_queue import queue_email
 from app.services.recommendation_service import ClientDBError, generate_recommendations_for_org
 
 logger = logging.getLogger(__name__)
@@ -104,6 +106,19 @@ async def complete_org_setup(
     )
     await db.commit()
 
+    if completed_by is not None:
+        try:
+            user = await UserRepository(db).get_by_id(completed_by)
+            if user and user.email:
+                await queue_email(
+                    "welcome",
+                    to=user.email,
+                    full_name=user.full_name or "",
+                    org_name=org.name,
+                )
+        except Exception:
+            logger.exception("Welcome email skipped after onboarding for org %s", org_id)
+
     if active_conn is not None and active_map is not None:
         from app.services.schedulers.pipeline_scheduler import trigger_pipeline_now
 
@@ -121,7 +136,12 @@ def _has_business_context(org: Organization) -> bool:
     return bool((org.business_context or "").strip())
 
 
-async def try_auto_complete_setup(db: AsyncSession, org_id: UUID) -> CompleteSetupResult | None:
+async def try_auto_complete_setup(
+    db: AsyncSession,
+    org_id: UUID,
+    *,
+    completed_by: UUID | None = None,
+) -> CompleteSetupResult | None:
     """Complete setup when business context and an active connection exist."""
     org = await OrganizationRepository(db).get_by_id(org_id)
     if not org or org.onboarding_done or not _has_business_context(org):
@@ -132,4 +152,4 @@ async def try_auto_complete_setup(db: AsyncSession, org_id: UUID) -> CompleteSet
     if not has_active:
         return None
 
-    return await complete_org_setup(db, org_id)
+    return await complete_org_setup(db, org_id, completed_by=completed_by)

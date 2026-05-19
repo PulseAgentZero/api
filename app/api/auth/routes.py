@@ -189,12 +189,6 @@ async def signup(
             await queue_email("verification", to=user.email, token=token)
     except Exception:
         logger.exception("verification email skipped for %s", user.email)
-    await queue_email(
-        "welcome",
-        to=user.email,
-        full_name=user.full_name or "",
-        org_name=org.name,
-    )
     await db.refresh(user)
     await db.refresh(org)
 
@@ -795,12 +789,6 @@ async def oauth_google_complete_signup(
     await db.commit()
     await db.refresh(user)
     await db.refresh(org)
-    await queue_email(
-        "welcome",
-        to=user.email,
-        full_name=user.full_name or "",
-        org_name=org.name,
-    )
     access, refresh = await _issue_tokens(user, org.id)
     return TokenResponse(
         access_token=access,

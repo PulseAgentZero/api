@@ -175,10 +175,10 @@ _public_tags = [
 ]
 
 public_app = FastAPI(
-    title="Pulse Public API",
+    title="Entivia Public API",
     description="See the overview below for authentication, envelopes, and rate limits.",
     version="1.0.0",
-    contact={"name": "Pulse Support", "email": "support@pulseai.io"},
+    contact={"name": "Entivia Support", "email": "support@entivia.online"},
     openapi_tags=_public_tags,
     docs_url=None if _is_prod else "/docs",
     redoc_url="/redoc",

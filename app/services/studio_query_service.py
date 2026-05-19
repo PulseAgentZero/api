@@ -168,6 +168,8 @@ def _serialize_value(v: Any) -> Any:
         return base64.b64encode(v).decode()
     if isinstance(v, UUID):
         return str(v)
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, default=str, ensure_ascii=False)
     return v
 
 

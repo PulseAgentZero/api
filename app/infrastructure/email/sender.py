@@ -159,13 +159,13 @@ async def _send(*, to: str, subject: str, html: str) -> bool:
 async def send_verification_email(to: str, token: str) -> None:
     link = f"{settings.FRONTEND_URL.rstrip('/')}/auth/verify-email?token={token}"
     html = _render("verify_email.html", subject="Verify your email address", link=link)
-    await _send(to=to, subject="Verify your Pulse email address", html=html)
+    await _send(to=to, subject="Verify your Entivia email address", html=html)
 
 
 async def send_password_reset_email(to: str, token: str) -> None:
     link = f"{settings.FRONTEND_URL.rstrip('/')}/auth/reset-password?token={token}"
     html = _render("reset_password.html", subject="Reset your password", link=link, email=to)
-    await _send(to=to, subject="Reset your Pulse password", html=html)
+    await _send(to=to, subject="Reset your Entivia password", html=html)
 
 
 async def send_welcome_email(
@@ -178,12 +178,12 @@ async def send_welcome_email(
     display_name = (full_name or "").strip() or "there"
     html = _render(
         "welcome.html",
-        subject=f"Welcome to Pulse — {org_name}",
+        subject=f"Welcome to Entivia — {org_name}",
         full_name=display_name,
         org_name=org_name,
         dashboard_url=dashboard_url,
     )
-    await _send(to=to, subject=f"Welcome to Pulse — {org_name}", html=html)
+    await _send(to=to, subject=f"Welcome to Entivia — {org_name}", html=html)
 
 
 async def send_invitation_email(to: str, token: str, invited_by: str, org_name: str, role: str = "member") -> None:
@@ -196,19 +196,19 @@ async def send_invitation_email(to: str, token: str, invited_by: str, org_name: 
         org_name=org_name,
         role=role,
     )
-    await _send(to=to, subject=f"You've been invited to join {org_name} on Pulse", html=html)
+    await _send(to=to, subject=f"You've been invited to join {org_name} on Entivia", html=html)
 
 
 async def send_subscription_success_email(to: str, org_name: str, next_payment_date: str) -> None:
     dashboard_url = f"{settings.FRONTEND_URL.rstrip('/')}/dashboard"
     html = _render(
         "subscription_success.html",
-        subject="You're now on Pulse Pro",
+        subject="You're now on Entivia Pro",
         org_name=org_name,
         next_payment_date=next_payment_date,
         dashboard_url=dashboard_url,
     )
-    await _send(to=to, subject="You're now on Pulse Pro 🎉", html=html)
+    await _send(to=to, subject="You're now on Entivia Pro 🎉", html=html)
 
 
 async def send_subscription_failed_email(to: str, org_name: str) -> None:
@@ -219,28 +219,28 @@ async def send_subscription_failed_email(to: str, org_name: str) -> None:
         org_name=org_name,
         manage_url=manage_url,
     )
-    await _send(to=to, subject="Action required: Pulse Pro payment failed", html=html)
+    await _send(to=to, subject="Action required: Entivia Pro payment failed", html=html)
 
 
 async def send_subscription_renewal_reminder_email(to: str, org_name: str, renewal_date: str) -> None:
     manage_url = f"{settings.FRONTEND_URL.rstrip('/')}/settings/billing"
     html = _render(
         "subscription_renewal_reminder.html",
-        subject="Your Pulse Pro subscription renews tomorrow",
+        subject="Your Entivia Pro subscription renews tomorrow",
         org_name=org_name,
         renewal_date=renewal_date,
         manage_url=manage_url,
     )
-    await _send(to=to, subject="Reminder: Your Pulse Pro subscription renews tomorrow", html=html)
+    await _send(to=to, subject="Reminder: Your Entivia Pro subscription renews tomorrow", html=html)
 
 
 async def send_license_key_email(to: str, license_key: str, expires_at: str | None = None) -> None:
     activate_docs_url = f"{settings.FRONTEND_URL.rstrip('/')}/docs/license-activation"
     html = _render(
         "license_purchase_success.html",
-        subject="Your Pulse license key is ready",
+        subject="Your Entivia license key is ready",
         license_key=license_key,
         expires_at=expires_at,
         activate_docs_url=activate_docs_url,
     )
-    await _send(to=to, subject="Your Pulse self-hosted license key", html=html)
+    await _send(to=to, subject="Your Entivia self-hosted license key", html=html)

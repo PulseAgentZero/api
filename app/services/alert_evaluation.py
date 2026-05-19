@@ -17,6 +17,7 @@ from app.infrastructure.database.models.alert_rule import AlertRule
 from app.infrastructure.database.models.notification_channel import NotificationChannel
 from app.infrastructure.database.models.entity_profile import EntityProfile
 from app.infrastructure.database.models.recommendation import Recommendation
+from app.services.notification_service import notify_alert_triggered
 from app.services.webhook_dispatch import deliver_webhook_payload
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,20 @@ async def evaluate_alerts_after_pipeline(
 
             rule.last_triggered_at = now
             touch_updated_at(rule)
+
+            try:
+                await notify_alert_triggered(
+                    db,
+                    org_id,
+                    rule_name=rule.name,
+                    metric=rule.metric,
+                    metric_value=float(value),
+                    operator=rule.operator,
+                    threshold=float(threshold),
+                    alert_event_id=event.id,
+                )
+            except Exception as e:
+                logger.warning("In-app alert notification failed for rule %s: %s", rule.id, e)
 
             payload = {
                 "event": "pulse.alert.triggered",

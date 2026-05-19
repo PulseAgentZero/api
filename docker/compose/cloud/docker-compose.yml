@@ -21,7 +21,7 @@
 # Nginx upstream DNS (reverse-proxy_nginx-network aliases):
 #   api      → pulse-api
 #   license  → pulse-license
-#   dashboard frontend (separate compose) → pulse-frontend — see docker/compose/dashboard/
+#   dashboard frontend (dashboard repo compose) → pulse-frontend
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-app: &app

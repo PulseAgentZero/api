@@ -321,7 +321,12 @@ async def _get_current_connection(db: AsyncSession, org_id) -> object:
     return conns[-1]
 
 
-async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
+async def _test_and_mark_connection(
+    conn,
+    db: AsyncSession,
+    org_id: UUID,
+) -> tuple[bool, str, str | None]:
+    previous_status = conn.status
     success, message, db_version = await test_connection_record(
         conn,
         decrypt_dsn=decrypt_dsn,
@@ -330,6 +335,22 @@ async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
     conn.last_tested_at = datetime.now(timezone.utc)
     conn.last_test_error = None if success else message
     touch_updated_at(conn)
+    if not success and previous_status == "active":
+        try:
+            from app.services.notification_service import notify_connection_test_failed
+
+            await notify_connection_test_failed(
+                db,
+                org_id,
+                connection_id=conn.id,
+                connection_name=conn.name or "Connection",
+                error_message=message,
+            )
+        except Exception:
+            logger.exception(
+                "In-app connection-failure notification skipped for connection %s",
+                conn.id,
+            )
     return success, message, db_version
 
 
@@ -384,7 +405,9 @@ async def upload_connection_file(
     )
     conn.config = {"upload_path": dest_path, "original_filename": file.filename}
     touch_updated_at(conn)
-    success, message, _db_version = await _test_and_mark_connection(conn)
+    success, message, _db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
     await db.commit()
     await db.refresh(conn)
     if not success:
@@ -408,7 +431,9 @@ async def test_current_connection(
     """
     conn = await _get_current_connection(db, current_user.org_id)
     _assert_live(conn)
-    success, message, db_version = await _test_and_mark_connection(conn)
+    success, message, db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
     await db.flush()
     await db.commit()
     if not success:
@@ -529,7 +554,9 @@ async def create_connection(
         connector_type=built.get("connector_type"),
         connection_meta=built.get("connection_meta") or {},
     )
-    success, message, _db_version = await _test_and_mark_connection(conn)
+    success, message, _db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
     if success:
         await log_audit(
             db,
@@ -601,7 +628,9 @@ async def _update_connection_record(
             conn.name = payload["name"]
         if "sslmode" in payload:
             conn.sslmode = payload["sslmode"]
-        success, message, _db_version = await _test_and_mark_connection(conn)
+        success, message, _db_version = await _test_and_mark_connection(
+            conn, db, conn.org_id
+        )
         await db.flush()
         await db.commit()
         if not success:
@@ -659,7 +688,7 @@ async def _update_connection_record(
             )
         )
 
-    success, message, _db_version = await _test_and_mark_connection(conn)
+    success, message, _db_version = await _test_and_mark_connection(conn, db, conn.org_id)
     await db.flush()
     await db.commit()
     if not success:
@@ -708,7 +737,9 @@ async def test_db_connection(
         raise not_found("Connection not found")
     _assert_live(conn)
 
-    success, message, db_version = await _test_and_mark_connection(conn)
+    success, message, db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
     await db.flush()
     await db.commit()
     if not success:

@@ -115,7 +115,9 @@ async def patch_member_settings(
 
     if not org.onboarding_done and (org.business_context or "").strip():
         try:
-            await try_auto_complete_setup(db, current_user.org_id)
+            await try_auto_complete_setup(
+                db, current_user.org_id, completed_by=current_user.id
+            )
             await db.refresh(org)
         except HTTPException:
             raise

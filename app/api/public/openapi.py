@@ -17,7 +17,7 @@ _UNAUTHENTICATED_PATH_PREFIXES = (
 )
 
 _PUBLIC_API_DESCRIPTION = """
-# Pulse Public API
+# Entivia Public API
 
 Programmatic access to **profiled entities**, **AI recommendations**, **pipeline runs**, and **org analytics** for integrations, data warehouses, and custom apps.
 
@@ -39,7 +39,7 @@ All paths in this spec are relative to that base. Example: list entities → `GE
 
 Most endpoints require an **API key** in the `X-API-Key` header.
 
-1. Sign in to Pulse → **Settings → API Keys**
+1. Sign in to Entivia → **Settings → API Keys**
 2. Create a key with scope **`read`** (GET only) or **`write`** (GET + POST)
 3. Send the key on every request:
 
@@ -121,7 +121,7 @@ Without Redis, API-key rate limits are not enforced (not recommended for product
 
 ---
 
-## Pulse Studio (public dashboards)
+## Entivia Studio (public dashboards)
 
 The **Studio** tag covers **unauthenticated** endpoints for shared dashboards:
 
@@ -158,7 +158,7 @@ _PUBLIC_TAG_DESCRIPTIONS: dict[str, str] = {
         "Org-level aggregates: entity counts, risk distribution, open recommendations, and pipeline activity."
     ),
     "Studio": (
-        "**No API key required.** View shareable Pulse Studio dashboards by slug or embed token. "
+        "**No API key required.** View shareable Entivia Studio dashboards by slug or embed token. "
         "Rate-limited per IP when Redis is enabled."
     ),
 }
@@ -293,7 +293,7 @@ def configure_public_openapi(
         schema["info"]["contact"] = public_app.contact
         schema["info"]["license"] = {
             "name": "Proprietary",
-            "url": "https://pulseai.io/terms",
+            "url": "https://entivia.online/terms",
         }
 
         components = schema.setdefault("components", {})

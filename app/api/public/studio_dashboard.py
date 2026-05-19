@@ -170,7 +170,7 @@ async def get_public_dashboard(
     db: AsyncSession = Depends(get_db),
 ) -> PublicDashboardResponse:
     """
-    Load a **public** Pulse Studio dashboard by its slug. **No `X-API-Key` header required.**
+    Load a **public** Entivia Studio dashboard by its slug. **No `X-API-Key` header required.**
 
     Visitors and embedded iframes use this URL. The dashboard owner must have enabled
     **Make public** in Studio, which assigns the slug.
