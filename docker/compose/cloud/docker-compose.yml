@@ -43,7 +43,7 @@ x-app: &app
     - ../../../logs:/app/logs
   networks:
     - pulse
-    # - reverse-proxy_nginx-network 
+    - reverse-proxy_nginx-network 
   dns:
     - 8.8.8.8
     - 8.8.4.4
@@ -71,7 +71,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
-      # - reverse-proxy_nginx-network 
+      - reverse-proxy_nginx-network 
       - pulse
     restart: unless-stopped
     healthcheck:
@@ -239,7 +239,7 @@ services:
     ports:
       - "${LICENSE_PORT:-8072}:8002"
     networks:
-      # - reverse-proxy_nginx-network 
+      - reverse-proxy_nginx-network 
       - pulse
     depends_on:
       postgres:
@@ -264,5 +264,5 @@ volumes:
 networks:
   pulse:
     driver: bridge
-  # reverse-proxy_nginx-network:
-  #   external: true
+  reverse-proxy_nginx-network:
+    external: true
