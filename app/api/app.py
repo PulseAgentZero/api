@@ -41,26 +41,6 @@ from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
 from app.infrastructure.redis.client import close_redis
-from app.services.schedulers.license_scheduler import (
-    shutdown_license_scheduler,
-    start_license_scheduler,
-)
-from app.services.schedulers.billing_scheduler import (
-    shutdown_billing_scheduler,
-    start_billing_scheduler,
-)
-from app.services.schedulers.usage_reset_scheduler import (
-    shutdown_usage_reset_scheduler,
-    start_usage_reset_scheduler,
-)
-from app.services.schedulers.memory_prune_scheduler import (
-    shutdown_memory_prune_scheduler,
-    start_memory_prune_scheduler,
-)
-from app.services.schedulers.pipeline_scheduler import (
-    shutdown_scheduler,
-    start_pipeline_scheduler,
-)
 
 configure_logging()
 
@@ -93,19 +73,11 @@ def _mount_local_storage(app: "FastAPI") -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-    scheduler = await start_pipeline_scheduler()
-    await start_license_scheduler()
-    await start_memory_prune_scheduler()
-    await start_billing_scheduler()
-    await start_usage_reset_scheduler()
+    # All APScheduler crons run in the dedicated scheduler process only
+    # (docker compose `scheduler`, self-hosted supervisord, or `python -m app.services.schedulers.run`).
     try:
         yield
     finally:
-        shutdown_scheduler()
-        shutdown_license_scheduler()
-        shutdown_memory_prune_scheduler()
-        shutdown_billing_scheduler()
-        shutdown_usage_reset_scheduler()
         await close_redis()
 
 

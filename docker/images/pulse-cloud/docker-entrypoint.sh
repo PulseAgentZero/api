@@ -52,8 +52,8 @@ case "$SERVICE" in
     ;;
 
   scheduler)
-    # Always run exactly ONE instance — uses a Redis distributed lock internally.
-    exec python -m app.services.schedulers.pipeline_scheduler
+    # Always run exactly ONE replica — all APScheduler crons live here.
+    exec python -m app.services.schedulers.run
     ;;
 
   *)

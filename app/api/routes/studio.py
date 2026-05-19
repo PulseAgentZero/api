@@ -73,15 +73,12 @@ from app.infrastructure.database.repositories.studio_visualization_repository im
 from app.infrastructure.database.session import get_db
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis.keys import studio_embed, studio_run_result
-from app.services.schedulers.studio_refresh_scheduler import (
-    schedule_query_refresh,
-    unschedule_query_refresh,
-)
 from app.services.studio_query_service import (
     _is_select_only,
     execute_studio_query,
     extract_param_names,
 )
+from app.services.studio_time_range import merge_dashboard_param_values
 from app.api.schemas.connection import IntrospectResponse
 
 logger = logging.getLogger(__name__)
@@ -215,11 +212,14 @@ async def execute_query(
     - 400 PARAM_MISSING — a placeholder has no value and no default.
     - 429 RATE_LIMITED — daily execution budget exceeded (free plan).
     """
+    from app.api.dependencies.plan_gate import get_org_plan
+
     redis = await get_redis()
+    org_plan = await get_org_plan(db, current_user.org_id)
     result = await execute_studio_query(
         db, current_user.org_id, body.connection_id, body.sql_text,
         param_defs=[], param_values=body.param_values,
-        page=body.page, page_size=body.page_size, redis=redis,
+        page=body.page, page_size=body.page_size, redis=redis, org_plan=org_plan,
     )
     await log_audit(
         db, org_id=current_user.org_id, user_id=current_user.id,
@@ -484,8 +484,8 @@ async def create_query(
     - `sql_text` — must be a SELECT statement. Use `{{param_name}}` for parameters.
     - `params` — declare each placeholder: `[{name, type, default_value, label}]`.
     - `tags` — list of tag strings for organization (max 20).
-    - `refresh_cron` — standard cron expression for auto-refresh, e.g. `"0 */6 * * *"`.
-    - `refresh_enabled` — set true to activate the cron refresh.
+    - `refresh_cron` — standard cron expression for server-side cache warming, e.g. `"0 */6 * * *"`.
+    - `refresh_enabled` — set true to activate cron refresh (picked up by the scheduler process within ~5 minutes).
 
     **Errors:**
     - 400 INVALID_SQL — not a SELECT.
@@ -510,8 +510,6 @@ async def create_query(
     )
     await db.commit()
     await db.refresh(q)
-    if q.refresh_enabled and q.refresh_cron:
-        schedule_query_refresh(q.id, q.refresh_cron)
     return StudioQueryResponse.model_validate(q)
 
 
@@ -550,7 +548,7 @@ async def update_query(
     **Roles required:** analyst (own queries only), manager/admin (any query)
 
     All fields are optional — only provided fields are updated.
-    Changing `refresh_cron` or `refresh_enabled` immediately updates the scheduler.
+    Changing `refresh_cron` or `refresh_enabled` is applied by the scheduler process within ~5 minutes.
 
     **Errors:**
     - 403 FORBIDDEN — analyst trying to edit another user's query.
@@ -594,11 +592,6 @@ async def update_query(
     await db.commit()
     await db.refresh(q)
 
-    if q.refresh_enabled and q.refresh_cron:
-        schedule_query_refresh(q.id, q.refresh_cron)
-    else:
-        unschedule_query_refresh(q.id)
-
     return StudioQueryResponse.model_validate(q)
 
 
@@ -617,7 +610,6 @@ async def delete_query(
     q = await StudioQueryRepository(db).get_by_id_and_org(query_id, current_user.org_id)
     if not q:
         raise not_found("Query not found")
-    unschedule_query_refresh(query_id)
     await StudioQueryRepository(db).delete(q)
     await db.commit()
 
@@ -664,12 +656,15 @@ async def run_saved_query(
     )
 
     if not queued:
+        from app.api.dependencies.plan_gate import get_org_plan
+
+        org_plan = await get_org_plan(db, current_user.org_id)
         await run_repo.mark_running(run)
         try:
             result = await execute_studio_query(
                 db, current_user.org_id, q.connection_id, q.sql_text,
                 param_defs=q.params or [], param_values=run_body.param_values,
-                page=1, page_size=5000, redis=None,
+                page=1, page_size=5000, redis=None, org_plan=org_plan,
             )
             await run_repo.mark_completed(run, result["total"])
             await repo.touch_last_run(q, result["total"])
@@ -1099,6 +1094,9 @@ async def create_dashboard(
     if body.is_public:
         slug = await _generate_slug(body.name, repo)
 
+    time_range_dict = (
+        body.time_range.model_dump(by_alias=True) if body.time_range else {}
+    )
     dashboard = await repo.create(
         current_user.org_id, current_user.id,
         name=body.name, description=body.description,
@@ -1106,6 +1104,8 @@ async def create_dashboard(
         layout=[item.model_dump() for item in body.layout],
         dashboard_params=[p.model_dump() for p in body.dashboard_params],
         tags=body.tags,
+        refresh_interval_seconds=body.refresh_interval_seconds,
+        time_range=time_range_dict,
     )
     await db.commit()
     await db.refresh(dashboard)
@@ -1149,9 +1149,12 @@ async def execute_dashboard(
 
     This is the primary endpoint for applying dashboard filters. Pass `param_values` matching
     the dashboard's `dashboard_params` definitions — they override each query's defaults.
+    The dashboard `time_range` (or optional `time_range` in the request body) injects
+    `__time_from` and `__time_to` into every query.
 
     **Request:**
     - `param_values` — dict of `{param_name: value}` matching the dashboard's filter definitions.
+    - `time_range` — optional override of the dashboard's saved time range preset.
 
     **Response:**
     - `results` — one entry per visualization: `{visualization_id, result | null, error | null}`.
@@ -1163,8 +1166,19 @@ async def execute_dashboard(
     if not dashboard:
         raise not_found("Dashboard not found")
 
+    from app.api.dependencies.plan_gate import get_org_plan
+
     items = await StudioDashboardItemRepository(db).list_by_dashboard(dashboard_id, current_user.org_id)
     redis = await get_redis()
+    org_plan = await get_org_plan(db, current_user.org_id)
+
+    effective_time_range = (
+        body.time_range.model_dump(by_alias=True)
+        if body.time_range is not None
+        else (dashboard.time_range or {})
+    )
+    merged_params = merge_dashboard_param_values(body.param_values, effective_time_range)
+
     results: list[DashboardExecuteItemResult] = []
 
     for item in items:
@@ -1179,8 +1193,8 @@ async def execute_dashboard(
         try:
             raw = await execute_studio_query(
                 db, current_user.org_id, q.connection_id, q.sql_text,
-                param_defs=q.params or [], param_values=body.param_values,
-                page=1, page_size=500, redis=redis,
+                param_defs=q.params or [], param_values=merged_params,
+                page=1, page_size=500, redis=redis, org_plan=org_plan,
             )
             results.append(DashboardExecuteItemResult(
                 visualization_id=item.visualization_id,
@@ -1229,6 +1243,10 @@ async def update_dashboard(
         updates["dashboard_params"] = [p.model_dump() for p in body.dashboard_params]
     if body.tags is not None:
         updates["tags"] = body.tags
+    if "refresh_interval_seconds" in body.model_fields_set:
+        updates["refresh_interval_seconds"] = body.refresh_interval_seconds
+    if body.time_range is not None:
+        updates["time_range"] = body.time_range.model_dump(by_alias=True)
     if body.is_public is not None:
         updates["is_public"] = body.is_public
         if body.is_public and not dashboard.slug:
@@ -1296,6 +1314,8 @@ async def fork_dashboard(
         layout=source.layout,
         dashboard_params=source.dashboard_params,
         tags=source.tags,
+        refresh_interval_seconds=source.refresh_interval_seconds,
+        time_range=source.time_range or {},
     )
 
     items = await StudioDashboardItemRepository(db).list_by_dashboard(dashboard_id, current_user.org_id)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.errors import plan_limit, plan_locked, rate_limited
 from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
+from app.services.billing_entitlements import get_effective_cloud_plan
 from app.services.self_hosted_license import resolve_self_hosted_entitlements
 
 # ── Plan limits ───────────────────────────────────────────────────────────────
@@ -27,6 +28,16 @@ PLAN_LIMITS: dict[str, dict[str, int | None]] = {
         "agent_queries_per_month": 100,
         "studio_dashboards": 5,
         "studio_query_executions_per_day": 600,
+    },
+    "growth": {
+        "api_keys": 5,
+        "webhook_channels": 3,
+        "users": 10,
+        "connections": 15,
+        "pipeline_runs_per_month": 100,
+        "agent_queries_per_month": 500,
+        "studio_dashboards": 20,
+        "studio_query_executions_per_day": 2000,
     },
     "pro": {
         "api_keys": None,
@@ -47,6 +58,22 @@ def get_plan_limits(plan: str) -> dict[str, int | None]:
     return PLAN_LIMITS.get(plan.lower(), PLAN_LIMITS["free"])
 
 
+async def get_org_plan(db: AsyncSession, org_id: UUID) -> str:
+    """Effective plan for limits (grace-period aware on cloud)."""
+    return await get_effective_cloud_plan(db, org_id)
+
+
+def _next_utc_midnight() -> datetime:
+    now = datetime.now(timezone.utc)
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _seconds_until_utc_midnight() -> int:
+    """TTL for daily Redis counters — always expires at 00:00 UTC."""
+    now = datetime.now(timezone.utc)
+    return max(60, int((_next_utc_midnight() - now).total_seconds()))
+
+
 # ── Cloud: feature -> minimum plans (audit_log still requires pro) ─────────────
 # api_keys and webhook_deliveries are removed — replaced with count-based limits
 # so free users can access them within their quota.
@@ -65,7 +92,7 @@ async def require_cloud_plan(db: AsyncSession, org_id: UUID, min_plans: tuple[st
         return
     if settings.DEPLOYMENT_MODE == "self_hosted":
         return
-    plan = (org.plan or "free").lower()
+    plan = await get_org_plan(db, org_id)
     if plan not in min_plans:
         raise plan_locked(
             "plan_upgrade",
@@ -98,10 +125,7 @@ async def require_feature(db: AsyncSession, org_id: UUID, feature: str) -> None:
             upgrade_url=f"{settings.FRONTEND_URL.rstrip('/')}/settings/license",
         )
 
-    org = await _get_org(db, org_id)
-    if org is None:
-        return
-    plan = (org.plan or "free").lower()
+    plan = await get_org_plan(db, org_id)
     if plan not in needed:
         raise plan_locked(
             feature,
@@ -113,10 +137,7 @@ async def require_feature(db: AsyncSession, org_id: UUID, feature: str) -> None:
 async def max_cloud_free_connections(db: AsyncSession, org_id: UUID, active_count: int) -> None:
     if settings.DEPLOYMENT_MODE == "self_hosted":
         return
-    org = await _get_org(db, org_id)
-    if org is None:
-        return
-    plan = (org.plan or "free").lower()
+    plan = await get_org_plan(db, org_id)
     limit = get_plan_limits(plan).get("connections")
     if limit is not None and active_count >= limit:
         raise plan_limit(
@@ -133,8 +154,7 @@ async def check_api_key_limit(db: AsyncSession, org_id: UUID) -> None:
         return
     from app.infrastructure.database.models.api_key import ApiKey
 
-    org = await _get_org(db, org_id)
-    plan = (org.plan or "free").lower() if org else "free"
+    plan = await get_org_plan(db, org_id)
     limit = get_plan_limits(plan).get("api_keys")
     if limit is None:
         return
@@ -153,27 +173,29 @@ async def check_api_key_limit(db: AsyncSession, org_id: UUID) -> None:
         )
 
 
-async def check_studio_execution_budget(
-    org_id: UUID, redis, plan: str = "free"
-) -> None:
+async def check_studio_execution_budget(org_id: UUID, plan: str = "free") -> None:
     """Raise RATE_LIMITED if the org has exceeded its daily studio query execution budget.
 
     Only enforced in cloud deployment. Pro plan and self-hosted always pass.
-    Counter stored in Redis: incremented per execution, expires at end of day.
+    Counter stored in Redis per UTC calendar day (resets at 00:00 UTC).
+    Uses get_redis() directly — not the optional cache client passed to execute_studio_query.
     """
     if settings.DEPLOYMENT_MODE != "cloud":
-        return
-    if redis is None:
         return
     limit = get_plan_limits(plan).get("studio_query_executions_per_day")
     if limit is None:
         return
+    from app.infrastructure.redis.client import get_redis
     from app.infrastructure.redis.keys import studio_budget
+
+    r = await get_redis()
+    if r is None:
+        return
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = studio_budget(str(org_id), today)
-    count = await redis.incr(key)
+    count = await r.incr(key)
     if count == 1:
-        await redis.expire(key, 86400)
+        await r.expire(key, _seconds_until_utc_midnight())
     if count > limit:
         raise rate_limited(
             f"Studio execution budget exceeded ({limit} executions/day on the free plan). "
@@ -191,8 +213,7 @@ async def check_studio_dashboard_limit(db: AsyncSession, org_id: UUID) -> None:
         return
     from app.infrastructure.database.models.studio_dashboard import StudioDashboard
 
-    org = await _get_org(db, org_id)
-    plan = (org.plan or "free").lower() if org else "free"
+    plan = await get_org_plan(db, org_id)
     limit = get_plan_limits(plan).get("studio_dashboards")
     if limit is None:
         return
@@ -217,8 +238,7 @@ async def check_webhook_channel_limit(db: AsyncSession, org_id: UUID) -> None:
         return
     from app.infrastructure.database.models.notification_channel import NotificationChannel
 
-    org = await _get_org(db, org_id)
-    plan = (org.plan or "free").lower() if org else "free"
+    plan = await get_org_plan(db, org_id)
     limit = get_plan_limits(plan).get("webhook_channels")
     if limit is None:
         return
@@ -251,9 +271,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     from app.infrastructure.database.models.user import User
     from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
 
-    org = await _get_org(db, org_id)
-    raw_plan = (org.plan or "free").lower() if org else "free"
-    plan = "pro" if settings.DEPLOYMENT_MODE == "self_hosted" else raw_plan
+    plan = await get_org_plan(db, org_id)
     limits = get_plan_limits(plan)
 
     now = datetime.now(timezone.utc)
@@ -329,6 +347,16 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     def slot(used: int, key: str) -> dict:
         return {"used": used, "limit": limits.get(key)}
 
+    studio_daily_limit = limits.get("studio_query_executions_per_day")
+    studio_executions_slot: dict = {
+        "used": studio_exec_today,
+        "limit": studio_daily_limit,
+    }
+    if studio_daily_limit is not None:
+        studio_executions_slot["resets_at"] = (
+            _next_utc_midnight().isoformat().replace("+00:00", "Z")
+        )
+
     return {
         "plan": plan,
         "limits": {
@@ -339,6 +367,6 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
             "pipeline_runs_this_month": slot(pipeline_run_count, "pipeline_runs_per_month"),
             "agent_queries_this_month": slot(agent_query_count, "agent_queries_per_month"),
             "studio_dashboards": slot(studio_dashboard_count, "studio_dashboards"),
-            "studio_executions_today": slot(studio_exec_today, "studio_query_executions_per_day"),
+            "studio_executions_today": studio_executions_slot,
         },
     }

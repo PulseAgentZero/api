@@ -23,6 +23,7 @@ from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.pipeline_run_repository import (
     PipelineRunRepository,
 )
+from app.infrastructure.audit import log_audit
 from app.infrastructure.database.session import get_db
 from app.services.pipeline_trigger import claim_and_trigger_pipeline, serialize_pipeline_run
 
@@ -46,13 +47,27 @@ async def _trigger_common(
     db: AsyncSession,
     mapping_id: UUID | None = None,
 ) -> dict:
-    return await claim_and_trigger_pipeline(
+    result = await claim_and_trigger_pipeline(
         db,
         current_user.org_id,
         mapping_id=mapping_id,
         triggered_by=current_user.id,
         trigger_source="manual",
     )
+    run_id = result.get("run_id")
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="pipeline.triggered",
+        resource="pipeline_run",
+        resource_id=UUID(run_id) if run_id else None,
+        metadata={
+            "trigger_source": "manual",
+            "mapping_id": str(mapping_id) if mapping_id else None,
+        },
+    )
+    return result
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)

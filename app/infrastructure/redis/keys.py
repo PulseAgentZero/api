@@ -41,6 +41,14 @@ def oauth_google_state(state: str) -> str:
     return f"oauth_google_state:{state}"
 
 
+def oauth_google_link_pending(token: str) -> str:
+    return f"oauth_google_link_pending:{token}"
+
+
+def oauth_google_signup_pending(token: str) -> str:
+    return f"oauth_google_signup_pending:{token}"
+
+
 def studio_embed(token: str) -> str:
     return f"studio:embed:{token}"
 

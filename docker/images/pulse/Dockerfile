@@ -1,13 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Pulse — Self-Hosted All-in-One Image
 #
-# Bundles: Frontend (Next.js) · API · Worker · Agent · Scheduler · Redis · nginx
-# Users only need a Postgres database — everything else is inside this image.
+# All-in-one self-hosted image (n8n-style): Frontend · API · Worker · Agent · Scheduler · Redis · nginx
+# End users pull pulseai/pulse and run docker/compose/self-hosted (Postgres + Qdrant only).
+# Requires Postgres + Qdrant alongside this container; Redis and all app processes are bundled here.
 #
 # Build (from the api/ directory):
 #   docker buildx build \
 #     -f docker/images/pulse/Dockerfile \
 #     --build-context frontend=../dashboard \
+#     --build-arg PULSE_LICENSE_SERVER_URL=https://license.pulseai.io \
+#     --build-arg PULSE_LICENSE_JWT_ISSUER=https://license.pulseai.io \
 #     -t pulseai/pulse:latest \
 #     .
 #
@@ -58,9 +61,10 @@ RUN \
 # Copy the rest of the source
 COPY --from=frontend . .
 
-# Build vars baked into the static output
+# Build vars baked into the static output (override only via --build-arg)
+ARG PULSE_DEPLOYMENT_MODE=self_hosted
 ENV NEXT_BUILD_STANDALONE=1
-ENV NEXT_PUBLIC_DEPLOYMENT_MODE=self_hosted
+ENV NEXT_PUBLIC_DEPLOYMENT_MODE=${PULSE_DEPLOYMENT_MODE}
 # Empty = relative URLs → nginx routes /api/* to FastAPI on the same host
 ENV NEXT_PUBLIC_API_URL=""
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -71,16 +75,23 @@ RUN npm run build
 # ── Stage 3: Runtime image ───────────────────────────────────────────────────
 FROM python:3.12-slim
 
+# License + deployment mode: set only at image build (not via .env or compose at runtime).
+ARG PULSE_LICENSE_SERVER_URL=https://license.pulseai.io
+ARG PULSE_LICENSE_JWT_ISSUER=https://license.pulseai.io
+
 LABEL org.opencontainers.image.title="Pulse (Self-Hosted)"
 LABEL org.opencontainers.image.vendor="AgentZero"
-LABEL org.opencontainers.image.description="All-in-one self-hosted Pulse image. Requires only a Postgres database."
+LABEL org.opencontainers.image.description="All-in-one self-hosted Pulse image. Requires Postgres and Qdrant; bundles Redis and all app services."
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    DEPLOYMENT_MODE=self_hosted \
     # Tell the backend to allow requests from localhost (nginx in the same container)
     FRONTEND_URL=http://localhost
+
+RUN mkdir -p /etc/pulse && printf '%s\n' \
+    "{\"deployment_mode\":\"self_hosted\",\"license_server_url\":\"${PULSE_LICENSE_SERVER_URL}\",\"license_jwt_issuer\":\"${PULSE_LICENSE_JWT_ISSUER}\"}" \
+    > /etc/pulse/build-config.json
 
 WORKDIR /app
 

@@ -25,14 +25,15 @@ from app.api.schemas.connection import (
     TestConnectionResponse,
     UpdateConnectionRequest,
 )
+from app.infrastructure.audit import log_audit
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
 from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.connectors.factory import _make_sql_dsn, build_encrypted_secret_and_row_fields
 from app.infrastructure.connectors.payload import parse_pulse_api_payload
+from app.infrastructure.connectors.connection_test import test_connection_record
 from app.infrastructure.database.connection_tester import (
     introspect_schema,
     preview_table_rows,
-    test_connection,
 )
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
@@ -321,13 +322,10 @@ async def _get_current_connection(db: AsyncSession, org_id) -> object:
 
 
 async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
-    try:
-        dsn = _connection_dsn(conn)
-    except PulseHTTPException as exc:
-        detail = exc.detail
-        msg = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
-        return False, msg, None
-    success, message, db_version = await test_connection(dsn, sslmode=conn.sslmode)
+    success, message, db_version = await test_connection_record(
+        conn,
+        decrypt_dsn=decrypt_dsn,
+    )
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     conn.last_test_error = None if success else message
@@ -385,10 +383,17 @@ async def upload_connection_file(
         connection_meta={"kind": "csv"},
     )
     conn.config = {"upload_path": dest_path, "original_filename": file.filename}
-    conn.status = "pending"
     touch_updated_at(conn)
+    success, message, _db_version = await _test_and_mark_connection(conn)
     await db.commit()
     await db.refresh(conn)
+    if not success:
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="TEST_CONNECTION_FAILED",
+            message=message,
+            fields={"success": "false", "connection_id": str(conn.id)},
+        )
     return _connection_to_response(conn)
 
 
@@ -525,6 +530,16 @@ async def create_connection(
         connection_meta=built.get("connection_meta") or {},
     )
     success, message, _db_version = await _test_and_mark_connection(conn)
+    if success:
+        await log_audit(
+            db,
+            org_id=current_user.org_id,
+            user_id=current_user.id,
+            action="connection.created",
+            resource="connection",
+            resource_id=conn.id,
+            metadata={"name": conn.name, "connector_type": conn.connector_type},
+        )
     await db.commit()
     if not success:
         raise PulseHTTPException(
@@ -670,6 +685,15 @@ async def delete_connection(
     _assert_live(conn)
     await ConnectionRepository(db).soft_delete(connection_uuid)
     await SchemaMappingRepository(db).deactivate_for_connection(connection_uuid)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="connection.deleted",
+        resource="connection",
+        resource_id=connection_uuid,
+        metadata={"name": conn.name},
+    )
     await db.commit()
 
 

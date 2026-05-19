@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,6 +38,10 @@ class StudioDashboard(Base, UUIDMixin, TimestampMixin):
     )
     dashboard_params: Mapped[list] = mapped_column(
         JSONB, nullable=False, default=list, server_default="[]"
+    )
+    refresh_interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    time_range: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
     )
     is_public: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"

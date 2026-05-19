@@ -16,12 +16,15 @@ Manages recurring Pro plan subscriptions for cloud-hosted Pulse workspaces.
   3. GET  /billing/subscription
        Returns the current subscription state for the authenticated org.
 
-  4. POST /billing/subscription/cancel
+  4. GET  /billing/subscription/manage-link
+       Returns a Paystack URL for the customer to update their card on file.
+
+  5. POST /billing/subscription/cancel
        Disables auto-renewal. The subscription stays active until
        `next_payment_date`, then Paystack sends a `subscription.disable` webhook
        which downgrades the org to free.
 
-  5. POST /billing/webhook  (no JWT — Paystack posts here directly)
+  6. POST /billing/webhook  (no JWT — Paystack posts here directly)
        Receives Paystack events. Signature is verified with HMAC-SHA512 before
        any processing. Always returns 200 so Paystack does not retry.
 
@@ -30,17 +33,19 @@ Manages recurring Pro plan subscriptions for cloud-hosted Pulse workspaces.
          subscription.create     → binds SUB_xxx / email_token / next_payment_date
          subscription.disable    → downgrades org to free (cancelled / completed)
          subscription.not_renew  → marks subscription as non-renewing
-         invoice.payment_failed  → marks subscription as attention, sends failure email
+         invoice.payment_failed  → marks subscription as attention, sets grace timer, sends failure email
+
+  Cloud tiers: `growth` and `pro` (see `POST /billing/initialize` body `plan` field).
 
 ## Self-hosted license purchase  (any deployment_mode)
 
 One-time payment that delivers a signed license key by email. The buyer then
 activates the key on their self-hosted Pulse instance via POST /license/activate.
 
-  6. POST /billing/self-hosted/initialize
+  7. POST /billing/self-hosted/initialize
        Starts a one-time Paystack charge. Returns `authorization_url`.
 
-  7. GET  /billing/self-hosted/verify/{reference}
+  8. GET  /billing/self-hosted/verify/{reference}
        Verifies the payment, requests a signed license key from the Pulse license
        server, and emails it to the purchaser. Falls back gracefully if the
        license server is temporarily unreachable.
@@ -54,7 +59,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -73,6 +78,12 @@ from app.infrastructure.email.sender import (
     send_license_key_email,
     send_subscription_failed_email,
     send_subscription_success_email,
+)
+from app.services.billing_entitlements import (
+    get_effective_cloud_plan,
+    paystack_plan_code_for_tier,
+    subscription_response,
+    tier_from_paystack_plan_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,9 +157,18 @@ async def _org_name(db: AsyncSession, org_id: uuid.UUID) -> str:
     return org.name if org else "your organisation"
 
 
+async def _subscription_payload(db: AsyncSession, sub: Subscription) -> dict:
+    effective = await get_effective_cloud_plan(db, sub.org_id, sub=sub)
+    return subscription_response(sub, effective_plan=effective)
+
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class InitializePaymentRequest(BaseModel):
+    plan: Literal["pro", "growth"] = Field(
+        default="pro",
+        description="Cloud tier to subscribe to. Maps to Paystack plan codes via server env.",
+    )
     callback_url: str = Field(
         ...,
         description=(
@@ -167,7 +187,11 @@ class InitializePaymentResponse(BaseModel):
 
 
 class SubscriptionResponse(BaseModel):
-    plan: str = Field(..., description="Current plan: `free` or `pro`.")
+    plan: str = Field(..., description="Stored plan: `free`, `growth`, or `pro`.")
+    effective_plan: str = Field(
+        ...,
+        description="Plan used for limits (may be `free` when grace period expired after failed payment).",
+    )
     status: str = Field(
         ...,
         description=(
@@ -182,7 +206,26 @@ class SubscriptionResponse(BaseModel):
     next_payment_date: datetime | None = Field(
         None, description="Next scheduled billing date. `null` for free or cancelled plans."
     )
+    payment_failed_at: datetime | None = Field(
+        None, description="When the last renewal payment failed. `null` if not in failure state."
+    )
+    grace_ends_at: datetime | None = Field(
+        None,
+        description="End of grace period after failed payment. After this, effective_plan becomes `free`.",
+    )
+    payment_attention: bool = Field(
+        False,
+        description="True when payment failed but grace period has not expired — show update-card banner.",
+    )
+    manage_link_available: bool = Field(
+        False,
+        description="True when Paystack subscription code exists and manage-link can be generated.",
+    )
     updated_at: datetime | None = Field(None, description="Last time this record was modified.")
+
+
+class ManageLinkResponse(BaseModel):
+    link: str = Field(..., description="Paystack-hosted URL for the customer to update their card.")
 
 
 class SelfHostedInitializeRequest(BaseModel):
@@ -233,9 +276,13 @@ async def initialize_payment(
 ) -> dict:
     _require_cloud()
 
-    plan_code = settings.PAYSTACK_PRO_PLAN_CODE
+    tier = body.plan.lower()
+    plan_code = paystack_plan_code_for_tier(tier)
     if not plan_code:
-        raise HTTPException(status_code=503, detail="Pro plan is not configured on this server")
+        raise HTTPException(
+            status_code=503,
+            detail=f"{tier.title()} plan is not configured on this server (Paystack plan code missing)",
+        )
 
     if not settings.get_paystack_secret_key():
         raise HTTPException(status_code=503, detail="Payment service is not configured")
@@ -248,7 +295,7 @@ async def initialize_payment(
         "metadata": {
             "org_id": str(current_user.org_id),
             "user_id": str(current_user.id),
-            "plan": "pro",
+            "plan": tier,
             "purchase_type": "cloud_subscription",
         },
     }
@@ -316,21 +363,25 @@ async def verify_payment(
     authorization = tx.get("authorization") or {}
     customer = tx.get("customer") or {}
 
+    tier = str(meta.get("plan") or "pro").lower()
+    if tier not in ("pro", "growth"):
+        tier = "pro"
+
     sub = await _get_or_create_subscription(db, current_user.org_id)
-    sub.plan = "pro"
+    sub.plan = tier
     sub.status = "active"
+    sub.payment_failed_at = None
     sub.authorization_code = authorization.get("authorization_code")
     sub.paystack_customer_code = customer.get("customer_code")
-    sub.paystack_plan_code = settings.PAYSTACK_PRO_PLAN_CODE
+    sub.paystack_plan_code = paystack_plan_code_for_tier(tier)
 
     org = await db.get(Organization, current_user.org_id)
     if org:
-        org.plan = "pro"
+        org.plan = tier
 
     await db.commit()
     await db.refresh(sub)
 
-    # Send confirmation email (best-effort)
     if sub.next_payment_date:
         next_date = sub.next_payment_date.strftime("%B %d, %Y")
     else:
@@ -338,13 +389,7 @@ async def verify_payment(
     org_display = org.name if org else "your organisation"
     await send_subscription_success_email(current_user.email, org_display, next_date)
 
-    return {
-        "plan": sub.plan,
-        "status": sub.status,
-        "paystack_subscription_code": sub.paystack_subscription_code,
-        "next_payment_date": sub.next_payment_date,
-        "updated_at": sub.updated_at,
-    }
+    return await _subscription_payload(db, sub)
 
 
 @router.get(
@@ -364,13 +409,47 @@ async def get_subscription(
     _require_cloud()
     sub = await _get_or_create_subscription(db, current_user.org_id)
     await db.commit()
-    return {
-        "plan": sub.plan,
-        "status": sub.status,
-        "paystack_subscription_code": sub.paystack_subscription_code,
-        "next_payment_date": sub.next_payment_date,
-        "updated_at": sub.updated_at,
-    }
+    return await _subscription_payload(db, sub)
+
+
+@router.get(
+    "/subscription/manage-link",
+    response_model=ManageLinkResponse,
+    summary="Get Paystack link to update payment method",
+    description=(
+        "**Cloud only.** Returns a Paystack-hosted URL where the customer can update "
+        "the card on file for their subscription. Requires an active Paystack subscription code."
+    ),
+)
+async def get_subscription_manage_link(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    _require_cloud()
+
+    sub = await _get_or_create_subscription(db, current_user.org_id)
+    if not sub.paystack_subscription_code:
+        raise bad_request("NO_ACTIVE_SUBSCRIPTION", "No Paystack subscription found for this organization")
+
+    if not settings.get_paystack_secret_key():
+        raise HTTPException(status_code=503, detail="Payment service is not configured")
+
+    code = sub.paystack_subscription_code
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{PAYSTACK_BASE}/subscription/{code}/manage/link",
+            headers=_paystack_headers(),
+        )
+
+    if resp.status_code != 200:
+        logger.error("Paystack manage link failed: %s — %s", resp.status_code, resp.text[:300])
+        raise HTTPException(status_code=502, detail="Could not generate payment update link")
+
+    link = resp.json().get("data", {}).get("link")
+    if not link:
+        raise HTTPException(status_code=502, detail="Paystack did not return a manage link")
+
+    return {"link": link}
 
 
 @router.post(
@@ -417,13 +496,7 @@ async def cancel_subscription(
     await db.commit()
     await db.refresh(sub)
 
-    return {
-        "plan": sub.plan,
-        "status": sub.status,
-        "paystack_subscription_code": sub.paystack_subscription_code,
-        "next_payment_date": sub.next_payment_date,
-        "updated_at": sub.updated_at,
-    }
+    return await _subscription_payload(db, sub)
 
 
 # ── Paystack webhook ──────────────────────────────────────────────────────────
@@ -509,7 +582,7 @@ async def _on_charge_success(db: AsyncSession, data: dict) -> None:
         sub = await _find_sub_by_customer(db, customer_code)
         if sub and sub.status == "attention":
             sub.status = "active"
-            # Notify admin that the payment issue was resolved
+            sub.payment_failed_at = None
             email = await _org_admin_email(db, sub.org_id)
             org = await _org_name(db, sub.org_id)
             if email and sub.next_payment_date:
@@ -540,16 +613,19 @@ async def _on_subscription_create(db: AsyncSession, data: dict) -> None:
         logger.warning("subscription.create: no local subscription for customer %s", customer_code)
         return
 
+    tier = tier_from_paystack_plan_code(plan_code)
+
     sub.paystack_subscription_code = subscription_code
     sub.paystack_email_token = email_token
     sub.paystack_plan_code = plan_code
     sub.next_payment_date = next_payment
     sub.status = paystack_status
-    sub.plan = "pro"
+    sub.plan = tier
+    sub.payment_failed_at = None
 
     org = await db.get(Organization, sub.org_id)
     if org:
-        org.plan = "pro"
+        org.plan = tier
 
     # Send success email now that we have the next_payment_date
     email = await _org_admin_email(db, sub.org_id)
@@ -594,6 +670,7 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
         return
 
     sub.status = "attention"
+    sub.payment_failed_at = datetime.now(timezone.utc)
 
     email = await _org_admin_email(db, sub.org_id)
     org = await _org_name(db, sub.org_id)
@@ -744,6 +821,10 @@ async def _issue_license_key(
     The license server endpoint: POST {LICENSE_SERVER_URL}/api/v1/keys/purchase
     """
     url = f"{settings.LICENSE_SERVER_URL.rstrip('/')}/api/v1/keys/purchase"
+    headers = {"Content-Type": "application/json"}
+    api_key = settings.LICENSE_SERVER_API_KEY
+    if api_key:
+        headers["X-License-Api-Key"] = api_key
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
@@ -754,7 +835,7 @@ async def _issue_license_key(
                     "org_id": org_id,
                     "product": "self_hosted",
                 },
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
         if resp.status_code in (200, 201):
             data = resp.json().get("data") or resp.json()

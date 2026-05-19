@@ -210,10 +210,13 @@ async def recommend_visualization(
                 pass
 
     if not cached:
+        from app.api.dependencies.plan_gate import get_org_plan
+
+        org_plan = await get_org_plan(db, org_id)
         result = await execute_studio_query(
             db, org_id, q.connection_id, q.sql_text,
             param_defs=q.params or [], param_values={},
-            page=1, page_size=100, redis=redis,
+            page=1, page_size=100, redis=redis, org_plan=org_plan,
         )
         rows = result["rows"]
         columns = result["columns"]

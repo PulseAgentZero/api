@@ -131,7 +131,9 @@ async def post_complete_setup(
     db: AsyncSession = Depends(get_db),
 ) -> CompleteSetupResponse:
     """Finalize org setup and trigger the first pipeline run when ready."""
-    result = await complete_org_setup(db, current_user.org_id)
+    result = await complete_org_setup(
+        db, current_user.org_id, completed_by=current_user.id
+    )
     if result.already_complete:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -163,12 +165,14 @@ async def get_organization_usage(
         "webhook_channels":            { "used": 0, "limit": 1 },
         "users":                       { "used": 2, "limit": 3 },
         "pipeline_runs_this_month":    { "used": 3, "limit": 20 },
-        "agent_queries_this_month":    { "used": 12, "limit": 100 }
+        "agent_queries_this_month":    { "used": 12, "limit": 100 },
+        "studio_executions_today":     { "used": 5, "limit": 600, "resets_at": "2025-05-20T00:00:00Z" }
       }
     }
     ```
 
     `limit: null` means unlimited (Pro plan or self-hosted).
+    `resets_at` on `studio_executions_today` is the next **00:00 UTC** (daily counter key rolls on UTC date).
     """
     return await get_usage_summary(db, current_user.org_id)
 

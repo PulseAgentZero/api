@@ -75,3 +75,18 @@ class OrgOut(BaseModel):
 class MeResponse(BaseModel):
     user: UserOut
     org: OrgOut
+
+
+class GoogleLinkRequest(BaseModel):
+    link_token: str
+    password: str | None = None
+
+
+class GoogleLinkCancelRequest(BaseModel):
+    link_token: str
+
+
+class GoogleCompleteSignupRequest(BaseModel):
+    pending_token: str
+    org_name: str = Field(min_length=1)
+    full_name: str = ""

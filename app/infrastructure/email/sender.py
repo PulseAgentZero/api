@@ -168,6 +168,24 @@ async def send_password_reset_email(to: str, token: str) -> None:
     await _send(to=to, subject="Reset your Pulse password", html=html)
 
 
+async def send_welcome_email(
+    to: str,
+    *,
+    full_name: str,
+    org_name: str,
+) -> None:
+    dashboard_url = f"{settings.FRONTEND_URL.rstrip('/')}/dashboard"
+    display_name = (full_name or "").strip() or "there"
+    html = _render(
+        "welcome.html",
+        subject=f"Welcome to Pulse — {org_name}",
+        full_name=display_name,
+        org_name=org_name,
+        dashboard_url=dashboard_url,
+    )
+    await _send(to=to, subject=f"Welcome to Pulse — {org_name}", html=html)
+
+
 async def send_invitation_email(to: str, token: str, invited_by: str, org_name: str, role: str = "member") -> None:
     link = f"{settings.FRONTEND_URL.rstrip('/')}/auth/accept-invite?token={token}"
     html = _render(

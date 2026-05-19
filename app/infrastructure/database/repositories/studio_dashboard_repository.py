@@ -130,6 +130,8 @@ class StudioDashboardRepository:
         layout: list,
         dashboard_params: list | None = None,
         tags: list | None = None,
+        refresh_interval_seconds: int | None = None,
+        time_range: dict | None = None,
     ) -> StudioDashboard:
         dashboard = StudioDashboard(
             org_id=org_id,
@@ -141,6 +143,8 @@ class StudioDashboardRepository:
             layout=layout,
             dashboard_params=dashboard_params or [],
             tags=tags or [],
+            refresh_interval_seconds=refresh_interval_seconds,
+            time_range=time_range or {},
         )
         self.db.add(dashboard)
         await self.db.flush()

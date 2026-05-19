@@ -93,6 +93,10 @@ async def _handle_studio_query(data: dict) -> None:
             await session.commit()
             return
 
+        from app.api.dependencies.plan_gate import get_org_plan
+
+        org_plan = await get_org_plan(session, org_id)
+
         await run_repo.mark_running(run)
         await session.commit()
 
@@ -107,7 +111,8 @@ async def _handle_studio_query(data: dict) -> None:
                 param_values=param_values,
                 page=1,
                 page_size=5000,
-                redis=None,  # Skip cache for the raw result — we store it ourselves below
+                redis=None,  # Skip query-result cache — run result stored below
+                org_plan=org_plan,
             )
             # Store full result in Redis keyed by run_id (TTL 1 hour)
             if redis is not None:

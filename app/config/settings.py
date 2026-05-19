@@ -24,6 +24,50 @@ GROQ_MODEL_HEAVY = "openai/gpt-oss-120b"  # analytical/schema-heavy work
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"  # routing/tools/structured JSON
 GROQ_MODEL_FAST = "llama-3.1-8b-instant"  # low-latency/simple tasks
 
+# Written at Docker image build time (docker/images/pulse/Dockerfile). When present,
+# deployment_mode and license URLs are taken from this file only — not .env or compose.
+PULSE_BUILD_CONFIG_PATH = Path("/etc/pulse/build-config.json")
+_DEFAULT_LICENSE_SERVER_URL = "https://license.pulseai.io"
+
+
+@lru_cache(maxsize=1)
+def _pulse_build_config() -> dict:
+    if not PULSE_BUILD_CONFIG_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(PULSE_BUILD_CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("Failed to read %s: %s", PULSE_BUILD_CONFIG_PATH, exc)
+        return {}
+
+
+def _resolve_deployment_mode() -> str:
+    baked = _pulse_build_config().get("deployment_mode")
+    if baked:
+        return str(baked).lower()
+    return os.getenv("DEPLOYMENT_MODE", "cloud").lower()
+
+
+def _resolve_license_server_url() -> str:
+    baked = _pulse_build_config().get("license_server_url")
+    if baked:
+        return str(baked).rstrip("/")
+    if _resolve_deployment_mode() == "self_hosted":
+        return _DEFAULT_LICENSE_SERVER_URL
+    return os.getenv("LICENSE_SERVER_URL", _DEFAULT_LICENSE_SERVER_URL).rstrip("/")
+
+
+def _resolve_license_jwt_issuer() -> Optional[str]:
+    baked = _pulse_build_config().get("license_jwt_issuer")
+    if baked:
+        raw = str(baked).strip()
+        return raw or None
+    if _resolve_deployment_mode() == "self_hosted":
+        return _DEFAULT_LICENSE_SERVER_URL
+    raw = os.getenv("LICENSE_JWT_ISSUER", _DEFAULT_LICENSE_SERVER_URL).strip()
+    return raw or None
+
 VOYAGE_EMBEDDING_MODEL = "voyage-4-large"
 VOYAGE_EMBEDDING_DIMENSION = 1024
 
@@ -156,12 +200,13 @@ class Settings:
     # ------------------------------------------------------------------
     # Deployment / service URLs
     # ------------------------------------------------------------------
-    DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "cloud").lower()
+    DEPLOYMENT_MODE: str = _resolve_deployment_mode()
     AGENT_SERVICE_URL: Optional[str] = os.getenv("AGENT_SERVICE_URL", "").strip() or None
-    LICENSE_SERVER_URL: str = os.getenv("LICENSE_SERVER_URL", "https://license.pulseai.io").rstrip("/")
+    LICENSE_SERVER_URL: str = _resolve_license_server_url()
+    LICENSE_SERVER_API_KEY: Optional[str] = os.getenv("LICENSE_SERVER_API_KEY", "").strip() or None
     # RSA PEM for offline plc_* JWT verification (LICENSE_SYSTEM.md)
     PULSE_LICENSE_PUBLIC_KEY: Optional[str] = os.getenv("PULSE_LICENSE_PUBLIC_KEY", "").strip() or None
-    LICENSE_JWT_ISSUER: Optional[str] = os.getenv("LICENSE_JWT_ISSUER", "https://license.pulseai.io").strip() or None
+    LICENSE_JWT_ISSUER: Optional[str] = _resolve_license_jwt_issuer()
     LICENSE_OFFLINE_GRACE_DAYS: int = int(os.getenv("LICENSE_OFFLINE_GRACE_DAYS", "7"))
     LICENSE_REVALIDATION_INTERVAL_HOURS: int = int(os.getenv("LICENSE_REVALIDATION_INTERVAL_HOURS", "24"))
 
@@ -300,6 +345,7 @@ class Settings:
         "K_k8N_IyoXaDyql8ijHUmO9KA6FyuAqP7guglrC0Pns=",
     )
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    OAUTH_REDIRECT_ALLOWLIST: str = os.getenv("OAUTH_REDIRECT_ALLOWLIST", "")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
     PASSWORD_HASH_ITERATIONS: int = int(
         os.getenv("PASSWORD_HASH_ITERATIONS", "600000")
@@ -321,6 +367,38 @@ class Settings:
     def is_google_oauth_configured(cls) -> bool:
         return bool(cls.get_google_client_id() and cls.get_google_client_secret())
 
+    @classmethod
+    def oauth_redirect_origins(cls) -> set[str]:
+        from urllib.parse import urlparse
+
+        origins: set[str] = set()
+        for base in (cls.FRONTEND_URL,):
+            parsed = urlparse(base.strip())
+            if parsed.scheme and parsed.netloc:
+                origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        for part in cls.OAUTH_REDIRECT_ALLOWLIST.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            parsed = urlparse(part if "://" in part else f"https://{part}")
+            if parsed.scheme and parsed.netloc:
+                origins.add(f"{parsed.scheme}://{parsed.netloc}")
+        return origins
+
+    @classmethod
+    def is_oauth_redirect_allowed(cls, redirect_uri: str) -> bool:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(redirect_uri.strip())
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        return origin in cls.oauth_redirect_origins()
+
+    @classmethod
+    def default_oauth_callback_dest(cls) -> str:
+        return f"{cls.FRONTEND_URL.rstrip('/')}/auth/oauth/callback"
+
     # ------------------------------------------------------------------
     # Email (Resend)
     # ------------------------------------------------------------------
@@ -340,8 +418,11 @@ class Settings:
     # Paystack (billing / subscriptions)
     # ------------------------------------------------------------------
     PAYSTACK_SECRET_KEY: Optional[str] = os.getenv("PAYSTACK_SECRET_KEY")
-    # Cloud subscription — single "pro" recurring plan
+    # Cloud recurring plans (create each plan in Paystack dashboard)
     PAYSTACK_PRO_PLAN_CODE: Optional[str] = os.getenv("PAYSTACK_PRO_PLAN_CODE")
+    PAYSTACK_GROWTH_PLAN_CODE: Optional[str] = os.getenv("PAYSTACK_GROWTH_PLAN_CODE")
+    # Days to keep paid entitlements after invoice.payment_failed before downgrading to free
+    BILLING_GRACE_DAYS: int = int(os.getenv("BILLING_GRACE_DAYS", "7"))
     # Self-hosted one-time license purchase price in kobo (e.g. 5000000 = ₦50,000)
     PAYSTACK_SELFHOSTED_LICENSE_PRICE: int = int(os.getenv("PAYSTACK_SELFHOSTED_LICENSE_PRICE", "0"))
 

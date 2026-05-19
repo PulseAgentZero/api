@@ -176,6 +176,24 @@ class StudioVisualizationUpdateRequest(BaseModel):
 
 # ── Dashboard request schemas ─────────────────────────────────────────────────
 
+class DashboardTimeRange(BaseModel):
+    """Grafana-style time range stored on the dashboard."""
+
+    preset: Literal[
+        "last_15m",
+        "last_1h",
+        "last_6h",
+        "last_24h",
+        "last_7d",
+        "last_30d",
+        "custom",
+    ] = "last_24h"
+    from_: str | None = Field(None, alias="from")
+    to: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class StudioDashboardCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = Field(None, max_length=2000)
@@ -183,6 +201,8 @@ class StudioDashboardCreateRequest(BaseModel):
     layout: list[DashboardLayoutItem] = Field(default_factory=list)
     dashboard_params: list[QueryParamDefinition] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list, max_length=20)
+    refresh_interval_seconds: int | None = Field(None, ge=5, le=86400)
+    time_range: DashboardTimeRange | None = None
 
 
 class StudioDashboardUpdateRequest(BaseModel):
@@ -192,6 +212,15 @@ class StudioDashboardUpdateRequest(BaseModel):
     layout: list[DashboardLayoutItem] | None = None
     dashboard_params: list[QueryParamDefinition] | None = None
     tags: list[str] | None = None
+    refresh_interval_seconds: int | None = Field(None, ge=0, le=86400)
+    time_range: DashboardTimeRange | None = None
+
+    @field_validator("refresh_interval_seconds")
+    @classmethod
+    def zero_means_off(cls, v: int | None) -> int | None:
+        if v == 0:
+            return None
+        return v
 
 
 class StudioDashboardAddItemRequest(BaseModel):
@@ -216,6 +245,7 @@ class StudioDashboardForkRequest(BaseModel):
 class StudioDashboardExecuteRequest(BaseModel):
     """Dashboard-level filter values — propagated to all charts."""
     param_values: dict[str, Any] = Field(default_factory=dict)
+    time_range: DashboardTimeRange | None = None
 
 
 class StudioEmbedTokenRequest(BaseModel):
@@ -294,6 +324,8 @@ class StudioDashboardResponse(BaseModel):
     layout: list[Any]
     dashboard_params: list[Any]
     tags: list[Any]
+    refresh_interval_seconds: int | None = None
+    time_range: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     items: list[StudioDashboardItemResponse] = []
@@ -406,6 +438,8 @@ class PublicDashboardResponse(BaseModel):
         default_factory=list,
         description="Filter definitions visitors can pass as query parameters.",
     )
+    refresh_interval_seconds: int | None = None
+    time_range: dict[str, Any] = Field(default_factory=dict)
     visualizations: list[PublicVisualizationResponse] = Field(
         ...,
         description="Charts on the dashboard, each with up to 500 rows of query data.",

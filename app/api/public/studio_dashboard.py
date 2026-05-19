@@ -38,6 +38,7 @@ from app.infrastructure.database.session import get_db
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis.keys import studio_embed, studio_public_rl
 from app.services.studio_query_service import execute_studio_query
+from app.services.studio_time_range import merge_dashboard_param_values
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/studio", tags=["Studio"])
@@ -70,6 +71,23 @@ async def _apply_rate_limit(request: Request, redis) -> None:
         logger.warning("Studio public rate-limit Redis error: %s", exc)
 
 
+def _time_range_from_params(
+    dashboard: StudioDashboard,
+    param_values: dict,
+) -> tuple[dict, dict]:
+    """Extract time_range overrides from query params; return (time_range, remaining filters)."""
+    filters = dict(param_values)
+    time_range = dict(dashboard.time_range or {})
+    preset = filters.pop("time_preset", None)
+    if preset:
+        time_range["preset"] = preset
+    if "time_from" in filters:
+        time_range["from"] = filters.pop("time_from")
+    if "time_to" in filters:
+        time_range["to"] = filters.pop("time_to")
+    return time_range, filters
+
+
 async def _render_dashboard(
     dashboard: StudioDashboard,
     db: AsyncSession,
@@ -80,6 +98,11 @@ async def _render_dashboard(
     items = await StudioDashboardItemRepository(db).list_by_dashboard(
         dashboard.id, dashboard.org_id
     )
+    from app.api.dependencies.plan_gate import get_org_plan
+
+    org_plan = await get_org_plan(db, dashboard.org_id)
+    time_range, filters = _time_range_from_params(dashboard, param_values or {})
+    merged_params = merge_dashboard_param_values(filters, time_range)
     viz_responses: list[PublicVisualizationResponse] = []
 
     for item in items:
@@ -96,8 +119,8 @@ async def _render_dashboard(
                 raw = await execute_studio_query(
                     db, dashboard.org_id, q.connection_id, q.sql_text,
                     param_defs=q.params or [],
-                    param_values=param_values or {},
-                    page=1, page_size=500, redis=redis,
+                    param_values=merged_params,
+                    page=1, page_size=500, redis=redis, org_plan=org_plan,
                 )
                 query_result = StudioQueryResultResponse(**raw)
             except Exception:
@@ -121,6 +144,8 @@ async def _render_dashboard(
         slug=dashboard.slug or "",
         layout=dashboard.layout,
         dashboard_params=dashboard.dashboard_params,
+        refresh_interval_seconds=dashboard.refresh_interval_seconds,
+        time_range=dashboard.time_range or {},
         visualizations=viz_responses,
     )
 

@@ -7,9 +7,12 @@ set -e
 # supervisord manages: API · Worker · Agent · Scheduler · Next.js · nginx
 # ─────────────────────────────────────────────────────────────────────────────
 
-REDIS_URL="${REDIS_URL:-redis://localhost:6379/0}"
+export REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
 API_WORKERS="${API_WORKERS:-1}"
 AGENT_WORKERS="${AGENT_WORKERS:-1}"
+
+echo "[pulse] REDIS_URL=${REDIS_URL}"
+echo "[pulse] QDRANT_URL=${QDRANT_URL:-<not set>}"
 
 # ── 0. Writable storage for the `pulse` app user (uid 1001) ───────────────────
 # Named volumes (e.g. uploads_data:/app/uploads) are often created root-owned.

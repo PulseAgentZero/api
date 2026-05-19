@@ -5,11 +5,17 @@ SELF_HOSTED_IMAGE   = pulseai/pulse
 CLOUD_IMAGE         = pulseai/pulse-cloud
 LICENSE_IMAGE       = pulseai/pulse-license
 
+# Maintainer builds only — public users pull pulseai/pulse from Docker Hub.
+# Default: ../dashboard (sibling of this repo, e.g. ~/Desktop/dashboard next to ~/Desktop/api).
+PULSE_DASHBOARD_DIR ?= ../dashboard
+tag                 ?= latest
+
 # ── Build images ──────────────────────────────────────────────────────────────
 
 build-self-hosted:
 	docker build \
 		-f docker/images/pulse/Dockerfile \
+		--build-context frontend=$(PULSE_DASHBOARD_DIR) \
 		-t $(SELF_HOSTED_IMAGE):$(tag) \
 		-t $(SELF_HOSTED_IMAGE):latest \
 		.
@@ -44,7 +50,7 @@ push-license:
 
 push: push-self-hosted push-cloud push-license
 
-# ── Self-hosted ───────────────────────────────────────────────────────────────
+# ── Self-hosted (db + qdrant + pulse all-in-one) ──────────────────────────────
 
 sh-up:
 	docker compose -f $(SELF_HOSTED_COMPOSE) up -d
@@ -77,6 +83,9 @@ scale-workers:
 dev:
 	uvicorn app.api.app:app --reload --host 0.0.0.0 --port 8000
 
+dev-scheduler:
+	python -m app.services.schedulers.run
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 migrate:
@@ -94,5 +103,5 @@ reset-db:
 .PHONY: build-self-hosted build-cloud build-license build \
         push-self-hosted push-cloud push-license push \
         sh-up sh-down sh-logs sh-pull \
-        up down logs scale-workers dev \
+        up down logs scale-workers dev dev-scheduler \
         migrate revision seed reset-db

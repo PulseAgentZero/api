@@ -126,6 +126,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       DEPLOYMENT_MODE: cloud
+      # License: cloud orgs do not activate licenses. Set LICENSE_SERVER_URL in .env only
+      # if you run the `license` service and sell self-hosted keys via Paystack billing.
       API_WORKERS: ${API_WORKERS:-2}
       # Internal URL so api can proxy /agent/* requests to the agent service
       AGENT_SERVICE_URL: http://agent:8001
@@ -212,7 +214,7 @@ services:
         condition: service_started
     # Scheduler is a background job process — no HTTP port, no HTTP health check
     healthcheck:
-      test: ["CMD", "python", "-c", "import app.services.schedulers.pipeline_scheduler; print('ok')"]
+      test: ["CMD", "python", "-c", "import app.services.schedulers.run; print('ok')"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -246,6 +248,7 @@ services:
 
   license:
     # Internal license validation server — not exposed publicly.
+    # Self-hosted instances reach it via public URL (e.g. https://license.pulseai.io).
     build:
       context: ../../..
       dockerfile: docker/images/pulse-license/Dockerfile
@@ -254,6 +257,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
       PORT: "8002"
+      LICENSE_JWT_ISSUER: ${LICENSE_JWT_ISSUER:-https://license.pulseai.io}
+      LICENSE_SIGNING_PRIVATE_KEY: ${LICENSE_SIGNING_PRIVATE_KEY:-}
+      LICENSE_SERVER_API_KEY: ${LICENSE_SERVER_API_KEY:-}
+      PULSE_LICENSE_PUBLIC_KEY: ${PULSE_LICENSE_PUBLIC_KEY:-}
     ports:
       - "${LICENSE_PORT:-8002}:8002"
     networks:

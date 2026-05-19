@@ -25,6 +25,9 @@ from app.infrastructure.database.session import async_session_factory
 logger = logging.getLogger(__name__)
 
 PIPELINE_INTERVAL_HOURS = int(os.getenv("PIPELINE_INTERVAL_HOURS", "4"))
+PIPELINE_ORG_DISCOVERY_INTERVAL_MINUTES = int(
+    os.getenv("PIPELINE_ORG_DISCOVERY_INTERVAL_MINUTES", "15")
+)
 
 _scheduler: AsyncIOScheduler | None = None
 
@@ -108,7 +111,10 @@ async def _discover_and_schedule_orgs(scheduler: AsyncIOScheduler) -> None:
 
 
 def schedule_org(org_id: UUID, org_name: str = "") -> None:
-    """Add or update a pipeline schedule for a specific org (call after onboarding)."""
+    """Add or update a pipeline interval job for one org (scheduler process only).
+
+    Prefer letting periodic org discovery register new orgs; kept for tests/tools.
+    """
     global _scheduler
     if _scheduler is None:
         logger.warning("Scheduler not started — cannot schedule org %s", org_id)
@@ -210,7 +216,21 @@ async def start_pipeline_scheduler() -> AsyncIOScheduler:
 
     await _discover_and_schedule_orgs(_scheduler)
 
-    logger.info("Pipeline scheduler started (groq=%s, anthropic=%s)", groq_ok, anthropic_ok)
+    # Re-scan for newly onboarded orgs (API no longer runs an in-process scheduler).
+    _scheduler.add_job(
+        _discover_and_schedule_orgs,
+        trigger=IntervalTrigger(minutes=PIPELINE_ORG_DISCOVERY_INTERVAL_MINUTES),
+        id="pipeline_discover_orgs",
+        args=[_scheduler],
+        replace_existing=True,
+    )
+
+    logger.info(
+        "Pipeline scheduler started (groq=%s, anthropic=%s, discovery every %dm)",
+        groq_ok,
+        anthropic_ok,
+        PIPELINE_ORG_DISCOVERY_INTERVAL_MINUTES,
+    )
     return _scheduler
 
 
@@ -224,30 +244,7 @@ def shutdown_scheduler() -> None:
 
 
 if __name__ == "__main__":
-    import signal
+    from app.services.schedulers.run import main
 
-    from app.infrastructure.logging import configure_logging
-    from app.services.schedulers.studio_refresh_scheduler import (
-        shutdown_studio_refresh_scheduler,
-        start_studio_refresh_scheduler,
-    )
-
-    configure_logging()
-
-    async def _main() -> None:
-        loop = asyncio.get_running_loop()
-        stop = asyncio.Event()
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, stop.set)
-
-        await start_pipeline_scheduler()
-        await start_studio_refresh_scheduler()
-        logger.info("Scheduler running — waiting for stop signal")
-        await stop.wait()
-        shutdown_scheduler()
-        shutdown_studio_refresh_scheduler()
-        logger.info("Scheduler stopped")
-
-    asyncio.run(_main())
+    main()
 

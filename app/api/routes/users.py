@@ -341,7 +341,17 @@ async def update_user_role(
     if target.role == "admin" and body.role != "admin" and await repo.count_admins(current_user.org_id) <= 1:
         raise bad_request("LAST_ADMIN", "Cannot remove last admin")
 
+    old_role = target.role
     target.role = body.role
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="user.role_changed",
+        resource="user",
+        resource_id=target.id,
+        metadata={"email": target.email, "from_role": old_role, "to_role": body.role},
+    )
     await db.commit()
     return _to_response(target)
 
@@ -367,4 +377,13 @@ async def deactivate_user(
         raise bad_request("LAST_ADMIN", "Cannot deactivate last admin")
 
     target.is_active = False
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="user.deactivated",
+        resource="user",
+        resource_id=target.id,
+        metadata={"email": target.email},
+    )
     await db.commit()

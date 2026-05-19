@@ -9,6 +9,8 @@ from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.models.entity_profile import EntityProfile
 from app.infrastructure.database.models.entity_risk_history import EntityRiskHistory
 from app.infrastructure.database.models.invitation import Invitation
+from app.infrastructure.database.models.license_activation import LicenseActivation
+from app.infrastructure.database.models.license_issuance import LicenseIssuance
 from app.infrastructure.database.models.license_key import LicenseKey
 from app.infrastructure.database.models.llm_key_store import LlmKeyStore
 from app.infrastructure.database.models.notification_channel import NotificationChannel
@@ -41,6 +43,8 @@ __all__ = [
     "EntityProfile",
     "EntityRiskHistory",
     "Invitation",
+    "LicenseActivation",
+    "LicenseIssuance",
     "LicenseKey",
     "LlmKeyStore",
     "NotificationChannel",

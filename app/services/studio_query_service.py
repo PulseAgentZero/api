@@ -235,7 +235,7 @@ async def execute_studio_query(
     """
     # Enforce daily execution budget for cloud free plan
     from app.api.dependencies.plan_gate import check_studio_execution_budget
-    await check_studio_execution_budget(org_id, redis, plan=org_plan)
+    await check_studio_execution_budget(org_id, plan=org_plan)
 
     if not _is_select_only(sql_text):
         raise bad_request(

@@ -17,6 +17,17 @@ class UserRepository:
         result = await self.db.execute(select(User).where(User.email == email))
         return result.scalar_one_or_none()
 
+    async def get_by_auth_provider_id(self, provider: str, provider_id: str) -> User | None:
+        if not provider_id:
+            return None
+        result = await self.db.execute(
+            select(User).where(
+                User.auth_provider == provider,
+                User.auth_provider_id == provider_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def list_by_org(self, org_id: UUID) -> list[User]:
         result = await self.db.execute(
             select(User).where(User.org_id == org_id).order_by(User.created_at)

@@ -30,7 +30,12 @@ class CompleteSetupResult:
     already_complete: bool = False
 
 
-async def complete_org_setup(db: AsyncSession, org_id: UUID) -> CompleteSetupResult:
+async def complete_org_setup(
+    db: AsyncSession,
+    org_id: UUID,
+    *,
+    completed_by: UUID | None = None,
+) -> CompleteSetupResult:
     """Mark org setup complete; create schedule and trigger pipeline when ready."""
     org = await OrganizationRepository(db).get_by_id(org_id)
     if not org:
@@ -86,12 +91,23 @@ async def complete_org_setup(db: AsyncSession, org_id: UUID) -> CompleteSetupRes
         )
 
     org.onboarding_done = True
+    from app.infrastructure.audit import log_audit
+
+    await log_audit(
+        db,
+        org_id=org_id,
+        user_id=completed_by,
+        action="org.onboarding_completed",
+        resource="organization",
+        resource_id=org_id,
+        metadata={"generated_recommendations": generated},
+    )
     await db.commit()
 
     if active_conn is not None and active_map is not None:
-        from app.services.schedulers.pipeline_scheduler import schedule_org, trigger_pipeline_now
+        from app.services.schedulers.pipeline_scheduler import trigger_pipeline_now
 
-        schedule_org(org_id, org.name)
+        # Interval cron is registered by the dedicated scheduler process (periodic org discovery).
         await trigger_pipeline_now(org_id, trigger_source="setup")
 
     return CompleteSetupResult(

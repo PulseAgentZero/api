@@ -16,6 +16,7 @@ from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.infrastructure.audit import log_audit
 from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,15 @@ async def action_recommendation(
     if body and body.outcome_notes:
         rec.outcome_notes = body.outcome_notes
     touch_updated_at(rec)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="recommendation.actioned",
+        resource="recommendation",
+        resource_id=rec.id,
+        metadata={"entity_id": rec.entity_id},
+    )
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
@@ -151,6 +161,15 @@ async def dismiss_recommendation(
         raise bad_request("BAD_REQUEST", "Already actioned or dismissed")
     rec.status = "dismissed"
     touch_updated_at(rec)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="recommendation.dismissed",
+        resource="recommendation",
+        resource_id=rec.id,
+        metadata={"reason": body.reason if body else None},
+    )
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
@@ -194,6 +213,14 @@ async def escalate_recommendation(
                 source_id=rec.id,
             )
         )
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="recommendation.escalated",
+        resource="recommendation",
+        resource_id=rec.id,
+    )
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
