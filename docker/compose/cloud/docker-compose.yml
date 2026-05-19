@@ -43,6 +43,7 @@ x-app: &app
     - ../../../logs:/app/logs
   networks:
     - pulse
+    - reverse-proxy_nginx-network 
   dns:
     - 8.8.8.8
     - 8.8.4.4
@@ -261,3 +262,5 @@ volumes:
 networks:
   pulse:
     driver: bridge
+  reverse-proxy_nginx-network:
+    external: true
