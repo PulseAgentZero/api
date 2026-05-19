@@ -20,7 +20,7 @@ from app.config.settings import settings
 logger = logging.getLogger(__name__)
 
 
-_ENTITY_ID_RE = re.compile(r"\b[A-Z]{2,}-?\d{2,}\b")
+_ENTITY_ID_RE = re.compile(r"\b(?:[A-Z]{2,}-?\d{2,}|[1-9]\d{1,5})\b")
 
 
 @dataclass

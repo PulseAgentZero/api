@@ -17,7 +17,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.base import BaseAgent, LLMProvider
+from app.agents.base import BaseAgent, LLMProvider, repair_truncated_json
 from app.agents.prompts.risk_scoring import RISK_SCORING_PROMPT
 from app.agents.state import PipelineState
 from app.infrastructure.database.client_queries import compute_risk, fetch_entities, get_schema_mapping
@@ -30,10 +30,12 @@ from app.infrastructure.external_services.rag import (
     update_entity_metadata,
 )
 from app.config.settings import settings
+from app.services.procedural_memory import format_procedural_block
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RAG_INDEX_LIMIT = 1000
+NARRATIVE_BATCH_SIZE = 8
 
 
 class RiskScoringAgent(BaseAgent):
@@ -232,10 +234,15 @@ class RiskScoringAgent(BaseAgent):
 
             try:
                 narratives = await self._generate_narratives(state, payload)
-                narrative_map = {n["entity_id"]: n.get("risk_narrative", "") for n in narratives}
+                narrative_map = {
+                    str(n["entity_id"]): n.get("risk_narrative", "")
+                    for n in narratives
+                    if n.get("entity_id") is not None
+                }
                 for entity in scored_entities:
-                    if entity["entity_id"] in narrative_map:
-                        entity["risk_narrative"] = narrative_map[entity["entity_id"]]
+                    eid = str(entity["entity_id"])
+                    if eid in narrative_map and narrative_map[eid]:
+                        entity["risk_narrative"] = narrative_map[eid]
             except Exception as e:
                 logger.warning("[RiskScoringAgent] Narrative generation failed (non-fatal): %s", e)
                 # Non-fatal — scores are still valid without narratives
@@ -315,20 +322,46 @@ class RiskScoringAgent(BaseAgent):
     async def _generate_narratives(
         self, state: PipelineState, elevated: list[dict]
     ) -> list[dict]:
-        """Use GPT-OSS-120B on Groq to generate risk narratives for elevated entities."""
-
-        prompt = RISK_SCORING_PROMPT.format(
+        """Generate risk narratives for elevated entities in batches."""
+        system_prompt = RISK_SCORING_PROMPT.format(
             org_name=state.get("org_name", "Unknown"),
             industry=state.get("industry", "Unknown"),
             goal_label=state.get("goal_label", "improve operations"),
             entity_label=state.get("entity_label", "entities"),
             signal_columns=json.dumps(state.get("signal_columns", {})),
             risk_config=json.dumps(state.get("risk_config", {})),
+            procedural_block=format_procedural_block(
+                state.get("procedural_learnings")
+            ),
         )
 
-        entity_data = json.dumps(elevated, default=str)
+        all_narratives: list[dict] = []
+        slim_entities = [_slim_narrative_payload(e) for e in elevated]
+
+        for i in range(0, len(slim_entities), NARRATIVE_BATCH_SIZE):
+            batch = slim_entities[i : i + NARRATIVE_BATCH_SIZE]
+            batch_result = await self._generate_narrative_batch(
+                state, system_prompt, batch
+            )
+            all_narratives.extend(batch_result)
+
+        covered = {str(n.get("entity_id")) for n in all_narratives if n.get("entity_id")}
+        missing = [e for e in elevated if str(e.get("entity_id")) not in covered]
+        if missing:
+            all_narratives.extend(_fallback_narratives(missing, state))
+
+        return all_narratives
+
+    async def _generate_narrative_batch(
+        self,
+        state: PipelineState,
+        system_prompt: str,
+        batch: list[dict],
+    ) -> list[dict]:
+        """LLM narrative generation for one batch with JSON repair."""
+        entity_data = json.dumps(batch, default=str)
         user_prompt = (
-            f"Generate risk narratives for these {len(elevated)} elevated-risk "
+            f"Generate risk narratives for these {len(batch)} elevated-risk "
             f"{state.get('entity_label', 'entities')}. "
             f"Each entity already has a deterministic risk_score and risk_tier. "
             f"Your job is to write a 1-2 sentence risk_narrative for each one "
@@ -337,20 +370,122 @@ class RiskScoringAgent(BaseAgent):
         )
 
         raw = await self.llm_json_call(
-            system_prompt=prompt,
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
+            max_tokens=16384,
         )
 
+        parsed = _parse_narrative_llm_response(raw)
+        if parsed:
+            return parsed
+
+        logger.warning(
+            "[RiskScoringAgent] Narrative batch parse failed; using fallback for %d entities",
+            len(batch),
+        )
+        return _fallback_narratives(
+            [{"entity_id": e.get("entity_id"), **e} for e in batch],
+            state,
+        )
+
+
+def _parse_narrative_llm_response(raw: str) -> list[dict]:
+    """Parse LLM JSON for scored_entities; repair truncated output when possible."""
+    for attempt_raw in (raw, repair_truncated_json(raw)):
+        if not attempt_raw:
+            continue
         try:
-            result = json.loads(raw)
-            if isinstance(result, dict) and "scored_entities" in result:
-                return result["scored_entities"]
-            if isinstance(result, list):
-                return result
-            return []
+            result = json.loads(attempt_raw)
         except json.JSONDecodeError:
-            logger.warning("[RiskScoringAgent] Failed to parse narratives JSON")
-            return []
+            if attempt_raw is raw:
+                logger.warning(
+                    "[RiskScoringAgent] Failed to parse narratives JSON (snippet): %s",
+                    raw[:500],
+                )
+            continue
+        if isinstance(result, dict) and "scored_entities" in result:
+            return result["scored_entities"]
+        if isinstance(result, list):
+            return result
+        logger.warning(
+            "[RiskScoringAgent] Narratives JSON missing scored_entities key"
+        )
+        return []
+    return []
+
+
+def _slim_narrative_payload(entity: dict) -> dict:
+    """Shrink entity payload for narrative LLM context."""
+    signals = entity.get("signal_values") or {}
+    top_signals = sorted(
+        ((k, v) for k, v in signals.items() if isinstance(v, (int, float))),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )[:6]
+    slim: dict[str, Any] = {
+        "entity_id": entity.get("entity_id"),
+        "entity_name": entity.get("entity_name"),
+        "risk_score": entity.get("risk_score"),
+        "risk_tier": entity.get("risk_tier"),
+        "signal_values": dict(top_signals),
+        "scoring_method": entity.get("scoring_method"),
+    }
+    profile = entity.get("profile")
+    if isinstance(profile, dict):
+        summary = profile.get("profile_summary")
+        if summary:
+            slim["profile_summary"] = summary
+        elif profile.get("behavioural_metrics"):
+            slim["profile_summary"] = json.dumps(
+                profile.get("behavioural_metrics"), default=str
+            )[:400]
+    similar = entity.get("similar_entities") or []
+    if similar:
+        slim["similar_entities"] = [
+            {
+                "entity_id": s.get("entity_id"),
+                "similarity": s.get("similarity"),
+                "profile_summary": (s.get("profile_summary") or "")[:200],
+                "risk_tier": s.get("risk_tier"),
+            }
+            for s in similar[:3]
+        ]
+    if entity.get("ml_feature_importances"):
+        slim["ml_feature_importances"] = entity["ml_feature_importances"][:5]
+    return slim
+
+
+def _fallback_narratives(batch: list[dict], state: PipelineState) -> list[dict]:
+    """Template narratives when LLM output cannot be parsed."""
+    out: list[dict] = []
+    for entity in batch:
+        eid = entity.get("entity_id")
+        if eid is None:
+            continue
+        signals = entity.get("signal_values") or {}
+        top_signal = "unknown"
+        if signals:
+            top_signal = max(signals, key=lambda k: _narrative_signal_value(signals[k]))
+        tier = entity.get("risk_tier", "high")
+        score = entity.get("risk_score", 0)
+        out.append({
+            "entity_id": str(eid),
+            "entity_name": entity.get("entity_name"),
+            "risk_score": score,
+            "risk_tier": tier,
+            "risk_narrative": (
+                f"Risk score {score:.2f} ({tier} tier). "
+                f"Primary driver: {top_signal}."
+            ),
+        })
+    return out
+
+
+def _narrative_signal_value(v: object) -> float:
+    try:
+        return abs(float(v))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _augment_with_profile(entity: dict, profile: dict | None) -> dict:

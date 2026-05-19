@@ -719,3 +719,45 @@ def _find_balanced_json(text: str) -> str | None:
                         return text[i : j + 1]
             # Unbalanced — keep scanning for a later candidate.
     return None
+
+
+def repair_truncated_json(raw: str) -> str | None:
+    """Repair JSON truncated mid-generation by closing strings and brackets."""
+    stripped = raw.strip()
+    if not stripped:
+        return None
+
+    if stripped[-1] == '"':
+        pass
+    elif stripped[-1] not in ("}", "]", '"'):
+        stripped += '"'
+
+    brackets = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in stripped:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in brackets:
+            stack.append(brackets[ch])
+        elif ch == "}":
+            if stack and stack[-1] == "}":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "]":
+                stack.pop()
+
+    repaired = stripped + "".join(reversed(stack))
+    if len(repaired) < len(raw.strip()):
+        return None
+    return repaired

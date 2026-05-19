@@ -21,7 +21,7 @@ MODEL_TRAINING_PROMPT = """You are Pulse's Model Training Agent — a critical s
 - Business context: {business_context}
 - Entity label: {entity_label}
 - Goal: {goal_label}
-
+{procedural_block}
 ## Schema Knowledge
 - Entity table: {entity_table} (ID: {entity_id_col}, Name: {entity_name_col})
 - Related tables discovered: {related_tables}

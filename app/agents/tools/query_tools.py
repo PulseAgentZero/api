@@ -81,6 +81,17 @@ def _validate_where_clause(where: str | None) -> str | None:
 
 # ─── Audit logging ──────────────────────────────────────────────────────
 
+async def _fetch_table_columns(
+    client_conn: Any, db_type: str, table_name: str
+) -> list[str]:
+    """Return column names for a table from information_schema."""
+    cols_result = await client_conn.execute(
+        text(schema_columns_sql(db_type)),
+        {"tname": table_name},
+    )
+    return [row[0] for row in cols_result.all()]
+
+
 def _log_client_access(
     org_id: UUID,
     table: str,
@@ -170,20 +181,63 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 table = validate_identifier(table_name, "table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
+                available_columns = await _fetch_table_columns(
+                    client_conn, conn.db_type, table
+                )
+                if not available_columns:
+                    return {
+                        "error": f"Table '{table}' not found",
+                        "hint": "Call list_tables and use an exact table name from the result.",
+                    }
+
                 if not columns or columns.strip() == "*":
-                    cols_result = await client_conn.execute(
-                        text(schema_columns_sql(conn.db_type)),
-                        {"tname": table_name},
-                    )
-                    col_names = [r[0] for r in cols_result.all()]
-                    if not col_names:
-                        return {"error": f"Table '{table_name}' not found"}
+                    col_names = available_columns
                 else:
-                    col_names = [
-                        validate_identifier(c.strip(), "column")
-                        for c in columns.split(",")
-                        if c.strip() and c.strip() != "*"
-                    ]
+                    col_names = []
+                    missing: list[str] = []
+                    for raw in columns.split(","):
+                        name = raw.strip()
+                        if not name or name == "*":
+                            continue
+                        try:
+                            col = validate_identifier(name, "column")
+                        except ClientDBError as exc:
+                            return {"error": str(exc), "table": table}
+                        if col not in available_columns:
+                            missing.append(col)
+                        else:
+                            col_names.append(col)
+                    if missing:
+                        err: dict[str, Any] = {
+                            "error": (
+                                f"Column(s) {missing} do not exist on table '{table}'"
+                            ),
+                            "table": table,
+                            "missing_columns": missing,
+                            "available_columns": available_columns,
+                        }
+                        try:
+                            mapping = await get_schema_mapping(db, org_id)
+                            entity_cols = await _fetch_table_columns(
+                                client_conn,
+                                conn.db_type,
+                                mapping.entity_table,
+                            )
+                            if any(c in entity_cols for c in missing):
+                                err["hint"] = (
+                                    f"Column(s) exist on entity table "
+                                    f"'{mapping.entity_table}'; use "
+                                    "query_entity_table instead."
+                                )
+                        except Exception:
+                            pass
+                        return err
+                    if not col_names:
+                        return {
+                            "error": "No valid columns specified",
+                            "table": table,
+                            "available_columns": available_columns,
+                        }
 
                 quoted_cols = [quote_identifier(c, conn.db_type) for c in col_names]
                 sql = f"SELECT {', '.join(quoted_cols) or '*'} FROM {quoted_table}"
@@ -226,17 +280,71 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 if agg not in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
                     return {"error": f"Unsupported aggregate: {aggregate}"}
 
-                if column == "*":
-                    agg_expr = f"{agg}(*)"
-                else:
-                    col = validate_identifier(column, "column")
+                available_columns = await _fetch_table_columns(
+                    client_conn, conn.db_type, table
+                )
+                if not available_columns:
+                    return {
+                        "error": f"Table '{table}' not found or has no columns",
+                        "table": table,
+                    }
+
+                if column != "*":
+                    col_name = column.strip()
+                    try:
+                        col = validate_identifier(col_name, "column")
+                    except ClientDBError as exc:
+                        return {"error": str(exc), "table": table}
+
+                    if col not in available_columns:
+                        err: dict[str, Any] = {
+                            "error": (
+                                f"Column '{col}' does not exist on table '{table}'"
+                            ),
+                            "table": table,
+                            "column": col,
+                            "available_columns": available_columns,
+                        }
+                        try:
+                            mapping = await get_schema_mapping(db, org_id)
+                            entity_cols = await _fetch_table_columns(
+                                client_conn,
+                                conn.db_type,
+                                mapping.entity_table,
+                            )
+                            if col in entity_cols:
+                                err["hint"] = (
+                                    f"Column '{col}' is on entity table "
+                                    f"'{mapping.entity_table}'; use query_entity_table "
+                                    f"or query_aggregate on that table."
+                                )
+                        except Exception:
+                            pass
+                        return err
+
                     agg_expr = f"{agg}({quote_identifier(col, conn.db_type)})"
+                else:
+                    if agg != "COUNT":
+                        return {
+                            "error": "Only COUNT supports column '*'",
+                            "table": table,
+                        }
+                    agg_expr = f"{agg}(*)"
 
                 sql = f"SELECT {agg_expr} AS result"
 
                 select_cols = ["result"]
                 if group_by:
                     gb_col = validate_identifier(group_by, "group_by column")
+                    if gb_col not in available_columns:
+                        return {
+                            "error": (
+                                f"GROUP BY column '{gb_col}' does not exist on "
+                                f"table '{table}'"
+                            ),
+                            "table": table,
+                            "available_columns": available_columns,
+                        }
                     quoted_gb = quote_identifier(gb_col, conn.db_type)
                     sql = f"SELECT {quoted_gb}, {agg_expr} AS result"
                     select_cols = [gb_col, "result"]

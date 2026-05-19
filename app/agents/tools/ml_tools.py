@@ -347,6 +347,13 @@ def build_ml_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         cv_accuracy, cv_precision, cv_recall, cv_f1, cv_auc = [], [], [], [], []
         avg = "binary" if n_unique_y == 2 else "weighted"
 
+        # Detect positive class index once — used for threshold-adjusted P/R/F1
+        positive_idx = _detect_positive_class(t_classes)
+        # Minority class proportion as decision threshold. At default 0.5, a
+        # class_weight="balanced" model often still predicts all-negative on
+        # severely imbalanced data, producing P/R/F1=0 despite good AUC.
+        minority_threshold = float(np.bincount(y).min()) / len(y) if n_unique_y == 2 else 0.5
+
         try:
             skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
             for train_idx, test_idx in skf.split(X, y):
@@ -358,18 +365,30 @@ def build_ml_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
                 y_pred = fold_model.predict(X[test_idx])
 
                 cv_accuracy.append(float(accuracy_score(y[test_idx], y_pred)))
-                cv_precision.append(float(precision_score(y[test_idx], y_pred, average=avg, zero_division=0)))
-                cv_recall.append(float(recall_score(y[test_idx], y_pred, average=avg, zero_division=0)))
-                cv_f1.append(float(f1_score(y[test_idx], y_pred, average=avg, zero_division=0)))
 
                 try:
                     y_proba = fold_model.predict_proba(X[test_idx])
                     if n_unique_y == 2:
-                        cv_auc.append(float(roc_auc_score(y[test_idx], y_proba[:, 1])))
+                        # Use minority-proportion threshold for meaningful P/R/F1
+                        y_pred_thresh = (y_proba[:, positive_idx] >= minority_threshold).astype(int)
+                        cv_precision.append(float(precision_score(y[test_idx], y_pred_thresh, average=avg, zero_division=0)))
+                        cv_recall.append(float(recall_score(y[test_idx], y_pred_thresh, average=avg, zero_division=0)))
+                        cv_f1.append(float(f1_score(y[test_idx], y_pred_thresh, average=avg, zero_division=0)))
+                        cv_auc.append(float(roc_auc_score(y[test_idx], y_proba[:, positive_idx])))
                     else:
+                        cv_precision.append(float(precision_score(y[test_idx], y_pred, average=avg, zero_division=0)))
+                        cv_recall.append(float(recall_score(y[test_idx], y_pred, average=avg, zero_division=0)))
+                        cv_f1.append(float(f1_score(y[test_idx], y_pred, average=avg, zero_division=0)))
                         cv_auc.append(float(roc_auc_score(y[test_idx], y_proba, multi_class="ovr", average="weighted")))
-                except Exception:
-                    pass
+                except Exception as _cv_exc:
+                    logger.warning(
+                        "CV fold proba/threshold metrics failed (%s: %s) — "
+                        "falling back to predict(). positive_idx=%s minority_threshold=%s n_unique_y=%s",
+                        type(_cv_exc).__name__, _cv_exc, positive_idx, minority_threshold, n_unique_y,
+                    )
+                    cv_precision.append(float(precision_score(y[test_idx], y_pred, average=avg, zero_division=0)))
+                    cv_recall.append(float(recall_score(y[test_idx], y_pred, average=avg, zero_division=0)))
+                    cv_f1.append(float(f1_score(y[test_idx], y_pred, average=avg, zero_division=0)))
         except Exception as e:
             return {"error": f"Cross-validation failed: {e}"}
 

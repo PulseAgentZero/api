@@ -17,7 +17,7 @@ IMPORTANT: The risk SCORES are already computed (either by an ML model or by the
 - Industry: {industry}
 - Goal: {goal_label}
 - Entity label: {entity_label}
-
+{procedural_block}
 ## Risk Configuration
 - Signal columns and weights: {signal_columns}
 - Risk config: {risk_config}

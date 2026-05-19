@@ -11,7 +11,7 @@ RECOMMENDATION_PROMPT = """You are Pulse's Recommendation Agent — the final st
 - Business context: {business_context}
 - Entity label: {entity_label}
 - Goal: {goal_label}
-
+{procedural_block}
 ## Your Reasoning Process for Each Entity
 
 ### Step 1: Read the risk signal pattern

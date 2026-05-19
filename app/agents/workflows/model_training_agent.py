@@ -32,6 +32,7 @@ from app.agents.state import PipelineState
 from app.agents.tools.ml_tools import build_ml_tools, _clean_model_store, _SCORED_STORE
 from app.agents.tools.query_tools import build_query_tools
 from app.config.settings import settings
+from app.services.procedural_memory import format_procedural_block
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,9 @@ class ModelTrainingAgent(BaseAgent):
             related_tables=json.dumps(state.get("related_tables", []), default=str),
             signal_columns=json.dumps(state.get("signal_columns", {})),
             target_column_hint=target_hint,
+            procedural_block=format_procedural_block(
+                state.get("procedural_learnings")
+            ),
         )
 
         user_prompt = (

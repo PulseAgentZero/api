@@ -20,7 +20,7 @@ _MEM_KEY = "profile"
 _MEM_TOP_N = 5
 _MEM_MAX_ENTITIES = 50
 _MEM_MAX_TOPICS = 30
-_MEM_ENTITY_RE = re.compile(r"\b[A-Z]{2,}-?\d{2,}\b")
+_MEM_ENTITY_RE = re.compile(r"\b(?:[A-Z]{2,}-?\d{2,}|[1-9]\d{1,5})\b")
 _MEM_TOPIC_KEYWORDS = (
     "recommendation", "critical", "high risk", "churn", "overview",
     "draft", "similar", "metrics", "trend", "anomaly", "summary",
