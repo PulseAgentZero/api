@@ -66,7 +66,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-pulse}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5442}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -100,9 +100,6 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
-    ports:
-      - "${QDRANT_HTTP_PORT:-6333}:6333"
-      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
@@ -132,7 +129,7 @@ services:
       # Internal URL so api can proxy /agent/* requests to the agent service
       AGENT_SERVICE_URL: http://agent:8001
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_PORT:-8040}:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 20s
@@ -222,30 +219,6 @@ services:
     deploy:
       replicas: 1               # always exactly one scheduler
 
-  # frontend:
-  #   # Pulse dashboard — Next.js standalone.
-  #   # NEXT_PUBLIC_API_URL is baked in at build time, so rebuild when the API URL changes.
-  #   build:
-  #     context: ../../../../dashboard
-  #     dockerfile: Dockerfile
-  #     args:
-  #       NEXT_PUBLIC_API_URL: ${FRONTEND_API_URL:-http://localhost:8000}
-  #       NEXT_PUBLIC_DEPLOYMENT_MODE: cloud
-  #   image: pulseai/pulse-frontend:${IMAGE_TAG:-latest}
-  #   ports:
-  #     - "${FRONTEND_PORT:-3000}:3000"
-  #   environment:
-  #     NODE_ENV: production
-  #   networks:
-  #     - pulse
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ || exit 1"]
-  #     interval: 30s
-  #     timeout: 5s
-  #     retries: 3
-  #     start_period: 15s
-
   license:
     # Internal license validation server — not exposed publicly.
     # Self-hosted instances reach it via public URL (e.g. https://license.pulseai.io).
@@ -262,7 +235,7 @@ services:
       LICENSE_SERVER_API_KEY: ${LICENSE_SERVER_API_KEY:-}
       PULSE_LICENSE_PUBLIC_KEY: ${PULSE_LICENSE_PUBLIC_KEY:-}
     ports:
-      - "${LICENSE_PORT:-8002}:8002"
+      - "${LICENSE_PORT:-8072}:8002"
     networks:
       - pulse
     depends_on:
