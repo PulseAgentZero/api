@@ -54,25 +54,25 @@ jobs:
                   remote_user: ${{ secrets.VPS_USER }}
                   remote_key: ${{ secrets.VPS_SSH_KEY }}
 
-            # - name: Build and run with Docker Compose
-            #   uses: appleboy/ssh-action@v1.2.4
-            #   with:
-            #       host: ${{ secrets.VPS_HOST }}
-            #       username: ${{ secrets.VPS_USER }}
-            #       key: ${{ secrets.VPS_SSH_KEY }}
-            #       script_stop: true
-            #       script: |
-            #           set -euo pipefail
-            #           cd "${{ env.DEPLOY_REMOTE_PATH }}"
-            #           docker compose -f "${{ env.COMPOSE_FILE }}" down
-            #           docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --remove-orphans
+            - name: Build and run with Docker Compose
+              uses: appleboy/ssh-action@v1.2.4
+              with:
+                  host: ${{ secrets.VPS_HOST }}
+                  username: ${{ secrets.VPS_USER }}
+                  key: ${{ secrets.VPS_SSH_KEY }}
+                  script_stop: true
+                  script: |
+                      set -euo pipefail
+                      cd "${{ env.DEPLOY_REMOTE_PATH }}"
+                      docker compose -f "${{ env.COMPOSE_FILE }}" down
+                      docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --remove-orphans
 
-            # - name: Notify deployment status
-            #   if: always()
-            #   run: |
-            #       if [ "${{ job.status }}" == "success" ]; then
-            #         echo "Deployment successful"
-            #       else
-            #         echo "Deployment failed"
-            #         exit 1
-            #       fi
+            - name: Notify deployment status
+              if: always()
+              run: |
+                  if [ "${{ job.status }}" == "success" ]; then
+                    echo "Deployment successful"
+                  else
+                    echo "Deployment failed"
+                    exit 1
+                  fi

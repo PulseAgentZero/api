@@ -157,11 +157,11 @@ services:
         condition: service_started    # wait for migrations
     # docker compose up --scale worker=4
     healthcheck:
-      test: ["CMD", "python", "-c", "import app.worker; print('ok')"]
+      test: ["CMD", "python", "scripts/docker/redis_healthcheck.py"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
   agent:
     <<: *app
@@ -211,7 +211,7 @@ services:
         condition: service_started
     # Scheduler is a background job process — no HTTP port, no HTTP health check
     healthcheck:
-      test: ["CMD", "python", "-c", "import app.services.schedulers.run; print('ok')"]
+      test: ["CMD", "python", "scripts/docker/redis_healthcheck.py"]
       interval: 60s
       timeout: 10s
       retries: 3

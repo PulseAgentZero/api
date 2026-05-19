@@ -67,8 +67,9 @@ RUN chmod +x /docker-entrypoint.sh
 # Entrypoint starts as root to fix volume permissions, then drops to `pulse` via gosu.
 EXPOSE 8000
 
-HEALTHCHECK --interval=20s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+# Per-service healthchecks are defined in docker-compose (api/agent use HTTP;
+# worker/scheduler use scripts/docker/redis_healthcheck.py).
+HEALTHCHECK NONE
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["api"]

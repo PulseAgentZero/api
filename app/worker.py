@@ -184,6 +184,7 @@ async def _loop() -> None:
 
 
 async def _main() -> None:
+    logger.info("Worker listening on queues: %s", _ALL_QUEUES)
     try:
         await _loop()
     finally:
