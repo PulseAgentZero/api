@@ -64,7 +64,6 @@ jobs:
                   script: |
                       set -euo pipefail
                       cd "${{ env.DEPLOY_REMOTE_PATH }}"
-                      docker compose -f "${{ env.COMPOSE_FILE }}" down
                       docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --remove-orphans
 
             - name: Notify deployment status
