@@ -99,6 +99,82 @@ def _schema_columns_sql(db_type: str | None) -> str:
     )
 
 
+def _column_data_type_sql(db_type: str | None) -> str:
+    """Return SQL that fetches the data_type for a specific column in a table."""
+    dt = _norm_client_db_type(db_type)
+    if dt == "mysql":
+        return (
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = :tname "
+            "AND column_name = :cname LIMIT 1"
+        )
+    if dt == "sqlite":
+        return (
+            "SELECT type AS data_type FROM pragma_table_info(:tname) "
+            "WHERE name = :cname LIMIT 1"
+        )
+    if dt == "mssql":
+        return (
+            "SELECT DATA_TYPE AS data_type FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = SCHEMA_NAME() AND TABLE_NAME = :tname "
+            "AND COLUMN_NAME = :cname"
+        )
+    return (
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = :tname "
+        "AND column_name = :cname LIMIT 1"
+    )
+
+
+_INTEGER_TYPE_NAMES = frozenset({
+    "integer", "int", "int4", "int8", "int2",
+    "bigint", "smallint", "tinyint", "serial", "bigserial",
+    "mediumint", "number",
+})
+
+_UUID_TYPE_NAMES = frozenset({"uuid"})
+
+
+def _coerce_entity_id(entity_id: str, data_type: str | None) -> object:
+    """Cast the entity_id string to the correct Python type for SQL binding.
+
+    This prevents asyncpg DataError when the client DB column is an integer
+    but the chat agent passes a string like '628'.
+    """
+    if not data_type:
+        return entity_id
+    dt_lower = data_type.lower().strip()
+    if dt_lower in _INTEGER_TYPE_NAMES:
+        try:
+            return int(entity_id)
+        except (ValueError, TypeError):
+            return entity_id
+    if dt_lower in _UUID_TYPE_NAMES:
+        import uuid as _uuid
+        try:
+            return _uuid.UUID(entity_id)
+        except (ValueError, TypeError):
+            return entity_id
+    return entity_id
+
+
+async def _detect_id_column_type(
+    client_conn: AsyncConnection, db_type: str | None,
+    table_name: str, column_name: str,
+) -> str | None:
+    """Best-effort detection of the entity ID column's data type."""
+    try:
+        sql = _column_data_type_sql(db_type)
+        result = await client_conn.execute(
+            text(sql), {"tname": table_name, "cname": column_name},
+        )
+        row = result.one_or_none()
+        return str(row[0]).lower().strip() if row else None
+    except Exception as exc:
+        logger.debug("[client_queries] column type detection failed (non-fatal): %s", exc)
+        return None
+
+
 class ClientDBError(Exception):
     """Raised when the client DB is not available or misconfigured."""
 
@@ -249,7 +325,12 @@ async def fetch_entities(
 async def fetch_entity_by_id(
     db: AsyncSession, org_id, entity_id: str, mapping: SchemaMapping
 ) -> dict | None:
-    """Fetch a single entity from the client DB by ID."""
+    """Fetch a single entity from the client DB by ID.
+
+    Auto-detects the entity ID column's data type and casts the bind
+    parameter accordingly, preventing asyncpg DataError when the column
+    is an integer but the caller passes a string.
+    """
     engine, _conn = await _get_client_engine(db, org_id)
     try:
         async with _safe_client_connection(engine, _conn) as client_conn:
@@ -261,13 +342,20 @@ async def fetch_entity_by_id(
             if not all_cols:
                 raise ClientDBError("Mapped entity table was not found in the client database")
 
+            # Detect entity ID column type so we can cast the bind param.
+            id_col_type = await _detect_id_column_type(
+                client_conn, _conn.db_type,
+                mapping.entity_table, mapping.entity_id_col,
+            )
+            coerced_eid = _coerce_entity_id(entity_id, id_col_type)
+
             quoted_cols = [_quote_identifier(c, _conn.db_type) for c in all_cols]
             sql = (
                 f"SELECT {', '.join(quoted_cols)} FROM "
                 f"{_quote_identifier(mapping.entity_table, _conn.db_type)} "
                 f"WHERE {_quote_identifier(mapping.entity_id_col, _conn.db_type)} = :eid"
             )
-            result = await client_conn.execute(text(sql), {"eid": entity_id})
+            result = await client_conn.execute(text(sql), {"eid": coerced_eid})
             row = result.one_or_none()
             if row is None:
                 return None
@@ -300,6 +388,12 @@ async def fetch_entity_trend(
                 if col_name not in cols:
                     cols.append(col_name)
 
+            # Detect entity ID column type for correct bind param casting.
+            id_col_type = await _detect_id_column_type(
+                client_conn, _conn.db_type, table_name, id_col,
+            )
+            coerced_eid = _coerce_entity_id(entity_id, id_col_type)
+
             quoted_cols = [_quote_identifier(c, _conn.db_type) for c in cols]
             q_table = _quote_identifier(table_name, _conn.db_type)
             q_id = _quote_identifier(id_col, _conn.db_type)
@@ -315,7 +409,7 @@ async def fetch_entity_trend(
                     f"SELECT {col_list} FROM {q_table} WHERE {q_id} = :eid "
                     f"ORDER BY {q_ts} DESC LIMIT :limit"
                 )
-            result = await client_conn.execute(text(sql), {"eid": entity_id, "limit": limit})
+            result = await client_conn.execute(text(sql), {"eid": coerced_eid, "limit": limit})
             rows = result.all()
             points = []
             for row in reversed(rows):
@@ -331,6 +425,25 @@ async def fetch_entity_trend(
         await engine.dispose()
 
 
+def _try_float(val: object) -> float | None:
+    """Parse a DB cell as float; return None for categorical / non-numeric values."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return float(val)
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        stripped = val.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
 def compute_risk(
     entities: list[dict],
     signal_columns: dict | None,
@@ -344,14 +457,27 @@ def compute_risk(
             e["risk_tier"] = "low"
         return entities
 
-    signal_keys = list(signal_columns.keys())
     col_to_signal = {v: k for k, v in signal_columns.items()}
+    # Only score columns that contain numeric values (skip region names, labels, etc.).
+    numeric_col_to_signal: dict[str, str] = {}
+    for col, signal_key in col_to_signal.items():
+        if any(_try_float(entity.get(col)) is not None for entity in entities):
+            numeric_col_to_signal[col] = signal_key
+
+    if not numeric_col_to_signal:
+        for e in entities:
+            e["risk_score"] = 0.0
+            e["risk_tier"] = "low"
+            e["signals"] = {}
+        return entities
+
+    signal_keys = list({k for k in numeric_col_to_signal.values()})
 
     signal_values: dict[str, list[float]] = {k: [] for k in signal_keys}
     for entity in entities:
-        for col, signal_key in col_to_signal.items():
-            val = entity.get(col)
-            signal_values[signal_key].append(float(val) if val is not None else 0.0)
+        for col, signal_key in numeric_col_to_signal.items():
+            parsed = _try_float(entity.get(col))
+            signal_values[signal_key].append(parsed if parsed is not None else 0.0)
 
     mins = {}
     maxs = {}
@@ -369,8 +495,9 @@ def compute_risk(
     for entity in entities:
         signals = {}
         score = 0.0
-        for col, signal_key in col_to_signal.items():
-            raw = float(entity.get(col, 0) or 0)
+        for col, signal_key in numeric_col_to_signal.items():
+            parsed = _try_float(entity.get(col))
+            raw = parsed if parsed is not None else 0.0
             signals[signal_key] = raw
             rng = maxs[signal_key] - mins[signal_key]
             normalized = _signal_score(

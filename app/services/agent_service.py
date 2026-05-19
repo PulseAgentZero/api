@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 from uuid import UUID
 
@@ -24,7 +26,18 @@ _MEM_ENTITY_RE = re.compile(r"\b(?:[A-Z]{2,}-?\d{2,}|[1-9]\d{1,5})\b")
 _MEM_TOPIC_KEYWORDS = (
     "recommendation", "critical", "high risk", "churn", "overview",
     "draft", "similar", "metrics", "trend", "anomaly", "summary",
+    "pipeline", "compare", "history", "outcome", "default",
+    "fraud", "readmission",
 )
+
+
+@dataclass
+class ChatResult:
+    """Result from a single chat turn, carrying reply text + tool context."""
+    reply: str
+    tool_context: dict[str, Any] = field(default_factory=dict)
+    tools_called: list[str] = field(default_factory=list)
+
 
 from app.config.settings import settings
 from app.infrastructure.database.client_queries import (
@@ -32,6 +45,7 @@ from app.infrastructure.database.client_queries import (
     compute_risk,
     fetch_entities,
     fetch_entity_by_id,
+    fetch_entity_trend,
     get_schema_mapping,
 )
 from app.infrastructure.database.models.user import User
@@ -53,19 +67,29 @@ from app.services.conversational_memory import (
 )
 from groq import AsyncGroq
 
+from sqlalchemy import func as sa_func, select as sa_select
+from app.infrastructure.database.models.entity_profile import EntityProfile
+
 from app.agents.prompts.conversational import (
     CLARIFICATION_REPLY_PROMPT,
+    DATA_ACCESS_REPLY_PROMPT,
     GREETING_REPLY_PROMPT,
     HELP_REPLY_PROMPT,
     OFF_TOPIC_REPLY_PROMPT,
     render_chat_system_prompt,
+    reply_contains_em_dash,
+    sanitize_pulse_reply,
 )
 from app.services.intent_router import (
     CONVERSATIONAL_INTENTS,
+    apply_pipeline_intent_override,
     build_fastpath_args,
     classify_intent,
     filter_tools_by_intent,
+    resolve_followup_query,
 )
+
+CHAT_LOGGER = logging.getLogger("pulse.chat")
 
 
 _conv_groq_client: AsyncGroq | None = None
@@ -85,9 +109,15 @@ def _get_conv_groq() -> AsyncGroq | None:
 _CONV_REPLY_PROMPTS = {
     "greeting": GREETING_REPLY_PROMPT,
     "help": HELP_REPLY_PROMPT,
+    "data_access": DATA_ACCESS_REPLY_PROMPT,
     "off_topic": OFF_TOPIC_REPLY_PROMPT,
     "unknown": CLARIFICATION_REPLY_PROMPT,
 }
+
+_DATA_ACCESS_PATTERNS = (
+    "database", "data base", "sql", "schema", "table", "tables", "raw data",
+    "query my db", "query the db",
+)
 
 
 async def _craft_conversational_reply(intent_name: str, state: dict) -> str | None:
@@ -101,19 +131,20 @@ async def _craft_conversational_reply(intent_name: str, state: dict) -> str | No
     client = _get_conv_groq()
     if client is None:
         return None
+    max_tokens = 450 if intent_name in ("help", "data_access") else 320
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=settings.GROQ_LLM_MODEL_FAST,
                 messages=[
                     {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps(state, default=str)[:1200]},
+                    {"role": "user", "content": json.dumps(state, default=str)[:2000]},
                 ],
-                temperature=0.6,
-                max_tokens=300,
+                temperature=0.78,
+                max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             ),
-            timeout=6.0,
+            timeout=8.0,
         )
         raw = (response.choices[0].message.content or "").strip()
         data = json.loads(raw)
@@ -128,6 +159,20 @@ TOOLS = [
     {
         "name": "get_overview",
         "description": "Get total entities, risk breakdown, active recommendation count, and top at-risk entities.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "get_pipeline_status",
+        "description": "Get autonomous pipeline run status: active run, last completed run, entity counts, recommendations generated.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "get_pipeline_detail",
+        "description": (
+            "Get detailed breakdown of the latest pipeline run: per-step timing and success, "
+            "ML model metrics (accuracy, F1, AUC), top feature importances, and RAG statistics. "
+            "Use when the user asks about pipeline steps, model performance, or how long something took."
+        ),
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -166,6 +211,41 @@ TOOLS = [
         },
     },
     {
+        "name": "get_outcome_analysis",
+        "description": (
+            "Get outcome/target analysis: how many entities hit the target condition "
+            "(e.g. churned, defaulted, readmitted, delayed), outcome rate, and breakdown "
+            "by risk tier. Use when the user asks about outcomes, target rates, or event counts."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "get_entity_trend",
+        "description": (
+            "Get historical signal values over time for one entity. Shows how key metrics "
+            "evolved across records. Use when the user asks about trends, history, or "
+            "changes over time for a specific entity."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string", "description": "Entity ID to get trend for"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Max data points"},
+            },
+            "required": ["entity_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "compare_pipeline_runs",
+        "description": (
+            "Compare the two most recent pipeline runs: entity count changes, risk tier shifts, "
+            "recommendation count deltas, and performance differences. Use when the user asks "
+            "'what changed', 'compare runs', or 'any differences since last time'."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "generate_action_draft",
         "description": "Generate a concise action draft for one entity using its live profile.",
         "input_schema": {
@@ -198,7 +278,78 @@ def _json_ready(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
+def _condense_tool_result(result: Any, max_chars: int = 500) -> Any:
+    """Condense a tool result dict for persistence as turn metadata.
+
+    Keeps the structure but truncates long strings and limits list sizes
+    so the persisted context is compact enough to inject into future prompts.
+    """
+    if isinstance(result, dict):
+        condensed = {}
+        for k, v in result.items():
+            if isinstance(v, str) and len(v) > 200:
+                condensed[k] = v[:200] + "..."
+            elif isinstance(v, list) and len(v) > 5:
+                condensed[k] = v[:5]
+                condensed[f"{k}_total"] = len(v)
+            else:
+                condensed[k] = v
+        raw = json.dumps(condensed, default=str)
+        if len(raw) > max_chars:
+            return json.loads(raw[:max_chars - 1] + "}")
+        return condensed
+    if isinstance(result, str) and len(result) > max_chars:
+        return result[:max_chars]
+    return result
+
+
 async def _overview(db: AsyncSession, org_id: UUID) -> dict:
+    """Get overview with risk breakdown.
+
+    Prefers ML-predicted profiles from entity_profiles (written by the
+    pipeline's risk scoring step) when available. Falls back to live
+    recomputation from the client DB when no profiles exist.
+    """
+    # Try ML-predicted profiles first.
+    profile_count = await db.scalar(
+        sa_select(sa_func.count())
+        .select_from(EntityProfile)
+        .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
+    ) or 0
+
+    if profile_count > 0:
+        # Use persisted ML-predicted risk tiers.
+        profiles = list(
+            (await db.execute(
+                sa_select(EntityProfile)
+                .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
+                .order_by(EntityProfile.risk_score.desc().nullslast())
+            )).scalars().all()
+        )
+        # Map display tiers back to internal tier names for consistency.
+        _tier_map = {"high": "high", "medium": "medium", "low": "low", "healthy": "low"}
+        breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for p in profiles:
+            tier = _tier_map.get((p.risk_tier or "low").lower(), "low")
+            breakdown[tier] += 1
+        top = profiles[:3]
+        active_recs = await RecommendationRepository(db).list_by_org(org_id, status="open")
+        return {
+            "total_entities": len(profiles),
+            "risk_breakdown": breakdown,
+            "active_recommendations": len(active_recs),
+            "top_at_risk": [
+                {
+                    "entity_id": p.entity_id,
+                    "entity_label": p.entity_name,
+                    "risk_score": float(p.risk_score or 0),
+                    "risk_tier": _tier_map.get((p.risk_tier or "low").lower(), "low"),
+                }
+                for p in top
+            ],
+        }
+
+    # Fallback: live recomputation from client DB.
     mapping = await get_schema_mapping(db, org_id)
     entities = await fetch_entities(db, org_id, mapping)
     entities = compute_risk(entities, mapping.signal_columns, mapping.risk_config)
@@ -230,6 +381,62 @@ async def _entities(
     search: str | None = None,
     limit: int = 25,
 ) -> dict:
+    """Get filtered entity summaries.
+
+    Prefers ML-predicted profiles from entity_profiles when available.
+    """
+    # Try ML-predicted profiles first.
+    profile_count = await db.scalar(
+        sa_select(sa_func.count())
+        .select_from(EntityProfile)
+        .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
+    ) or 0
+
+    _tier_map = {"high": "high", "medium": "medium", "low": "low", "healthy": "low"}
+
+    if profile_count > 0:
+        conds = [
+            EntityProfile.org_id == org_id,
+            EntityProfile.is_latest.is_(True),
+        ]
+        if risk_tier:
+            # Map internal tier to display tiers for the DB query.
+            display_tiers = [k for k, v in _tier_map.items() if v == risk_tier]
+            if not display_tiers:
+                display_tiers = [risk_tier]
+            conds.append(EntityProfile.risk_tier.in_([t.title() for t in display_tiers] + display_tiers))
+        if search:
+            like = f"%{search.lower()}%"
+            conds.append(
+                sa_func.lower(EntityProfile.entity_name).like(like)
+                | sa_func.lower(EntityProfile.entity_id).like(like)
+            )
+
+        profiles = list(
+            (await db.execute(
+                sa_select(EntityProfile)
+                .where(*conds)
+                .order_by(EntityProfile.risk_score.desc().nullslast())
+                .limit(limit)
+            )).scalars().all()
+        )
+        total = await db.scalar(
+            sa_select(sa_func.count()).select_from(EntityProfile).where(*conds)
+        ) or 0
+
+        rows = [
+            {
+                "entity_id": p.entity_id,
+                "entity_label": p.entity_name,
+                "risk_score": float(p.risk_score or 0),
+                "risk_tier": _tier_map.get((p.risk_tier or "low").lower(), "low"),
+                "signals": (p.profile_data or {}).get("signal_values", {}),
+            }
+            for p in profiles
+        ]
+        return {"entities": rows, "total": int(total)}
+
+    # Fallback: live recomputation from client DB.
     mapping = await get_schema_mapping(db, org_id)
     entities = await fetch_entities(db, org_id, mapping)
     entities = compute_risk(entities, mapping.signal_columns, mapping.risk_config)
@@ -308,6 +515,261 @@ async def _recommendations(
             for rec in recs[:limit]
         ],
         "total": len(recs),
+    }
+
+
+def _pipeline_run_snapshot(run) -> dict:
+    return {
+        "id": str(run.id),
+        "status": run.status,
+        "current_step": run.current_step,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "entities_scored": run.entities_scored,
+        "critical_count": run.critical_count,
+        "high_count": run.high_count,
+        "recommendations_generated": run.recommendations_generated,
+        "error": run.error,
+    }
+
+
+async def _pipeline_status(db: AsyncSession, org_id: UUID) -> dict:
+    """Structured pipeline run status for tools and synthesis."""
+    from app.infrastructure.database.repositories.pipeline_run_repository import (
+        PipelineRunRepository,
+    )
+
+    repo = PipelineRunRepository(db)
+    try:
+        recent = await repo.list_by_org(org_id, limit=5)
+    except Exception:
+        return {"error": "Could not load pipeline runs", "has_completed_run": False}
+
+    if not recent:
+        return {
+            "has_completed_run": False,
+            "active_run": None,
+            "last_completed_run": None,
+            "message": "No pipeline run has completed yet for this organization.",
+        }
+
+    active = next((r for r in recent if r.status in ("queued", "running")), None)
+    last_done = next((r for r in recent if r.status in ("succeeded", "failed")), None)
+    return {
+        "has_completed_run": last_done is not None and last_done.status == "succeeded",
+        "active_run": _pipeline_run_snapshot(active) if active else None,
+        "last_completed_run": _pipeline_run_snapshot(last_done) if last_done else None,
+    }
+
+
+async def _pipeline_detail(db: AsyncSession, org_id: UUID) -> dict:
+    """Rich pipeline run detail: per-step timing, model metrics, feature importances."""
+    from app.infrastructure.database.repositories.pipeline_run_repository import (
+        PipelineRunRepository,
+    )
+
+    repo = PipelineRunRepository(db)
+    try:
+        recent = await repo.list_by_org(org_id, limit=3)
+    except Exception:
+        return {"error": "Could not load pipeline runs"}
+
+    last_done = next((r for r in recent if r.status in ("succeeded", "failed")), None)
+    if not last_done:
+        return {"error": "No completed pipeline run found for this organization."}
+
+    # Step-level breakdown.
+    steps = []
+    for s in (last_done.step_metrics or []):
+        steps.append({
+            "step": s.get("step"),
+            "success": s.get("success"),
+            "duration_ms": s.get("duration_ms"),
+            "llm_calls": s.get("llm_calls", 0),
+            "tool_calls": s.get("tool_calls", 0),
+            "tokens": s.get("total_tokens", 0),
+            "error": s.get("error"),
+        })
+
+    # Model metrics from the run artifact file.
+    model_metrics = {}
+    feature_importances = []
+    try:
+        from pathlib import Path
+        import json as _json
+        _RUN_LOG_DIR = Path("logs/pipeline_runs")
+        if _RUN_LOG_DIR.exists():
+            # Find the artifact JSON for this run.
+            for artifact_file in sorted(_RUN_LOG_DIR.glob(f"*{last_done.id}*.json"), reverse=True):
+                artifact = _json.loads(artifact_file.read_text(encoding="utf-8"))
+                model_metrics = artifact.get("model_metrics") or {}
+                # Feature importances are usually in risk_summary or model_metrics.
+                risk_summary = artifact.get("risk_summary") or {}
+                feature_importances = risk_summary.get("top_risk_drivers") or []
+                if not feature_importances:
+                    feature_importances = model_metrics.get("feature_importances") or []
+                break
+    except Exception as exc:
+        logger.debug("[pipeline_detail] artifact read failed: %s", exc)
+
+    rag_metrics = last_done.rag_metrics or {}
+
+    return {
+        "run_id": str(last_done.id),
+        "status": last_done.status,
+        "completed_at": last_done.completed_at.isoformat() if last_done.completed_at else None,
+        "duration_ms": last_done.duration_ms,
+        "entities_scored": last_done.entities_scored,
+        "critical_count": last_done.critical_count,
+        "high_count": last_done.high_count,
+        "recommendations_generated": last_done.recommendations_generated,
+        "total_llm_calls": last_done.total_llm_calls,
+        "total_tool_calls": last_done.total_tool_calls,
+        "total_tokens": last_done.total_tokens,
+        "steps": steps,
+        "model_metrics": model_metrics,
+        "feature_importances": feature_importances[:10],
+        "rag_metrics": {
+            "eval": rag_metrics.get("eval"),
+        } if rag_metrics else {},
+    }
+
+
+async def _outcome_analysis(db: AsyncSession, org_id: UUID) -> dict:
+    """Outcome/target analysis from the client DB's target column or entity profiles.
+
+    Works for any domain: churn, fraud, readmission, delivery failure, etc.
+    The target column is configured per-org in the schema mapping.
+    """
+    # Try entity profiles first (ML-predicted).
+    total_profiles = await db.scalar(
+        sa_select(sa_func.count())
+        .select_from(EntityProfile)
+        .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
+    ) or 0
+
+    if total_profiles > 0:
+        # Count by risk tier.
+        _tier_map = {"high": "high", "medium": "medium", "low": "low", "healthy": "low"}
+        profiles = list(
+            (await db.execute(
+                sa_select(EntityProfile.risk_tier, sa_func.count().label("cnt"))
+                .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
+                .group_by(EntityProfile.risk_tier)
+            )).all()
+        )
+        tier_counts = {}
+        for tier_val, cnt in profiles:
+            mapped = _tier_map.get((tier_val or "low").lower(), "low")
+            tier_counts[mapped] = tier_counts.get(mapped, 0) + cnt
+
+        # Also try to get the actual outcome count from client DB.
+        outcome_data = await _query_outcome_from_client_db(db, org_id)
+
+        result = {
+            "total_entities": total_profiles,
+            "risk_tier_breakdown": tier_counts,
+            "high_risk_count": tier_counts.get("high", 0),
+        }
+        if outcome_data:
+            result.update(outcome_data)
+        return result
+
+    # Direct client DB query.
+    outcome_data = await _query_outcome_from_client_db(db, org_id)
+    if outcome_data:
+        return outcome_data
+    return {"error": "No entity profiles or outcome data available. Run a pipeline first."}
+
+
+async def _query_outcome_from_client_db(db: AsyncSession, org_id: UUID) -> dict | None:
+    """Query the target/outcome column from the client DB."""
+    try:
+        mapping = await get_schema_mapping(db, org_id)
+        target_col = getattr(mapping, "target_column", None)
+        if not target_col:
+            return None
+
+        entities = await fetch_entities(db, org_id, mapping)
+        if not entities:
+            return None
+
+        # Count positive-outcome entities.
+        total = len(entities)
+        positive = sum(
+            1 for e in entities
+            if e.get(target_col) in (1, True, "1", "true", "yes", "True", "Yes")
+        )
+        return {
+            "total_entities": total,
+            "positive_outcome_count": positive,
+            "outcome_rate": round(positive / total * 100, 2) if total > 0 else 0,
+            "negative_outcome_count": total - positive,
+            "target_column": target_col,
+        }
+    except Exception as exc:
+        logger.debug("[outcome_analysis] client DB query failed: %s", exc)
+        return None
+
+
+async def _entity_trend(
+    db: AsyncSession, org_id: UUID, entity_id: str, limit: int = 100,
+) -> dict:
+    """Get historical signal trend for one entity."""
+    try:
+        mapping = await get_schema_mapping(db, org_id)
+        points = await fetch_entity_trend(db, org_id, entity_id, mapping, limit=limit)
+        return {
+            "entity_id": entity_id,
+            "data_points": len(points),
+            "trend": points,
+        }
+    except ClientDBError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Could not fetch trend: {exc}"}
+
+
+async def _compare_runs(db: AsyncSession, org_id: UUID) -> dict:
+    """Compare the two most recent completed pipeline runs."""
+    from app.infrastructure.database.repositories.pipeline_run_repository import (
+        PipelineRunRepository,
+    )
+
+    repo = PipelineRunRepository(db)
+    try:
+        recent = await repo.list_by_org(org_id, limit=10)
+    except Exception:
+        return {"error": "Could not load pipeline runs"}
+
+    completed = [r for r in recent if r.status in ("succeeded", "failed")]
+    if len(completed) < 2:
+        return {"error": "Need at least 2 completed runs to compare. Only found " + str(len(completed)) + "."}
+
+    current, previous = completed[0], completed[1]
+
+    def _snap(run):
+        return {
+            "run_id": str(run.id),
+            "status": run.status,
+            "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+            "entities_scored": run.entities_scored,
+            "critical_count": run.critical_count,
+            "high_count": run.high_count,
+            "recommendations_generated": run.recommendations_generated,
+            "duration_ms": run.duration_ms,
+            "total_tokens": run.total_tokens,
+        }
+
+    return {
+        "current_run": _snap(current),
+        "previous_run": _snap(previous),
+        "deltas": {
+            "entities_scored": current.entities_scored - previous.entities_scored,
+            "critical_count": current.critical_count - previous.critical_count,
+            "high_count": current.high_count - previous.high_count,
+            "recommendations_generated": current.recommendations_generated - previous.recommendations_generated,
+            "duration_ms": (current.duration_ms or 0) - (previous.duration_ms or 0),
+        },
     }
 
 
@@ -455,6 +917,20 @@ async def _run_tool(
     try:
         if name == "get_overview":
             return await _overview(db, org_id)
+        if name == "get_pipeline_status":
+            return await _pipeline_status(db, org_id)
+        if name == "get_pipeline_detail":
+            return await _pipeline_detail(db, org_id)
+        if name == "get_outcome_analysis":
+            return await _outcome_analysis(db, org_id)
+        if name == "get_entity_trend":
+            return await _entity_trend(
+                db, org_id,
+                str(tool_input["entity_id"]),
+                limit=int(tool_input.get("limit") or 100),
+            )
+        if name == "compare_pipeline_runs":
+            return await _compare_runs(db, org_id)
         if name == "get_entities":
             return await _entities(
                 db,
@@ -583,77 +1059,202 @@ def _latest_user_message(conversation_messages: list[dict]) -> str:
     return ""
 
 
+def _build_context_window(
+    conversation_messages: list[dict],
+    window_size: int | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Split messages into (overflow, active_window).
+
+    The active window is the most recent `window_size` messages; overflow is
+    everything before that. Only user/assistant text messages count toward
+    the window; tool_result blocks are always kept with their adjacent
+    assistant message.
+
+    Returns (overflow_messages, active_window_messages) where both are
+    sublists of the original conversation_messages.
+    """
+    ws = window_size or settings.CHAT_CONTEXT_WINDOW_MESSAGES
+    if len(conversation_messages) <= ws:
+        return [], conversation_messages
+
+    # Find the split point: we want at least `ws` messages in the active window,
+    # but we don't want to cut in the middle of a tool-use exchange.
+    split = len(conversation_messages) - ws
+    # Walk forward from the split to find a clean user-message boundary.
+    while split > 0 and split < len(conversation_messages):
+        msg = conversation_messages[split]
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            break
+        split += 1
+
+    overflow = conversation_messages[:split]
+    active = conversation_messages[split:]
+    return overflow, active
+
+
+async def _summarize_overflow(overflow_messages: list[dict]) -> str:
+    """Compress overflow messages into a short context summary.
+
+    Uses Groq-fast for speed. Falls back to a simple truncation when
+    Groq is unavailable. Returns a 2-4 sentence summary.
+    """
+    if not overflow_messages:
+        return ""
+
+    # Build a compact transcript of the overflow.
+    lines: list[str] = []
+    for msg in overflow_messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if not role or not content:
+            continue
+        if isinstance(content, str):
+            lines.append(f"{role}: {content[:300]}")
+        elif isinstance(content, list):
+            # tool_result blocks — just note the tool names.
+            tool_names = [
+                c.get("name", "tool") for c in content
+                if isinstance(c, dict) and c.get("type") == "tool_use"
+            ]
+            if tool_names:
+                lines.append(f"{role}: [called tools: {', '.join(tool_names)}]")
+    transcript = "\n".join(lines[-20:])  # cap to prevent huge prompts
+
+    if not transcript.strip():
+        return ""
+
+    # Try Groq-fast summarization.
+    try:
+        from groq import AsyncGroq
+        if settings.is_groq_configured():
+            client = AsyncGroq(api_key=settings.groq_api_key, max_retries=1, timeout=6.0)
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=settings.GROQ_LLM_MODEL_FAST,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Summarize this conversation excerpt in 2-4 sentences, third person. "
+                                "Capture: what the user asked about, which entities/IDs were discussed, "
+                                "what data was surfaced, and any decisions made. Be specific about "
+                                "entity IDs and numbers. No JSON, just plain text."
+                            ),
+                        },
+                        {"role": "user", "content": transcript},
+                    ],
+                    temperature=0.0,
+                    max_tokens=200,
+                ),
+                timeout=6.0,
+            )
+            summary = (response.choices[0].message.content or "").strip()
+            if summary:
+                return summary
+    except Exception as exc:
+        logger.debug("[context_window] Groq summarization failed: %s", exc)
+
+    # Fallback: extract key lines.
+    user_lines = [l for l in lines if l.startswith("user:")]
+    if user_lines:
+        return "Earlier in this conversation, the user asked: " + "; ".join(
+            l.replace("user: ", "") for l in user_lines[-3:]
+        )
+    return ""
+
+
 async def _system_prompt(
     db: AsyncSession,
     current_user: User,
     *,
     recalled_block: str = "",
     handoff_block: str = "",
+    overflow_summary: str = "",
 ) -> str:
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     org_name = org.name if org else "this organization"
     entity_label = org.entity_label if org and org.entity_label else "entities"
     goal_label = org.goal_label if org and org.goal_label else "improve operations"
+    industry = (org.industry if org and org.industry else "") or ""
     context = org.business_context if org and org.business_context else "No business context configured."
 
     pipeline_block = await _pipeline_context_block(db, current_user.org_id)
     memory = await _load_user_memory(db, current_user)
     memory_block = _format_memory_for_prompt(memory)
 
+    # Inject overflow summary if present (context window management).
+    overflow_block = ""
+    if overflow_summary:
+        overflow_block = (
+            "## Conversation history (summarized older messages)\n"
+            f"{overflow_summary}\n"
+            "The messages below are the most recent; use the summary above "
+            "for context on what was discussed earlier.\n\n"
+        )
+
     return render_chat_system_prompt(
         org_name=org_name,
         entity_label=entity_label,
         goal_label=goal_label,
         business_context=context,
+        industry=industry,
         pipeline_block=pipeline_block,
         memory_block=memory_block,
-        handoff_block=handoff_block,
+        handoff_block=handoff_block + overflow_block,
         recalled_block=recalled_block,
+    )
+
+
+async def _org_context(db: AsyncSession, current_user: User) -> tuple[str, str]:
+    """Return (industry, business_context) for grounding checks."""
+    try:
+        org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    except Exception:
+        return "", ""
+    if not org:
+        return "", ""
+    return (
+        (org.industry or "") or "",
+        (org.business_context or "") or "",
     )
 
 
 async def _pipeline_context_block(db: AsyncSession, org_id: UUID) -> str:
     """Compose a short autonomous-pipeline status section for the system prompt."""
-    from app.infrastructure.database.repositories.pipeline_run_repository import (
-        PipelineRunRepository,
-    )
-
-    repo = PipelineRunRepository(db)
     try:
-        recent = await repo.list_by_org(org_id, limit=5)
+        status = await _pipeline_status(db, org_id)
     except Exception:
         return ""
 
-    if not recent:
+    if status.get("message"):
         return (
             "Autonomous pipeline status: no pipeline run has completed yet for "
             "this organization. If asked about the latest analysis, say so and "
             "fall back to live tool calls.\n"
         )
 
-    active = next((r for r in recent if r.status in ("queued", "running")), None)
-    last_done = next((r for r in recent if r.status in ("succeeded", "failed")), None)
-
     lines = ["Autonomous pipeline status:"]
-    if active is not None:
+    active = status.get("active_run")
+    last_done = status.get("last_completed_run")
+    if active:
         lines.append(
-            f"- A pipeline run is currently {active.status} "
-            f"(step '{active.current_step or 'unknown'}', id={active.id})."
+            f"- A pipeline run is currently {active['status']} "
+            f"(step '{active.get('current_step') or 'unknown'}', id={active['id']})."
         )
-    if last_done is not None:
-        ts = last_done.completed_at.isoformat() if last_done.completed_at else "unknown time"
-        if last_done.status == "succeeded":
+    if last_done:
+        ts = last_done.get("completed_at") or "unknown time"
+        if last_done.get("status") == "succeeded":
             lines.append(
                 f"- Last successful run completed at {ts}: "
-                f"{last_done.entities_scored} entities scored "
-                f"({last_done.critical_count} critical, {last_done.high_count} high), "
-                f"{last_done.recommendations_generated} recommendations generated."
+                f"{last_done.get('entities_scored')} entities scored "
+                f"({last_done.get('critical_count')} critical, {last_done.get('high_count')} high), "
+                f"{last_done.get('recommendations_generated')} recommendations generated."
             )
         else:
             lines.append(
-                f"- Last run failed at {ts}: {last_done.error or 'unknown error'}."
+                f"- Last run failed at {ts}: {last_done.get('error') or 'unknown error'}."
             )
-    if active is None and last_done is None:
+    if not active and not last_done:
         lines.append("- No completed runs available.")
 
     lines.append(
@@ -661,6 +1262,114 @@ async def _pipeline_context_block(db: AsyncSession, org_id: UUID) -> str:
         "for live numbers, use the tools to re-query the client database."
     )
     return "\n".join(lines) + "\n"
+
+
+def _uses_local_currency(industry: str, business_context: str) -> bool:
+    combined = f"{industry} {business_context}".lower()
+    return any(k in combined for k in ("bank", "financial", "nigeria", "naira", "union bank"))
+
+
+def _reply_has_forbidden_currency(reply: str, industry: str, business_context: str) -> bool:
+    if "$" not in reply:
+        return False
+    return _uses_local_currency(industry, business_context)
+
+
+def _format_recommendations_fallback(data: dict) -> str:
+    recs = (data or {}).get("recommendations") or []
+    if not recs:
+        return "You're clear on open recommendations right now; nothing queued."
+    parts = [f"You've got {len(recs)} open recommendation{'s' if len(recs) != 1 else ''}."]
+    for rec in recs[:8]:
+        eid = rec.get("entity_id", "?")
+        title = rec.get("title") or "Follow-up needed"
+        action = rec.get("suggested_action") or rec.get("reasoning") or ""
+        snippet = f"{title}. {action}".strip() if action else title
+        parts.append(f"For customer {eid}: {snippet}")
+    if len(recs) > 8:
+        parts.append(f"…and {len(recs) - 8} more. Ask if you want the rest.")
+    parts.append("Tell me which customer to zoom in on, or say the word and I'll prioritize by urgency.")
+    return " ".join(parts)
+
+
+_CHAT_LOG_REPLY_MAX = 4000
+
+
+def _chat_log_content(text: str | None) -> str:
+    """Single-line log field; newlines would break tail -f."""
+    if not text:
+        return "-"
+    return " ".join(text.split())
+
+
+def _log_chat_turn(
+    *,
+    conversation_id: UUID | None,
+    intent: str | None,
+    confidence: float | None,
+    path: str,
+    tools_called: list[str] | None = None,
+    latency_ms: int | None = None,
+    user_message: str | None = None,
+    assistant_reply: str | None = None,
+    extra: str | None = None,
+) -> None:
+    cid = conversation_id or "-"
+    meta = (
+        f"[Chat] conversation_id={cid} intent={intent or '-'} confidence="
+        f"{f'{confidence:.2f}' if confidence is not None else '-'} "
+        f"path={path} tools={','.join(tools_called) if tools_called else '-'} "
+        f"latency_ms={latency_ms if latency_ms is not None else '-'} "
+        f"{extra or ''}"
+    ).strip()
+    user_line = f"{meta} role=user content={_chat_log_content(user_message)}"
+    logger.info(user_line)
+    CHAT_LOGGER.info(user_line)
+    if assistant_reply is not None:
+        body = _chat_log_content(assistant_reply)
+        if len(assistant_reply) > _CHAT_LOG_REPLY_MAX:
+            body = f"{body[:_CHAT_LOG_REPLY_MAX]}... ({len(assistant_reply)} chars total)"
+        assistant_line = f"[Chat] conversation_id={cid} path={path} role=assistant content={body}"
+        logger.info(assistant_line)
+        CHAT_LOGGER.info(assistant_line)
+
+
+async def _guarded_synthesis(
+    db: AsyncSession,
+    current_user: User,
+    conversation_messages: list[dict],
+    retrieved_data: dict,
+    *,
+    base_system_prompt: str,
+    industry: str,
+    business_context: str,
+) -> str:
+    """Synthesis with retries for em dashes, forbidden $, then deterministic fallback."""
+    extra_parts: list[str] = []
+    reply = await synthesis_agent_run(
+        db, current_user, conversation_messages, retrieved_data,
+        base_system_prompt=base_system_prompt,
+    )
+    if reply and reply_contains_em_dash(reply):
+        extra_parts.append(
+            "Do not use em dashes (—) or en dashes (–). Use commas, colons, or periods only."
+        )
+    if reply and _reply_has_forbidden_currency(reply, industry, business_context):
+        extra_parts.append(
+            "Remove all dollar ($) amounts. Use only text from the tool data. "
+            "Use local currency wording only if amounts appear in the data."
+        )
+    if extra_parts:
+        reply = await synthesis_agent_run(
+            db, current_user, conversation_messages, retrieved_data,
+            base_system_prompt=base_system_prompt,
+            extra_instruction=" ".join(extra_parts),
+        )
+    if reply and _reply_has_forbidden_currency(reply, industry, business_context):
+        rec_data = retrieved_data.get("get_recommendations")
+        if rec_data:
+            return sanitize_pulse_reply(_format_recommendations_fallback(rec_data))
+    return sanitize_pulse_reply(reply or "")
 
 
 async def _fallback_reply(
@@ -696,17 +1405,36 @@ async def _fallback_reply(
     )
 
 
+def _is_data_access_question(message: str) -> bool:
+    lower = message.lower()
+    return any(p in lower for p in _DATA_ACCESS_PATTERNS)
+
+
+def _recent_turns_for_prompt(conversation_messages: list[dict], limit: int = 4) -> list[dict]:
+    turns = []
+    for msg in conversation_messages[-limit:]:
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            turns.append({"role": role, "content": content[:400]})
+    return turns
+
+
 async def _conversational_reply(
     db: AsyncSession,
     current_user: User,
     intent_name: str,
     user_message: str,
+    *,
+    conversation_messages: list[dict] | None = None,
 ) -> str:
     """Tool-free reply for greeting / help / off_topic / unknown.
 
     Pulls org context (name, entity_label, goal_label) so the reply is grounded
     in the org's vocabulary instead of generic Pulse boilerplate.
     """
+    if intent_name == "help" and _is_data_access_question(user_message):
+        intent_name = "data_access"
     try:
         org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     except Exception:
@@ -729,12 +1457,13 @@ async def _conversational_reply(
         "entity_label": entity_label,
         "goal_label": goal_label,
         "message": user_message,
+        "recent_turns": _recent_turns_for_prompt(conversation_messages or []),
     }
 
     # Try LLM-crafted reply first (warmer + tone-matched).
     crafted = await _craft_conversational_reply(intent_name, state)
     if crafted:
-        return crafted
+        return sanitize_pulse_reply(crafted)
 
     # Fallback: static templates when Groq is unavailable or returns junk.
     return _conversational_reply_template(intent_name, state)
@@ -749,36 +1478,43 @@ def _conversational_reply_template(intent_name: str, state: dict) -> str:
     singular = entity_label[:-1] if entity_label.endswith("s") else entity_label
 
     if intent_name == "greeting":
-        opener = f"Hi {user_first}!" if user_first else "Hi!"
-        return (
-            f"{opener} I'm Pulse, the operational intelligence agent for {org_name}. "
-            f"Ask me about your {entity_label}, risk tiers, recommendations, or to "
-            f"draft an outreach: anything that helps you {goal_label}."
+        opener = f"Hey {user_first}," if user_first else "Hey,"
+        return sanitize_pulse_reply(
+            f"{opener} I'm Pulse AI, your intelligent copilot for {org_name}. "
+            f"I can help with {entity_label}, risk, and recommendations as you "
+            f"{goal_label}. Try \"what's our status?\" or "
+            f"\"what was my latest pipeline run about?\" to get started."
+        )
+
+    if intent_name == "data_access":
+        return sanitize_pulse_reply(
+            f"I'm Pulse AI, your copilot. I can't run arbitrary SQL or browse your schema, but I can answer "
+            f"real questions about {org_name}'s live {entity_label}: risk, outcomes, trends, "
+            f"recommendations, and more. Try \"what's our status?\" or "
+            f"\"what recommendations can you give me?\""
         )
 
     if intent_name == "help":
-        return (
-            f"Here's what I can do for {org_name}:\n"
-            f"- Quick overview (\"what's our status?\")\n"
-            f"- Pull details for a {singular} (\"tell me about NG-00075\")\n"
-            f"- List {entity_label} by tier (\"show critical {entity_label}\")\n"
-            f"- Active recommendations (\"what should I action today?\")\n"
-            f"- Find similar {entity_label} (\"5 more like NG-00075\")\n"
-            f"- Draft an outreach (\"draft a message for NG-00075\")\n"
-            f"- Explain trends (\"why is NG-00075 critical?\")\n\n"
-            f"What would you like to start with?"
+        return sanitize_pulse_reply(
+            f"I'm Pulse AI, your intelligent copilot for {org_name}. I can give you the big picture "
+            f"on {entity_label}, pull up a specific one by ID, surface what to action today, "
+            f"check the latest pipeline run, dig into model performance, track trends, "
+            f"find lookalikes, or draft outreach. "
+            f"Try \"show critical {entity_label}\" or \"tell me about 628\". "
+            f"What do you want to look at first?"
         )
 
     if intent_name == "off_topic":
-        return (
-            f"That's outside what I can help with. I'm focused on {org_name}'s "
-            f"{entity_label}: try \"what's our status?\" or \"show critical {entity_label}\" to start."
+        return sanitize_pulse_reply(
+            f"That's a bit outside what I cover as Pulse AI. I'm here for {org_name}'s "
+            f"{entity_label} and what to do about them. Try \"what's our status?\" or "
+            f"\"show critical {entity_label}\" and I'll jump in."
         )
 
-    # unknown / clarification
-    return (
-        f"I'm not sure what you're after. Try \"what's our status?\", "
-        f"\"show critical {entity_label}\", or \"what should I action today?\" to get going."
+    return sanitize_pulse_reply(
+        f"I want to make sure I help with the right thing. Do you mean the overall picture, "
+        f"a specific {singular}, or what's on your action list? "
+        f"\"What's our status?\" and \"what should I action today?\" are easy starters."
     )
 
 
@@ -786,13 +1522,65 @@ async def run(
     db: AsyncSession,
     current_user: User,
     conversation_messages: list[dict],
-) -> str:
-    """Process the conversation using Claude tool calls when configured."""
+    *,
+    conversation_id: UUID | None = None,
+) -> ChatResult:
+    """Process the conversation using Claude tool calls when configured.
 
-    if not settings.is_anthropic_configured():
-        return await _fallback_reply(db, current_user, conversation_messages)
+    Returns a ChatResult containing the reply text and any tool context
+    from the turn, so the caller can persist tool context for follow-ups.
+    """
+
+    t0 = time.perf_counter()
+    chat_path = "react"
+    chat_intent: str | None = None
+    chat_confidence: float | None = None
+    chat_tools: list[str] = []
+
+    def _finish(
+        reply: str,
+        path: str,
+        intent: str | None = None,
+        conf: float | None = None,
+        *,
+        effective_query: str | None = None,
+    ) -> str:
+        clean = sanitize_pulse_reply(reply)
+        _log_chat_turn(
+            conversation_id=conversation_id,
+            intent=intent or chat_intent,
+            confidence=conf if conf is not None else chat_confidence,
+            path=path,
+            tools_called=chat_tools or None,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+            user_message=latest_user,
+            assistant_reply=clean,
+            extra=f"effective_query={effective_query}" if effective_query else None,
+        )
+        return ChatResult(
+            reply=clean,
+            tool_context=dict(last_tool_context),
+            tools_called=list(chat_tools),
+        )
 
     latest_user = _latest_user_message(conversation_messages)
+    effective_user = latest_user
+    last_tool_context: dict[str, Any] = {}
+    followup_rewrite = resolve_followup_query(conversation_messages, latest_user)
+    if followup_rewrite:
+        effective_user = followup_rewrite
+        CHAT_LOGGER.info(
+            "[Chat] follow-up rewrite conversation_id=%s from=%r to=%r",
+            conversation_id or "-", latest_user, followup_rewrite,
+        )
+
+    if not settings.is_anthropic_configured():
+        return _finish(
+            await _fallback_reply(db, current_user, conversation_messages),
+            "fallback",
+        )
+
+    industry, business_context = await _org_context(db, current_user)
     recalled = await recall_memories(current_user, latest_user) if latest_user else []
     recalled_block = format_recalled_for_prompt(recalled)
 
@@ -809,30 +1597,70 @@ async def run(
         )
         handoff_block = format_handoff_for_prompt(handoffs)
 
+    # Context window management: prevent LLM context overflow on long conversations.
+    overflow_msgs, windowed_messages = _build_context_window(conversation_messages)
+    overflow_summary = ""
+    if overflow_msgs and len(overflow_msgs) >= settings.CHAT_CONTEXT_SUMMARY_OVERFLOW:
+        overflow_summary = await _summarize_overflow(overflow_msgs)
+        logger.info(
+            "[agent_service] context window: %d total, %d overflow → %d active, summary=%d chars",
+            len(conversation_messages), len(overflow_msgs),
+            len(windowed_messages), len(overflow_summary),
+        )
+    elif overflow_msgs:
+        # Small overflow: just note it was truncated.
+        overflow_summary = (
+            f"(Earlier {len(overflow_msgs)} messages were exchanged but are not shown. "
+            "The conversation continues below.)"
+        )
+
     # Semantic intent detection: fast-path high-confidence simple intents past
     # the full ReAct loop; otherwise prefilter the tool list for the ReAct loop.
     tools_for_run = TOOLS
     if settings.CHAT_INTENT_DETECTION_ENABLED and latest_user:
-        recent_for_intent = [
-            {"role": m["role"], "content": m["content"]}
-            for m in conversation_messages[-6:]
-            if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)
-        ]
-        intent = await classify_intent(latest_user, convo_history=recent_for_intent)
+        recent_for_intent = []
+        for m in conversation_messages[-6:]:
+            if m.get("role") not in {"user", "assistant"} or not isinstance(m.get("content"), str):
+                continue
+            entry = {"role": m["role"], "content": m["content"]}
+            # Inject tool hints so the classifier knows what data context is active.
+            if m.get("role") == "assistant" and m.get("tools_called"):
+                tools_hint = ", ".join(m["tools_called"])
+                entry["content"] += f" [tools used: {tools_hint}]"
+            recent_for_intent.append(entry)
+        intent = await classify_intent(effective_user, convo_history=recent_for_intent)
+        if intent:
+            intent = apply_pipeline_intent_override(intent, effective_user)
+            chat_intent = intent.intent
+            chat_confidence = intent.confidence
 
         # Conversational intents — greeting / help / off_topic / (low-confidence) unknown.
         # Skip ReAct and tool calls entirely; return a context-aware reply.
-        if intent and intent.intent in CONVERSATIONAL_INTENTS and intent.confidence >= 0.5:
+        if (
+            not followup_rewrite
+            and intent
+            and intent.intent in CONVERSATIONAL_INTENTS
+            and intent.confidence >= 0.5
+        ):
             logger.info(
                 "[agent_service] conversational intent=%s confidence=%.2f",
                 intent.intent, intent.confidence,
             )
-            return await _conversational_reply(db, current_user, intent.intent, latest_user)
+            reply = await _conversational_reply(
+                db, current_user, intent.intent, latest_user,
+                conversation_messages=conversation_messages,
+            )
+            return _finish(
+                reply, "conversational", intent.intent, intent.confidence,
+                effective_query=followup_rewrite,
+            )
 
         if intent and intent.confidence >= settings.CHAT_INTENT_FASTPATH_CONFIDENCE:
-            fp = build_fastpath_args(intent)
+            fp = build_fastpath_args(intent, effective_user)
             if fp is not None:
                 tool_name, tool_args = fp
+                chat_tools = [tool_name]
+                chat_path = "fastpath"
                 logger.info(
                     "[agent_service] intent fast-path: intent=%s confidence=%.2f tool=%s",
                     intent.intent, intent.confidence, tool_name,
@@ -841,21 +1669,30 @@ async def run(
                     tool_result = await _run_tool(
                         tool_name, tool_args, db, current_user.org_id,
                     )
+                    last_tool_context[tool_name] = _condense_tool_result(
+                        _json_ready(tool_result)
+                    )
                     base_system = await _system_prompt(
                         db, current_user,
                         recalled_block=recalled_block, handoff_block=handoff_block,
+                        overflow_summary=overflow_summary,
                     )
-                    synthesis_reply = await synthesis_agent_run(
-                        db, current_user, conversation_messages,
+                    synthesis_reply = await _guarded_synthesis(
+                        db, current_user, windowed_messages,
                         {tool_name: _json_ready(tool_result)},
                         base_system_prompt=base_system,
+                        industry=industry,
+                        business_context=business_context,
                     )
                     if synthesis_reply:
                         try:
                             await reflect_and_commit(current_user, latest_user, synthesis_reply)
                         except Exception as exc:
                             logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
-                        return synthesis_reply
+                        return _finish(
+                            synthesis_reply, "fastpath", intent.intent, intent.confidence,
+                            effective_query=followup_rewrite,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "[agent_service] fast-path failed, falling back to ReAct: %s", exc,
@@ -869,12 +1706,14 @@ async def run(
 
     # Optional Query+Synthesis split (hierarchical pattern from Agentic Architectures e-book).
     if settings.CONV_AGENT_SPLIT_ENABLED:
+        chat_path = "split"
         base_system = await _system_prompt(
             db, current_user, recalled_block=recalled_block, handoff_block=handoff_block,
+            overflow_summary=overflow_summary,
         )
         try:
             reply_text = await run_split(
-                db, current_user, conversation_messages,
+                db, current_user, windowed_messages,
                 base_system_prompt=base_system,
                 run_tool=_run_tool, full_tools=tools_for_run, json_ready=_json_ready,
             )
@@ -887,22 +1726,23 @@ async def run(
                     await reflect_and_commit(current_user, latest_user, reply_text)
                 except Exception as exc:
                     logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
-            return reply_text
+            return _finish(reply_text, "split", chat_intent, chat_confidence)
         # If split returned empty, fall through to single-agent path below.
 
     reply_text: str = ""
+    chat_path = "react"
     try:
         client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
         messages = [
             {"role": msg["role"], "content": msg["content"]}
-            for msg in conversation_messages
+            for msg in windowed_messages
             if msg.get("role") in {"user", "assistant"} and msg.get("content")
         ]
 
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
-            system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block),
+            system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary),
             tools=tools_for_run,
             messages=messages,
         )
@@ -924,11 +1764,15 @@ async def run(
             )
             tool_results = []
             for tool_use in tool_uses:
+                chat_tools.append(tool_use.name)
                 result = await _run_tool(
                     tool_use.name,
                     dict(tool_use.input or {}),
                     db,
                     current_user.org_id,
+                )
+                last_tool_context[tool_use.name] = _condense_tool_result(
+                    _json_ready(result)
                 )
                 tool_results.append(
                     {
@@ -941,14 +1785,27 @@ async def run(
             response = await client.messages.create(
                 model=settings.ANTHROPIC_LLM_MODEL,
                 max_tokens=900,
-                system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block),
+                system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary),
                 tools=tools_for_run,
                 messages=messages,
             )
         else:
             reply_text = "I could not complete the tool workflow in time. Try narrowing the question."
-    except Exception:
-        reply_text = await _fallback_reply(db, current_user, conversation_messages)
+    except Exception as exc:
+        chat_path = "fallback"
+        CHAT_LOGGER.exception(
+            "[Chat] run failed conversation_id=%s user=%r: %s",
+            conversation_id or "-", latest_user, exc,
+        )
+        logger.exception("[agent_service] run failed: %s", exc)
+        try:
+            reply_text = await _fallback_reply(db, current_user, conversation_messages)
+        except Exception as fb_exc:
+            CHAT_LOGGER.exception("[Chat] fallback also failed: %s", fb_exc)
+            reply_text = (
+                "I hit an error loading live data for that question. "
+                "Try \"what's our status?\" or \"show critical customers\" again."
+            )
 
     # Memory commit is best-effort; never let it block or fail the reply.
     if latest_user and reply_text:
@@ -957,7 +1814,10 @@ async def run(
         except Exception as exc:
             logger.debug("[agent_service] reflect_and_commit failed: %s", exc)
 
-    return reply_text
+    return _finish(
+        reply_text, chat_path, chat_intent, chat_confidence,
+        effective_query=followup_rewrite,
+    )
 
 
 async def run_stream(
@@ -987,13 +1847,24 @@ async def run_stream(
         )
         handoff_block = format_handoff_for_prompt(handoffs)
 
+    # Context window management (same as run()).
+    overflow_msgs, windowed_messages = _build_context_window(conversation_messages)
+    overflow_summary = ""
+    if overflow_msgs and len(overflow_msgs) >= settings.CHAT_CONTEXT_SUMMARY_OVERFLOW:
+        overflow_summary = await _summarize_overflow(overflow_msgs)
+    elif overflow_msgs:
+        overflow_summary = (
+            f"(Earlier {len(overflow_msgs)} messages were exchanged but are not shown. "
+            "The conversation continues below.)"
+        )
+
     client = AsyncAnthropic(api_key=settings.get_anthropic_api_key())
     messages = [
         {"role": msg["role"], "content": msg["content"]}
-        for msg in conversation_messages
+        for msg in windowed_messages
         if msg.get("role") in {"user", "assistant"} and msg.get("content")
     ]
-    system_prompt = await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block)
+    system_prompt = await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary)
 
     accumulated: list[str] = []
     try:

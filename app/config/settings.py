@@ -249,6 +249,10 @@ class Settings:
     # Conversational agent split (Query Agent + Synthesis Agent)
     CONV_AGENT_SPLIT_ENABLED: bool = os.getenv("CONV_AGENT_SPLIT_ENABLED", "false").lower() == "true"
 
+    # Chat context window
+    CHAT_CONTEXT_WINDOW_MESSAGES: int = int(os.getenv("CHAT_CONTEXT_WINDOW_MESSAGES", "20"))
+    CHAT_CONTEXT_SUMMARY_OVERFLOW: int = int(os.getenv("CHAT_CONTEXT_SUMMARY_OVERFLOW", "6"))
+
     # Semantic intent detection (fast classifier ahead of ReAct loop)
     CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"
     CHAT_INTENT_FASTPATH_CONFIDENCE: float = float(os.getenv("CHAT_INTENT_FASTPATH_CONFIDENCE", "0.85"))

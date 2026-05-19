@@ -84,6 +84,19 @@ def configure_logging(level: str | None = None, fmt: str | None = None) -> None:
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
 
+    chat_log_file = os.getenv("CHAT_LOG_FILE", "logs/chat.log")
+    if chat_log_file and chat_log_file.lower() != "none":
+        chat_path = Path(chat_log_file)
+        chat_path.parent.mkdir(parents=True, exist_ok=True)
+        chat_handler = logging.FileHandler(str(chat_path), encoding="utf-8")
+        chat_handler.setFormatter(formatter)
+        chat_logger = logging.getLogger("pulse.chat")
+        chat_logger.setLevel(chosen_level)
+        for existing in list(chat_logger.handlers):
+            chat_logger.removeHandler(existing)
+        chat_logger.addHandler(chat_handler)
+        chat_logger.propagate = True
+
     for noisy in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(noisy)
         for existing in list(lg.handlers):
