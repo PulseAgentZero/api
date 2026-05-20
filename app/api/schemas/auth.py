@@ -47,6 +47,36 @@ class TokenResponse(BaseModel):
     org: dict | None = None
 
 
+class MfaRequiredResponse(BaseModel):
+    status: str = "mfa_required"
+    mfa_token: str
+    user: dict
+
+
+class TotpSetupResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+
+
+class TotpEnableRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=16)
+
+
+class TotpDisableRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=32)
+    password: str | None = None
+
+
+class MfaVerifyRequest(BaseModel):
+    mfa_token: str
+    code: str = Field(min_length=6, max_length=32)
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str | None = None
+    totp_code: str | None = None
+
+
 class UserOut(BaseModel):
     id: UUID
     email: str
@@ -58,6 +88,8 @@ class UserOut(BaseModel):
     created_at: str
     org_id: UUID | None = None
     profile_image_url: str | None = None
+    totp_enabled: bool = False
+    is_org_owner: bool = False
 
 
 class OrgOut(BaseModel):
@@ -70,6 +102,7 @@ class OrgOut(BaseModel):
     created_at: str | None = None
     logo_url: str | None = None
     tour_guide: dict[str, Any] = Field(default_factory=dict)
+    require_2fa: bool = False
 
 
 class MeResponse(BaseModel):
@@ -90,3 +123,10 @@ class GoogleCompleteSignupRequest(BaseModel):
     pending_token: str
     org_name: str = Field(min_length=1)
     full_name: str = ""
+
+
+class InvitePreviewResponse(BaseModel):
+    email: str
+    org_name: str
+    role: str
+    expires_at: str

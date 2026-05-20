@@ -28,6 +28,15 @@ class Organization(Base, UUIDMixin, TimestampMixin):
     entity_label: Mapped[str | None] = mapped_column(String(100))
     goal_label: Mapped[str | None] = mapped_column(String(255))
     onboarding_done: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    require_2fa: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    welcome_email_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     slug: Mapped[str | None] = mapped_column(Text, unique=True)
     plan: Mapped[str] = mapped_column(Text, default="free", server_default="free")

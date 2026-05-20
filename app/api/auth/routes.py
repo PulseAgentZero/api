@@ -18,11 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.jwt_utils import (
     create_access_token,
-    create_refresh_token,
     decode_access_token,
     parse_uuid_loose,
     parse_uuid_sub,
 )
+from app.api.auth.mfa_flow import _org_dict, _user_dict, resolve_post_auth
+from app.api.auth.org_helpers import is_org_owner
+from app.api.auth.token_utils import issue_tokens
 from app.api.auth.passwords import hash_password, verify_password
 from app.api.errors import bad_request, conflict, not_found, rate_limited, unauthorized
 from app.api.schemas.auth import (
@@ -31,6 +33,7 @@ from app.api.schemas.auth import (
     GoogleCompleteSignupRequest,
     GoogleLinkCancelRequest,
     GoogleLinkRequest,
+    InvitePreviewResponse,
     LoginRequest,
     LogoutRequest,
     MeResponse,
@@ -41,6 +44,7 @@ from app.api.schemas.auth import (
     TokenResponse,
     UserOut,
 )
+from app.api.schemas.auth import MfaRequiredResponse
 from app.config.settings import settings
 from app.infrastructure.database.models.invitation import Invitation
 from app.infrastructure.database.models.user import User
@@ -78,45 +82,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 async def _issue_tokens(user: User, org_id: UUID) -> tuple[str, str]:
-    """Mint access + refresh tokens.
-
-    When Redis is available, refresh tokens are opaque server-side values
-    (one-time rotation on /auth/refresh). When Redis is unavailable, refresh
-    tokens are signed JWTs (stateless, reusable until expiry) — see CLAUDE.md.
-    """
-    access = create_access_token(user.id, org_id, user.role, user.email)
-    r = await get_redis()
-    if r is not None:
-        refresh = await redis_tokens.set_refresh_token(user.id, org_id, user.role)
-    else:
-        refresh = create_refresh_token(user.id)
-    return access, refresh
-
-
-def _user_dict(u: User) -> dict:
-    return {
-        "id": str(u.id),
-        "email": u.email,
-        "full_name": u.full_name,
-        "role": u.role,
-        "is_verified": u.is_verified,
-        "is_active": u.is_active,
-        "org_id": str(u.org_id),
-        "profile_image_url": u.profile_image_url,
-    }
-
-
-def _org_dict(o) -> dict:
-    return {
-        "id": str(o.id),
-        "name": o.name,
-        "slug": o.slug,
-        "industry": o.industry,
-        "plan": o.plan,
-        "onboarding_done": o.onboarding_done,
-        "logo_url": o.logo_url,
-        "tour_guide": getattr(o, "tour_guide", None) or {},
-    }
+    return await issue_tokens(user, org_id)
 
 
 @router.get("/instance")
@@ -151,6 +117,7 @@ async def signup(
         raise conflict("EMAIL_TAKEN", "Email already registered")
 
     org = await OrganizationRepository(db).create(body.org_name)
+    org.owner_user_id = None  # set after user flush
     user = await UserRepository(db).create(
         org_id=org.id,
         email=body.email,
@@ -159,6 +126,7 @@ async def signup(
     )
     user.full_name = body.full_name or ""
     user.is_verified = False
+    org.owner_user_id = user.id
     ip, ua = request_audit_context(request)
     await log_audit(
         db,
@@ -201,7 +169,7 @@ async def signup(
     )
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse | MfaRequiredResponse)
 async def login(
     body: LoginRequest,
     request: Request,
@@ -239,14 +207,7 @@ async def login(
     )
     await db.commit()
 
-    access, refresh = await _issue_tokens(user, user.org_id)
-    org = await OrganizationRepository(db).get_by_id(user.org_id)
-    return TokenResponse(
-        access_token=access,
-        refresh_token=refresh,
-        user=_user_dict(user),
-        org=_org_dict(org) if org else None,
-    )
+    return await resolve_post_auth(db, user, issue_tokens=_issue_tokens)
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -506,14 +467,102 @@ async def _oauth_login_redirect(
     user.last_login_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(user)
-    access_jwt, refresh_jwt = await _issue_tokens(user, user.org_id)
+    return await _oauth_post_auth_redirect(user, dest, db)
+
+
+async def _get_valid_invitation(db: AsyncSession, token: str) -> Invitation | None:
+    if not (token or "").strip():
+        return None
+    result = await db.execute(select(Invitation).where(Invitation.token == token.strip()))
+    inv = result.scalar_one_or_none()
+    if not inv or inv.accepted_at is not None:
+        return None
+    if inv.expires_at < datetime.now(timezone.utc):
+        return None
+    return inv
+
+
+async def _oauth_post_auth_redirect(user: User, dest: str, db: AsyncSession) -> RedirectResponse:
+    try:
+        result = await resolve_post_auth(db, user, issue_tokens=_issue_tokens)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        setup_tok = detail.get("setup_token") or (detail.get("fields") or {}).get("setup_token")
+        if detail.get("code") == "TWO_FACTOR_SETUP_REQUIRED" and setup_tok:
+            return _oauth_redirect(
+                dest,
+                oauth_action="setup_2fa",
+                setup_token=str(setup_tok),
+            )
+        raise
+    if isinstance(result, MfaRequiredResponse):
+        return _oauth_redirect(
+            dest,
+            oauth_action="mfa_required",
+            mfa_token=result.mfa_token,
+        )
     return _oauth_redirect(
         dest,
-        access_token=access_jwt,
-        refresh_token=refresh_jwt,
+        access_token=result.access_token,
+        refresh_token=result.refresh_token,
         token_type="bearer",
         oauth_action="login",
     )
+
+
+async def _oauth_accept_invite_redirect(
+    *,
+    db: AsyncSession,
+    dest: str,
+    inv: Invitation,
+    email: str,
+    sub: str,
+    name: str,
+    picture: str | None,
+) -> RedirectResponse:
+    invite_qs = {"invite_token": inv.token}
+    if email != (inv.email or "").strip().lower():
+        return _oauth_redirect(
+            dest,
+            error="invite_email_mismatch",
+            code="INVITE_EMAIL_MISMATCH",
+            **invite_qs,
+        )
+
+    existing = await UserRepository(db).get_by_email(inv.email)
+    if existing:
+        return _oauth_redirect(
+            dest,
+            error="account_exists",
+            code="ALREADY_IN_ORG",
+            **invite_qs,
+        )
+
+    user = await UserRepository(db).create(
+        org_id=inv.org_id,
+        email=inv.email,
+        password_hash=None,
+        role=inv.role,
+    )
+    user.full_name = name or user.full_name
+    user.profile_image_url = picture or user.profile_image_url
+    user.auth_provider = "google"
+    user.auth_provider_id = sub or None
+    user.is_verified = True
+    user.last_login_at = datetime.now(timezone.utc)
+    inv.accepted_at = datetime.now(timezone.utc)
+    await log_audit(
+        db,
+        org_id=inv.org_id,
+        user_id=user.id,
+        action="user.invite_accepted",
+        resource="invitation",
+        resource_id=inv.id,
+        metadata={"email": user.email, "role": user.role, "auth_provider": "google"},
+    )
+    await db.commit()
+    await db.refresh(user)
+    return await _oauth_post_auth_redirect(user, dest, db)
 
 
 async def _load_pending_json(r, key: str) -> dict | None:
@@ -528,11 +577,39 @@ async def _load_pending_json(r, key: str) -> dict | None:
         return None
 
 
+@router.get("/invite/preview", response_model=InvitePreviewResponse)
+async def invite_preview(
+    request: Request,
+    token: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+) -> InvitePreviewResponse:
+    """Public preview of a pending invitation (email, org name, role)."""
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "invite_preview", limit=30,
+        message="Too many requests. Try again shortly.",
+    )
+    inv = await _get_valid_invitation(db, token)
+    if not inv:
+        raise not_found("Invitation not found or expired")
+    org = await OrganizationRepository(db).get_by_id(inv.org_id)
+    if not org:
+        raise not_found("Organization not found")
+    return InvitePreviewResponse(
+        email=inv.email,
+        org_name=org.name,
+        role=inv.role,
+        expires_at=inv.expires_at.isoformat(),
+    )
+
+
 @router.get("/oauth/google")
 async def oauth_google_start(
     request: Request,
     redirect_uri: str | None = Query(None),
     intent: str = Query("login"),
+    invite_token: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
 ) -> RedirectResponse:
     r = await get_redis()
     await enforce_auth_ip_limit(
@@ -555,10 +632,21 @@ async def oauth_google_start(
             status_code=400,
             detail={"code": "INVALID_REDIRECT", "message": "redirect_uri origin is not allowed"},
         )
-    oauth_intent = intent if intent in ("login", "signup") else "login"
+    oauth_intent = intent
+    invite_token_clean = (invite_token or "").strip()
+    if oauth_intent == "invite":
+        if not invite_token_clean:
+            raise bad_request("BAD_REQUEST", "invite_token is required for invite sign-in")
+        inv = await _get_valid_invitation(db, invite_token_clean)
+        if not inv:
+            raise bad_request("INVALID_TOKEN", "Invalid or expired invitation")
+    elif oauth_intent not in ("login", "signup"):
+        oauth_intent = "login"
     state = secrets.token_urlsafe(32)
-    payload = json.dumps({"dest": dest, "intent": oauth_intent})
-    await r.set(redis_keys.oauth_google_state(state), payload, ex=_OAUTH_PENDING_TTL)
+    state_payload: dict = {"dest": dest, "intent": oauth_intent}
+    if oauth_intent == "invite":
+        state_payload["invite_token"] = invite_token_clean
+    await r.set(redis_keys.oauth_google_state(state), json.dumps(state_payload), ex=_OAUTH_PENDING_TTL)
     cid = settings.get_google_client_id()
     redir = settings.GOOGLE_REDIRECT_URI
     params = urllib.parse.urlencode(
@@ -594,12 +682,13 @@ async def oauth_google_callback(
     state_data = _parse_oauth_state(raw_state)
     dest = state_data.get("dest") or fallback_dest
     intent = state_data.get("intent") or "login"
+    invite_token = (state_data.get("invite_token") or "").strip()
 
     try:
         info = await _fetch_google_profile(code)
     except ValueError as exc:
-        code_str = str(exc)
-        return _oauth_redirect(dest, error="oauth_failed", code=code_str)
+        logger.warning("Google OAuth profile fetch failed: %s", exc)
+        return _oauth_redirect(dest, error="oauth_failed", code="OAUTH_FAILED")
 
     email = (info.get("email") or "").strip().lower()
     if not email:
@@ -612,6 +701,28 @@ async def oauth_google_callback(
     user = await repo.get_by_email(email)
     if user is None and sub:
         user = await repo.get_by_auth_provider_id("google", sub)
+
+    if intent == "invite":
+        extra = {"invite_token": invite_token} if invite_token else {}
+        if user is not None:
+            return _oauth_redirect(
+                dest,
+                error="account_exists",
+                code="ALREADY_IN_ORG",
+                **extra,
+            )
+        inv = await _get_valid_invitation(db, invite_token)
+        if not inv:
+            return _oauth_redirect(dest, error="invite_invalid", code="INVALID_TOKEN", **extra)
+        return await _oauth_accept_invite_redirect(
+            db=db,
+            dest=dest,
+            inv=inv,
+            email=email,
+            sub=sub,
+            name=name,
+            picture=picture,
+        )
 
     if user is not None:
         if not user.is_active:
@@ -711,14 +822,7 @@ async def oauth_google_link(
     await r.delete(key)
     await db.commit()
     await db.refresh(user)
-    org = await OrganizationRepository(db).get_by_id(user.org_id)
-    access, refresh = await _issue_tokens(user, user.org_id)
-    return TokenResponse(
-        access_token=access,
-        refresh_token=refresh,
-        user=_user_dict(user),
-        org=_org_dict(org) if org else None,
-    )
+    return await resolve_post_auth(db, user, issue_tokens=_issue_tokens)
 
 
 @router.post("/oauth/google/link/cancel", status_code=204)
@@ -761,6 +865,7 @@ async def oauth_google_complete_signup(
         password_hash=None,
         role="admin",
     )
+    org.owner_user_id = user.id
     user.full_name = name
     user.profile_image_url = picture
     user.auth_provider = "google"
@@ -789,21 +894,15 @@ async def oauth_google_complete_signup(
     await db.commit()
     await db.refresh(user)
     await db.refresh(org)
-    access, refresh = await _issue_tokens(user, org.id)
-    return TokenResponse(
-        access_token=access,
-        refresh_token=refresh,
-        user=_user_dict(user),
-        org=_org_dict(org),
-    )
+    return await resolve_post_auth(db, user, issue_tokens=_issue_tokens)
 
 
-@router.post("/accept-invite", response_model=TokenResponse)
+@router.post("/accept-invite", response_model=TokenResponse | MfaRequiredResponse)
 async def accept_invite(
     body: AcceptInviteRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
-) -> TokenResponse:
+) -> TokenResponse | MfaRequiredResponse:
     """Create user on ``Invitation.org_id`` with the role stored on the invitation row."""
     r = await get_redis()
     await enforce_auth_ip_limit(
@@ -839,14 +938,7 @@ async def accept_invite(
     )
     await db.commit()
     await db.refresh(user)
-    org = await OrganizationRepository(db).get_by_id(inv.org_id)
-    access, refresh = await _issue_tokens(user, inv.org_id)
-    return TokenResponse(
-        access_token=access,
-        refresh_token=refresh,
-        user=_user_dict(user),
-        org=_org_dict(org) if org else None,
-    )
+    return await resolve_post_auth(db, user, issue_tokens=_issue_tokens)
 
 
 @router.get("/me", response_model=MeResponse)
@@ -857,6 +949,9 @@ async def me(
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     if not org:
         raise not_found("Organization not found")
+    from app.services.totp_service import user_totp_enabled
+
+    owner_flag = is_org_owner(current_user, org)
     return MeResponse(
         user=UserOut(
             id=current_user.id,
@@ -869,6 +964,8 @@ async def me(
             created_at=current_user.created_at.isoformat(),
             org_id=current_user.org_id,
             profile_image_url=current_user.profile_image_url,
+            totp_enabled=user_totp_enabled(current_user),
+            is_org_owner=owner_flag,
         ),
         org=OrgOut(
             id=org.id,
@@ -880,5 +977,11 @@ async def me(
             created_at=org.created_at.isoformat(),
             logo_url=org.logo_url,
             tour_guide=getattr(org, "tour_guide", None) or {},
+            require_2fa=bool(getattr(org, "require_2fa", False)),
         ),
     )
+
+
+from app.api.auth.totp_routes import router as _totp_router
+
+router.include_router(_totp_router)

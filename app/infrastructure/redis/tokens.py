@@ -95,3 +95,17 @@ async def delete_pw_reset_token(token: str) -> None:
     if r is None:
         return
     await r.delete(keys.pw_reset(token))
+
+
+async def revoke_all_refresh_tokens_for_user(user_id: UUID) -> None:
+    """Invalidate all refresh token sessions for a user."""
+    r = await get_redis()
+    if r is None:
+        return
+    pattern = f"user_sessions:{user_id}:*"
+    async for session_key in r.scan_iter(match=pattern, count=100):
+        refresh_key_raw = await r.get(session_key)
+        if refresh_key_raw:
+            rk = refresh_key_raw.decode() if isinstance(refresh_key_raw, bytes) else str(refresh_key_raw)
+            await r.delete(rk)
+        await r.delete(session_key)

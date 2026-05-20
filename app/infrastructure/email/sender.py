@@ -234,6 +234,23 @@ async def send_subscription_renewal_reminder_email(to: str, org_name: str, renew
     await _send(to=to, subject="Reminder: Your Entivia Pro subscription renews tomorrow", html=html)
 
 
+async def send_org_delete_confirm_email(
+    to: str,
+    *,
+    code: str,
+    org_name: str,
+    full_name: str = "",
+) -> None:
+    html = _render(
+        "org_delete_confirm.html",
+        subject=f"Confirm deletion of {org_name}",
+        code=code,
+        org_name=org_name,
+        full_name=full_name,
+    )
+    await _send(to=to, subject=f"Confirm deletion of {org_name}", html=html)
+
+
 async def send_license_key_email(to: str, license_key: str, expires_at: str | None = None) -> None:
     activate_docs_url = f"{settings.FRONTEND_URL.rstrip('/')}/docs/license-activation"
     html = _render(

@@ -105,8 +105,9 @@ async def complete_org_setup(
         metadata={"generated_recommendations": generated},
     )
     await db.commit()
+    await db.refresh(org)
 
-    if completed_by is not None:
+    if completed_by is not None and org.welcome_email_sent_at is None:
         try:
             user = await UserRepository(db).get_by_id(completed_by)
             if user and user.email:
@@ -116,8 +117,11 @@ async def complete_org_setup(
                     full_name=user.full_name or "",
                     org_name=org.name,
                 )
+                org.welcome_email_sent_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.info("Welcome email queued for org %s to %s", org_id, user.email)
         except Exception:
-            logger.exception("Welcome email skipped after onboarding for org %s", org_id)
+            logger.exception("Welcome email failed after onboarding for org %s", org_id)
 
     if active_conn is not None and active_map is not None:
         from app.services.schedulers.pipeline_scheduler import trigger_pipeline_now

@@ -24,6 +24,7 @@ async def dispatch_email_job(data: dict[str, Any]) -> None:
         send_subscription_renewal_reminder_email,
         send_subscription_success_email,
         send_verification_email,
+        send_org_delete_confirm_email,
         send_welcome_email,
     )
 
@@ -55,6 +56,13 @@ async def dispatch_email_job(data: dict[str, Any]) -> None:
         elif email_type == "subscription_renewal_reminder":
             await send_subscription_renewal_reminder_email(
                 to, data["org_name"], data["renewal_date"]
+            )
+        elif email_type == "org_delete_confirm":
+            await send_org_delete_confirm_email(
+                to,
+                code=data["code"],
+                org_name=data["org_name"],
+                full_name=data.get("full_name", ""),
             )
         elif email_type == "license_key":
             await send_license_key_email(

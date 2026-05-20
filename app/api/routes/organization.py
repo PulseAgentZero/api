@@ -6,14 +6,19 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
-from app.api.auth.role_deps import require_role
+from app.api.auth.org_helpers import is_org_owner
+from app.api.auth.role_deps import require_org_owner, require_org_security_manager, require_role
 from app.api.dependencies.plan_gate import get_usage_summary
 from app.api.errors import bad_request, not_found
+from app.api.safe_errors import log_and_bad_request, public_message
 from app.api.schemas.organization import (
     AssetUploadResponse,
     CompleteSetupResponse,
+    DeleteOrgConfirmRequest,
     MemberSettingsRequest,
     OrgProfileResponse,
+    OrgSecurityRequest,
+    OrgSecurityResponse,
     UpdateOrgRequest,
 )
 from app.infrastructure.database.models.user import User
@@ -40,7 +45,8 @@ def _merge_tour_guide(existing: dict[str, Any] | None, patch: dict[str, Any] | N
     return base
 
 
-def _to_out(org) -> OrgProfileResponse:
+def _to_out(org, *, current_user: User | None = None) -> OrgProfileResponse:
+    owner_flag = is_org_owner(current_user, org) if current_user else False
     return OrgProfileResponse(
         id=org.id,
         name=org.name,
@@ -54,6 +60,8 @@ def _to_out(org) -> OrgProfileResponse:
         logo_url=org.logo_url,
         tour_guide=getattr(org, "tour_guide", None) or {},
         onboarding_done=org.onboarding_done,
+        require_2fa=bool(getattr(org, "require_2fa", False)),
+        is_org_owner=owner_flag,
         created_at=org.created_at,
         updated_at=org.updated_at,
     )
@@ -67,7 +75,7 @@ async def get_organization(
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     if not org:
         raise not_found("Organization not found")
-    return _to_out(org)
+    return _to_out(org, current_user=current_user)
 
 
 @router.put("", response_model=OrgProfileResponse)
@@ -86,7 +94,7 @@ async def update_organization(
         setattr(org, key, value)
     await db.commit()
     await db.refresh(org)
-    return _to_out(org)
+    return _to_out(org, current_user=current_user)
 
 
 @router.patch("/member-settings", response_model=OrgProfileResponse)
@@ -124,7 +132,60 @@ async def patch_member_settings(
         except Exception:
             logger.exception("Auto complete-setup failed for org %s", current_user.org_id)
 
-    return _to_out(org)
+    return _to_out(org, current_user=current_user)
+
+
+@router.patch("/security", response_model=OrgSecurityResponse)
+async def patch_org_security(
+    body: OrgSecurityRequest,
+    current_user: User = Depends(require_org_security_manager()),
+    db: AsyncSession = Depends(get_db),
+) -> OrgSecurityResponse:
+    org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    if not org:
+        raise not_found("Organization not found")
+    org.require_2fa = body.require_2fa
+    await db.commit()
+    return OrgSecurityResponse(require_2fa=org.require_2fa)
+
+
+@router.post("/delete/request-code", status_code=204)
+async def request_org_delete_code(
+    current_user: User = Depends(require_org_owner()),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    from app.services.org_deletion_service import send_org_delete_code
+
+    org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    if not org:
+        raise not_found("Organization not found")
+    await send_org_delete_code(owner=current_user, org_name=org.name, org_id=org.id)
+
+
+@router.post("/delete/confirm", status_code=204)
+async def confirm_org_delete(
+    body: DeleteOrgConfirmRequest,
+    current_user: User = Depends(require_org_owner()),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    from app.infrastructure.audit import log_audit
+    from app.services.org_deletion_service import confirm_org_deletion
+
+    await confirm_org_deletion(
+        db,
+        org_id=current_user.org_id,
+        owner_id=current_user.id,
+        code=body.code,
+    )
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="org.deleted",
+        resource="organization",
+        resource_id=current_user.org_id,
+    )
+    await db.commit()
 
 
 @router.post("/complete-setup", response_model=CompleteSetupResponse)
@@ -213,6 +274,9 @@ async def upload_organization_asset(
             content_type=file.content_type,
         )
     except RuntimeError as exc:
-        logger.warning("asset upload failed: %s", exc)
-        raise bad_request("STORAGE_NOT_CONFIGURED", str(exc)) from exc
+        raise log_and_bad_request(
+            "STORAGE_NOT_CONFIGURED",
+            exc,
+            user_message=public_message("STORAGE_NOT_CONFIGURED"),
+        ) from exc
     return AssetUploadResponse(url=url, category=category, object_key=key)

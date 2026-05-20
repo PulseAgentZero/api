@@ -41,30 +41,25 @@ async def _handle_pipeline(data: dict) -> None:
 
 
 async def _handle_introspection(data: dict) -> None:
-    from app.infrastructure.crypto import decrypt_dsn
     from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
-    from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
-    from app.services.schema_introspection import auto_create_schema_mapping
+    from app.services.schema_introspection import trigger_auto_schema_mapping
+    from app.services.studio_file_source_service import supports_studio_file_queries
 
     connection_id = UUID(data["connection_id"])
     org_id = UUID(data["org_id"])
 
     async with async_session_factory() as session:
         conn = await ConnectionRepository(session).get_by_id(connection_id)
-        if not conn or conn.org_id != org_id or not conn.encrypted_dsn:
-            logger.warning("Introspection job: connection %s not found or has no DSN", connection_id)
+        if not conn or conn.org_id != org_id:
+            logger.warning("Introspection job: connection %s not found", connection_id)
             return
-        org = await OrganizationRepository(session).get_by_id(org_id)
-        plaintext = decrypt_dsn(conn.encrypted_dsn)
-        await auto_create_schema_mapping(
-            session,
-            org_id=org_id,
-            connection_id=connection_id,
-            plaintext_dsn=plaintext,
-            sslmode=conn.sslmode,
-            entity_label=org.entity_label if org else None,
-            goal_label=org.goal_label if org else None,
-        )
+        if not supports_studio_file_queries(conn) and not conn.encrypted_dsn:
+            logger.warning(
+                "Introspection job: connection %s has no credentials for introspection",
+                connection_id,
+            )
+            return
+        await trigger_auto_schema_mapping(session, org_id=org_id, conn=conn)
         await session.commit()
     logger.info("Introspection complete connection_id=%s org_id=%s", connection_id, org_id)
 

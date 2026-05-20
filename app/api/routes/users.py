@@ -2,14 +2,17 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.passwords import hash_password, verify_password
 from app.api.auth.role_deps import require_role
-from app.api.errors import bad_request, conflict, not_found, rate_limited
+from app.api.auth.org_helpers import is_org_owner
+from app.api.errors import bad_request, conflict, forbidden, not_found, rate_limited
+from app.api.safe_errors import log_and_bad_request, public_message
+from app.api.schemas.auth import DeleteAccountRequest
 from app.api.schemas.user import (
     InviteUserRequest,
     InviteUserResponse,
@@ -22,6 +25,7 @@ from app.infrastructure.audit import log_audit
 from app.infrastructure.database.models.invitation import Invitation
 from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.database.repositories.user_repository import UserRepository
 from app.infrastructure.database.session import get_db
 from app.services.email_queue import queue_email
@@ -126,14 +130,53 @@ async def upload_my_avatar(
             content_type=content_type,
         )
     except RuntimeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "STORAGE_UNAVAILABLE", "message": str(exc)},
+        raise log_and_bad_request(
+            "STORAGE_NOT_CONFIGURED",
+            exc,
+            user_message=public_message("STORAGE_NOT_CONFIGURED"),
         ) from exc
     current_user.profile_image_url = url
     await db.commit()
     await db.refresh(current_user)
     return _to_response(current_user)
+
+
+@router.delete("/me", status_code=204)
+async def delete_my_account(
+    body: DeleteAccountRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Self-delete account. Organization owners must delete the org instead."""
+    from app.infrastructure.audit import log_audit
+    from app.services.totp_service import clear_totp_fields, user_totp_enabled, verify_totp_code
+
+    org = await OrganizationRepository(db).get_by_id(current_user.org_id)
+    if is_org_owner(current_user, org):
+        raise forbidden(
+            "OWNER_CANNOT_DELETE_ACCOUNT",
+            "Organization owners cannot delete their account. Delete the organization instead.",
+        )
+    if current_user.password_hash:
+        if not body.password or not verify_password(body.password, current_user.password_hash):
+            raise bad_request("INVALID_PASSWORD", "Password is required to delete your account")
+    if user_totp_enabled(current_user):
+        if not body.totp_code or not verify_totp_code(current_user, body.totp_code):
+            raise bad_request("INVALID_TOTP", "Valid two-factor code is required")
+    await redis_tokens.revoke_all_refresh_tokens_for_user(current_user.id)
+    clear_totp_fields(current_user)
+    current_user.is_active = False
+    current_user.email = f"deleted+{current_user.id}@deleted.local"
+    current_user.password_hash = None
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="user.self_deleted",
+        resource="user",
+        resource_id=current_user.id,
+    )
+    await db.commit()
 
 
 @router.put("/me/password")

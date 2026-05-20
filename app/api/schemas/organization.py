@@ -32,6 +32,18 @@ class UpdateOrgRequest(BaseModel):
     tour_guide: dict[str, Any] | None = None
 
 
+class OrgSecurityRequest(BaseModel):
+    require_2fa: bool
+
+
+class OrgSecurityResponse(BaseModel):
+    require_2fa: bool
+
+
+class DeleteOrgConfirmRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
 class OrgProfileResponse(BaseModel):
     id: UUID
     name: str
@@ -45,6 +57,8 @@ class OrgProfileResponse(BaseModel):
     logo_url: str | None
     tour_guide: dict[str, Any] = Field(default_factory=dict)
     onboarding_done: bool
+    require_2fa: bool = False
+    is_org_owner: bool = False
     created_at: datetime
     updated_at: datetime
 

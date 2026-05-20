@@ -352,7 +352,9 @@ async def get_schema(
     try:
         result = await _fetch_live_schema(db, current_user.org_id, connection_id)
     except Exception as exc:
-        raise bad_request("CLIENT_DB_ERROR", f"Could not fetch schema: {exc}") from exc
+        from app.api.safe_errors import log_and_bad_request
+
+        raise log_and_bad_request("CLIENT_DB_ERROR", exc) from exc
 
     if redis is not None:
         try:
@@ -398,7 +400,9 @@ async def refresh_schema(
     try:
         result = await _fetch_live_schema(db, current_user.org_id, connection_id)
     except Exception as exc:
-        raise bad_request("CLIENT_DB_ERROR", f"Could not fetch schema: {exc}") from exc
+        from app.api.safe_errors import log_and_bad_request
+
+        raise log_and_bad_request("CLIENT_DB_ERROR", exc) from exc
 
     # Repopulate cache
     if redis is not None:

@@ -86,6 +86,18 @@ def studio_query_cache(org_id: str, query_hash: str) -> str:
     return f"studio:qcache:{org_id}:{query_hash}"
 
 
+def mfa_login(token: str) -> str:
+    return f"mfa_login:{token}"
+
+
+def mfa_setup(token: str) -> str:
+    return f"mfa_setup:{token}"
+
+
+def org_delete_code(org_id: str, owner_id: str) -> str:
+    return f"org_delete_code:{org_id}:{owner_id}"
+
+
 def user_sessions_pattern(user_id) -> str:
     """Glob pattern to match all refresh tokens for a user.
     NOTE: refresh tokens are stored as refresh:{sha256(raw)} — we can't

@@ -1,6 +1,8 @@
 import logging
 import os
 import uuid as uuid_mod
+
+import pandas as pd
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, unquote
 from uuid import UUID
@@ -31,9 +33,15 @@ from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.connectors.factory import _make_sql_dsn, build_encrypted_secret_and_row_fields
 from app.infrastructure.connectors.payload import parse_pulse_api_payload
 from app.infrastructure.connectors.connection_test import test_connection_record
-from app.infrastructure.database.connection_tester import (
-    introspect_schema,
-    preview_table_rows,
+from app.infrastructure.database.connection_tester import preview_table_rows
+from app.api.safe_errors import log_and_bad_request, public_message, sanitize_connection_test_message
+from app.services.schema_introspection import (
+    introspect_connection_tables,
+    trigger_auto_schema_mapping,
+)
+from app.services.studio_file_source_service import (
+    load_file_source_frames,
+    supports_studio_file_queries,
 )
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
@@ -309,6 +317,21 @@ def _connection_dsn(conn) -> str:
     return decrypt_dsn(conn.encrypted_dsn)
 
 
+async def _schedule_schema_mapping_after_connection(
+    db: AsyncSession,
+    *,
+    org_id: UUID,
+    conn,
+) -> None:
+    """Enqueue background introspection or run inline when Redis is unavailable."""
+    from app.services.pipeline_queue import enqueue_introspection_job
+
+    queued = await enqueue_introspection_job(connection_id=conn.id, org_id=org_id)
+    if not queued:
+        await trigger_auto_schema_mapping(db, org_id=org_id, conn=conn)
+        await db.commit()
+
+
 def _assert_live(conn) -> None:
     if conn.deleted_at is not None:
         raise not_found("Connection not found")
@@ -414,9 +437,14 @@ async def upload_connection_file(
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false", "connection_id": str(conn.id)},
         )
+    await _schedule_schema_mapping_after_connection(
+        db,
+        org_id=current_user.org_id,
+        conn=conn,
+    )
     return _connection_to_response(conn)
 
 
@@ -440,7 +468,7 @@ async def test_current_connection(
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false"},
         )
     return TestConnectionResponse(success=True, message=message, db_version=db_version)
@@ -485,8 +513,10 @@ async def list_connection_tables(
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
     _assert_live(conn)
-    dsn = _connection_dsn(conn)
-    tables = await introspect_schema(dsn, sslmode=conn.sslmode)
+    try:
+        tables = await introspect_connection_tables(conn)
+    except ValueError as exc:
+        raise log_and_bad_request("BAD_REQUEST", exc) from exc
     return IntrospectResponse(tables=tables)
 
 
@@ -507,11 +537,24 @@ async def preview_connection_table(
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
     _assert_live(conn)
+    if supports_studio_file_queries(conn):
+        frames = await load_file_source_frames(conn)
+        if table_name not in frames:
+            raise bad_request("BAD_REQUEST", f"Table not found: {table_name}")
+        df = frames[table_name].head(limit)
+        rows = [
+            {
+                str(col): (None if pd.isna(val) else val.item() if hasattr(val, "item") else val)
+                for col, val in record.items()
+            }
+            for record in df.to_dict(orient="records")
+        ]
+        return TablePreviewResponse(table=table_name, rows=rows, limit=limit)
     dsn = _connection_dsn(conn)
     try:
         rows = await preview_table_rows(dsn, table_name, limit=limit, sslmode=conn.sslmode)
     except ValueError as exc:
-        raise bad_request("BAD_REQUEST", str(exc)) from exc
+        raise log_and_bad_request("BAD_REQUEST", exc) from exc
     return TablePreviewResponse(table=table_name, rows=rows, limit=limit)
 
 
@@ -572,8 +615,14 @@ async def create_connection(
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false", "connection_id": str(conn.id)},
+        )
+    if supports_studio_file_queries(conn):
+        await _schedule_schema_mapping_after_connection(
+            db,
+            org_id=current_user.org_id,
+            conn=conn,
         )
     return _connection_to_response(conn)
 
@@ -695,7 +744,7 @@ async def _update_connection_record(
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false"},
         )
     return _connection_to_response(conn)
@@ -746,7 +795,7 @@ async def test_db_connection(
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false"},
         )
 
@@ -763,7 +812,8 @@ async def introspect_db_schema(
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
     _assert_live(conn)
-
-    dsn = _connection_dsn(conn)
-    tables = await introspect_schema(dsn, sslmode=conn.sslmode)
+    try:
+        tables = await introspect_connection_tables(conn)
+    except ValueError as exc:
+        raise log_and_bad_request("BAD_REQUEST", exc) from exc
     return IntrospectResponse(tables=tables)
