@@ -252,12 +252,9 @@ async def _fetch_live_schema(
     db: AsyncSession, org_id: UUID, connection_id: UUID | None
 ) -> IntrospectResponse:
     """Fetch tables + columns directly from the client DB or file sources."""
-    from sqlalchemy import text as _text
-
-    from app.agents.tools.client_db import open_client_engine, safe_client_connection
-    from app.infrastructure.database.client_queries import ClientDBError
-    from app.infrastructure.database.connection_tester import introspect_schema
+    from app.infrastructure.connectors.payload import parse_pulse_api_payload
     from app.infrastructure.crypto import decrypt_dsn
+    from app.infrastructure.database.connection_tester import introspect_schema
     from app.services.studio_file_source_service import (
         fetch_file_source_schema,
         get_connection_for_studio,
@@ -265,32 +262,25 @@ async def _fetch_live_schema(
     )
     from app.services.studio_query_service import _get_specific_engine
 
-    if connection_id is not None:
-        conn_row = await get_connection_for_studio(db, org_id, connection_id)
-        if supports_studio_file_queries(conn_row):
-            tables = await fetch_file_source_schema(conn_row)
-            return IntrospectResponse(tables=tables)
+    conn_row = await get_connection_for_studio(db, org_id, connection_id)
+    if supports_studio_file_queries(conn_row):
+        tables = await fetch_file_source_schema(conn_row)
+        return IntrospectResponse(tables=tables)
 
-    from app.infrastructure.connectors.payload import parse_pulse_api_payload
+    if not conn_row.encrypted_dsn:
+        raise not_found(
+            "Connection has no schema to browse — re-create or test the connection first"
+        )
 
-    if connection_id is not None:
-        conn_row = await get_connection_for_studio(db, org_id, connection_id)
-        dsn_plain = decrypt_dsn(conn_row.encrypted_dsn) if conn_row.encrypted_dsn else ""
-        if parse_pulse_api_payload(dsn_plain) is not None:
-            tables = await introspect_schema(dsn_plain, sslmode=conn_row.sslmode)
-        else:
-            engine, conn = await _get_specific_engine(db, org_id, connection_id)
-            try:
-                tables = await introspect_schema(dsn_plain, sslmode=conn.sslmode)
-            finally:
-                await engine.dispose()
+    dsn_plain = decrypt_dsn(conn_row.encrypted_dsn)
+    if parse_pulse_api_payload(dsn_plain) is not None:
+        tables = await introspect_schema(dsn_plain, sslmode=conn_row.sslmode)
     else:
-        from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
-        conns = await ConnectionRepository(db).list_by_org(org_id)
-        if not conns:
-            raise not_found("No connection found for this organisation")
-        conn = next((c for c in conns if c.status == "active" and not c.deleted_at), conns[0])
-        tables = await introspect_schema(decrypt_dsn(conn.encrypted_dsn), sslmode=conn.sslmode)
+        engine, conn = await _get_specific_engine(db, org_id, conn_row.id)
+        try:
+            tables = await introspect_schema(dsn_plain, sslmode=conn.sslmode)
+        finally:
+            await engine.dispose()
 
     return IntrospectResponse(tables=tables)
 

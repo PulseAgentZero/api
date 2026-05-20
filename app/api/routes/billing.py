@@ -161,6 +161,55 @@ async def _subscription_payload(db: AsyncSession, sub: Subscription) -> dict:
     return subscription_response(sub, effective_plan=effective)
 
 
+def _paystack_key_mode() -> str:
+    key = settings.get_paystack_secret_key() or ""
+    if key.startswith("sk_live_"):
+        return "live"
+    if key.startswith("sk_test_"):
+        return "test"
+    return "unknown"
+
+
+async def _fetch_paystack_plan(
+    client: httpx.AsyncClient,
+    *,
+    plan_code: str,
+    tier: str,
+) -> dict[str, Any]:
+    """Fetch a configured Paystack plan before initializing checkout.
+
+    Paystack returns the same "Plan not found" error from transaction
+    initialization when the plan code belongs to a different integration mode
+    (for example, a live dashboard plan used with a test secret key). Fetching
+    the plan first lets us log and return a targeted configuration error.
+    """
+    resp = await client.get(
+        f"{PAYSTACK_BASE}/plan/{plan_code}",
+        headers=_paystack_headers(),
+    )
+    if resp.status_code == 200:
+        return resp.json().get("data", {}) or {}
+
+    logger.error(
+        "Paystack %s plan lookup failed for %s using %s key: %s — %s",
+        tier,
+        plan_code,
+        _paystack_key_mode(),
+        resp.status_code,
+        resp.text[:300],
+    )
+    if resp.status_code == 404:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Paystack {tier} plan was not found for the configured "
+                f"{_paystack_key_mode()} secret key. Use a live secret key for "
+                "live dashboard plans, or a test secret key for test dashboard plans."
+            ),
+        )
+    raise HTTPException(status_code=502, detail="Could not validate Paystack plan")
+
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class InitializePaymentRequest(BaseModel):
@@ -286,20 +335,24 @@ async def initialize_payment(
     if not settings.get_paystack_secret_key():
         raise HTTPException(status_code=503, detail="Payment service is not configured")
 
-    payload: dict[str, Any] = {
-        "email": current_user.email,
-        "amount": 100,  # overridden by the Paystack plan amount
-        "plan": plan_code,
-        "callback_url": body.callback_url,
-        "metadata": {
-            "org_id": str(current_user.org_id),
-            "user_id": str(current_user.id),
-            "plan": tier,
-            "purchase_type": "cloud_subscription",
-        },
-    }
-
     async with httpx.AsyncClient(timeout=15.0) as client:
+        plan = await _fetch_paystack_plan(client, plan_code=plan_code, tier=tier)
+        payload: dict[str, Any] = {
+            "email": current_user.email,
+            # Paystack docs say the plan overrides amount, but amount remains a
+            # required transaction field. Use the fetched plan amount so the
+            # checkout request matches the plan exactly.
+            "amount": int(plan.get("amount") or 100),
+            "plan": plan_code,
+            "callback_url": body.callback_url,
+            "metadata": {
+                "org_id": str(current_user.org_id),
+                "user_id": str(current_user.id),
+                "plan": tier,
+                "paystack_plan_code": plan_code,
+                "purchase_type": "cloud_subscription",
+            },
+        }
         resp = await client.post(
             f"{PAYSTACK_BASE}/transaction/initialize",
             json=payload,

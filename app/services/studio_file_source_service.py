@@ -392,25 +392,34 @@ async def execute_file_source_query(
     *,
     param_defs: list[dict] | None = None,
     param_values: dict[str, Any] | None = None,
+    bound_values: dict[str, Any] | None = None,
     page: int = 1,
     page_size: int = 100,
 ) -> dict[str, Any]:
+    """Run a SELECT against a file-source connection (CSV, Excel, Sheets, S3).
+
+    Two calling modes are supported:
+    1. Pass the original SQL with ``{{name}}`` placeholders plus ``param_defs`` /
+       ``param_values`` — this function will substitute them.
+    2. Pass SQL that already has ``:name`` placeholders along with ``bound_values``
+       — used by :func:`execute_studio_query`, which performs substitution once
+       so the cache key reflects the bound values.
+    """
     if not _is_select_only(sql_text):
         raise bad_request(
             "INVALID_SQL",
             "Only SELECT statements are permitted in Pulse Studio.",
         )
 
-    from app.services.studio_query_service import _inject_limit
-
-    from app.services.studio_query_service import _PARAM_PATTERN
+    from app.services.studio_query_service import _inject_limit, _PARAM_PATTERN
 
     limited_sql = _inject_limit(sql_text.strip(), _MAX_ROWS)
-    bound_values: dict[str, Any] = {}
-    if _PARAM_PATTERN.search(limited_sql):
-        limited_sql, bound_values = apply_params(
-            limited_sql, param_defs or [], param_values or {}
-        )
+    if bound_values is None:
+        bound_values = {}
+        if _PARAM_PATTERN.search(limited_sql):
+            limited_sql, bound_values = apply_params(
+                limited_sql, param_defs or [], param_values or {}
+            )
 
     frames = await load_file_source_frames(conn)
     return await asyncio.to_thread(

@@ -135,6 +135,42 @@ async def _get_client_engine(db: AsyncSession, org_id) -> tuple[AsyncEngine, Con
     When multiple connections exist, prefer a non-deleted row with ``status ==
     "active"``, then the most recently updated.
     """
+    conn = await _get_connection(db, org_id)
+    if not conn.encrypted_dsn:
+        raise ClientDBError(
+            "This connection has no SQL database URL. Use a SQL connection, "
+            "or a supported file source for file-based pipeline workflows."
+        )
+    dsn = decrypt_dsn(conn.encrypted_dsn)
+    if parse_pulse_api_payload(dsn) is not None:
+        raise ClientDBError(
+            "This org connection is an API or object-store connector. "
+            "Use a SQL database (Postgres, MySQL, SQLite, SQL Server, Redshift) for live SQL entity mapping, "
+            "or upload CSV for file-based workflows."
+        )
+    url = _to_async_url(dsn)
+    engine = create_async_engine(url, connect_args=_connect_args(url, conn.sslmode))
+    return engine, conn
+
+
+async def _get_connection(
+    db: AsyncSession,
+    org_id,
+    connection_id: UUID | None = None,
+) -> Connection:
+    if connection_id is not None:
+        result = await db.execute(
+            select(Connection).where(
+                Connection.id == connection_id,
+                Connection.org_id == org_id,
+                Connection.deleted_at.is_(None),
+            )
+        )
+        conn = result.scalar_one_or_none()
+        if not conn:
+            raise ClientDBError("Mapped connection is missing or has been deleted")
+        return conn
+
     result = await db.execute(
         select(Connection)
         .where(Connection.org_id == org_id, Connection.deleted_at.is_(None))
@@ -148,6 +184,20 @@ async def _get_client_engine(db: AsyncSession, org_id) -> tuple[AsyncEngine, Con
     conn = result.scalar_one_or_none()
     if not conn:
         raise ClientDBError("No connection configured for this organization")
+    return conn
+
+
+async def _get_client_engine_for_connection(
+    db: AsyncSession,
+    org_id,
+    connection_id: UUID | None,
+) -> tuple[AsyncEngine, Connection]:
+    conn = await _get_connection(db, org_id, connection_id)
+    if not conn.encrypted_dsn:
+        raise ClientDBError(
+            "This connection has no SQL database URL. Use a SQL connection, "
+            "or a supported file source for file-based pipeline workflows."
+        )
     dsn = decrypt_dsn(conn.encrypted_dsn)
     if parse_pulse_api_payload(dsn) is not None:
         raise ClientDBError(
@@ -158,6 +208,32 @@ async def _get_client_engine(db: AsyncSession, org_id) -> tuple[AsyncEngine, Con
     url = _to_async_url(dsn)
     engine = create_async_engine(url, connect_args=_connect_args(url, conn.sslmode))
     return engine, conn
+
+
+async def _load_file_source_frames_if_supported(
+    conn: Connection,
+) -> dict[str, Any] | None:
+    from app.services.studio_file_source_service import (
+        load_file_source_frames,
+        supports_studio_file_queries,
+    )
+
+    if not supports_studio_file_queries(conn):
+        return None
+    return await load_file_source_frames(conn)
+
+
+def _records_from_frame(
+    frame,
+    *,
+    columns: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    missing = [col for col in columns if col not in frame.columns]
+    if missing:
+        raise ClientDBError(f"Mapped columns not found in file source: {', '.join(missing)}")
+    subset = frame.loc[:, columns].head(limit)
+    return subset.where(subset.notna(), None).to_dict(orient="records")
 
 
 @asynccontextmanager
@@ -220,18 +296,26 @@ async def fetch_entities(
 
     At most :data:`_MAX_ENTITY_FETCH_ROWS` rows are returned per call.
     """
-    engine, _conn = await _get_client_engine(db, org_id)
+    conn = await _get_connection(db, org_id, mapping.connection_id)
+    frames = await _load_file_source_frames_if_supported(conn)
+    table_name = _validate_identifier(mapping.entity_table, "entity table")
+    cols = [_validate_identifier(mapping.entity_id_col, "entity ID column")]
+    if mapping.entity_name_col:
+        cols.append(_validate_identifier(mapping.entity_name_col, "entity name column"))
+    for col_name in (mapping.signal_columns or {}).values():
+        col_name = _validate_identifier(col_name, "signal column")
+        if col_name not in cols:
+            cols.append(col_name)
+
+    if frames is not None:
+        frame = frames.get(table_name)
+        if frame is None:
+            raise ClientDBError("Mapped entity table was not found in the file source")
+        return _records_from_frame(frame, columns=cols, limit=_MAX_ENTITY_FETCH_ROWS)
+
+    engine, _conn = await _get_client_engine_for_connection(db, org_id, mapping.connection_id)
     try:
         async with _safe_client_connection(engine, _conn) as client_conn:
-            table_name = _validate_identifier(mapping.entity_table, "entity table")
-            cols = [_validate_identifier(mapping.entity_id_col, "entity ID column")]
-            if mapping.entity_name_col:
-                cols.append(_validate_identifier(mapping.entity_name_col, "entity name column"))
-            for col_name in (mapping.signal_columns or {}).values():
-                col_name = _validate_identifier(col_name, "signal column")
-                if col_name not in cols:
-                    cols.append(col_name)
-
             quoted_cols = [_quote_identifier(c, _conn.db_type) for c in cols]
             q_table = _quote_identifier(table_name, _conn.db_type)
             col_list = ", ".join(quoted_cols)
@@ -250,7 +334,23 @@ async def fetch_entity_by_id(
     db: AsyncSession, org_id, entity_id: str, mapping: SchemaMapping
 ) -> dict | None:
     """Fetch a single entity from the client DB by ID."""
-    engine, _conn = await _get_client_engine(db, org_id)
+    conn = await _get_connection(db, org_id, mapping.connection_id)
+    frames = await _load_file_source_frames_if_supported(conn)
+    if frames is not None:
+        table_name = _validate_identifier(mapping.entity_table, "entity table")
+        id_col = _validate_identifier(mapping.entity_id_col, "entity ID column")
+        frame = frames.get(table_name)
+        if frame is None:
+            raise ClientDBError("Mapped entity table was not found in the file source")
+        if id_col not in frame.columns:
+            raise ClientDBError("Mapped entity ID column was not found in the file source")
+        match = frame[frame[id_col].astype(str) == str(entity_id)]
+        if match.empty:
+            return None
+        row = match.head(1).where(match.head(1).notna(), None).to_dict(orient="records")[0]
+        return row
+
+    engine, _conn = await _get_client_engine_for_connection(db, org_id, mapping.connection_id)
     try:
         async with _safe_client_connection(engine, _conn) as client_conn:
             cols_result = await client_conn.execute(
@@ -288,18 +388,41 @@ async def fetch_entity_trend(
     if not mapping.timestamp_col:
         raise ClientDBError("No timestamp column configured for this organization")
 
-    engine, _conn = await _get_client_engine(db, org_id)
+    conn = await _get_connection(db, org_id, mapping.connection_id)
+    frames = await _load_file_source_frames_if_supported(conn)
+    table_name = _validate_identifier(mapping.entity_table, "entity table")
+    id_col = _validate_identifier(mapping.entity_id_col, "entity ID column")
+    ts_col = _validate_identifier(mapping.timestamp_col, "timestamp column")
+    cols = [ts_col]
+    for col_name in (mapping.signal_columns or {}).values():
+        col_name = _validate_identifier(col_name, "signal column")
+        if col_name not in cols:
+            cols.append(col_name)
+
+    if frames is not None:
+        frame = frames.get(table_name)
+        if frame is None:
+            raise ClientDBError("Mapped entity table was not found in the file source")
+        required_cols = [id_col, *cols]
+        missing = [col for col in required_cols if col not in frame.columns]
+        if missing:
+            raise ClientDBError(f"Mapped columns not found in file source: {', '.join(missing)}")
+        subset = frame[frame[id_col].astype(str) == str(entity_id)].copy()
+        subset = subset.sort_values(ts_col, ascending=False).head(limit)
+        points = []
+        for row in reversed(subset.where(subset.notna(), None).to_dict(orient="records")):
+            ts_value = row.get(ts_col)
+            values = {col: row.get(col) for col in cols if col != ts_col}
+            if isinstance(ts_value, datetime | date):
+                ts = ts_value.isoformat()
+            else:
+                ts = str(ts_value)
+            points.append({"timestamp": ts, "values": values})
+        return points
+
+    engine, _conn = await _get_client_engine_for_connection(db, org_id, mapping.connection_id)
     try:
         async with _safe_client_connection(engine, _conn) as client_conn:
-            table_name = _validate_identifier(mapping.entity_table, "entity table")
-            id_col = _validate_identifier(mapping.entity_id_col, "entity ID column")
-            ts_col = _validate_identifier(mapping.timestamp_col, "timestamp column")
-            cols = [ts_col]
-            for col_name in (mapping.signal_columns or {}).values():
-                col_name = _validate_identifier(col_name, "signal column")
-                if col_name not in cols:
-                    cols.append(col_name)
-
             quoted_cols = [_quote_identifier(c, _conn.db_type) for c in cols]
             q_table = _quote_identifier(table_name, _conn.db_type)
             q_id = _quote_identifier(id_col, _conn.db_type)

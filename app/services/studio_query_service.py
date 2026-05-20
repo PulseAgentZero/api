@@ -291,24 +291,33 @@ async def execute_studio_query(
         except Exception:
             logger.warning("Studio cache read failed for org=%s", org_id, exc_info=True)
 
-    # --- File sources (CSV, Google Sheets, S3) ---
-    if connection_id is not None:
-        from app.services.studio_file_source_service import (
-            execute_file_source_query,
-            get_connection_for_studio,
-            supports_studio_file_queries,
-        )
+    # --- File sources (CSV, Excel, Google Sheets, S3) ---
+    # Resolve a candidate connection for both explicit and primary-connection
+    # paths so CSV/Excel orgs work even when the caller didn't specify one.
+    from app.services.studio_file_source_service import (
+        execute_file_source_query,
+        get_connection_for_studio,
+        supports_studio_file_queries,
+    )
 
-        file_conn = await get_connection_for_studio(db, org_id, connection_id)
-        if supports_studio_file_queries(file_conn):
-            return await execute_file_source_query(
-                file_conn,
-                limited_sql,
-                param_defs=param_defs,
-                param_values=param_values,
-                page=page,
-                page_size=page_size,
-            )
+    try:
+        candidate_conn = await get_connection_for_studio(db, org_id, connection_id)
+    except Exception:
+        # Surfaced later by open_client_engine when the SQL path also has no
+        # connection — keep the original error semantics for that case.
+        candidate_conn = None
+
+    if candidate_conn is not None and supports_studio_file_queries(candidate_conn):
+        # _execute_duckdb paginates internally, so we can't reuse the SQL-path
+        # cache shape (full row list). Skip the result cache for file sources —
+        # the heavy work is loading frames, which DuckDB handles fast enough.
+        return await execute_file_source_query(
+            candidate_conn,
+            limited_sql,
+            bound_values=bound_values,
+            page=page,
+            page_size=page_size,
+        )
 
     # --- Execute against client DB ---
     engine: AsyncEngine | None = None

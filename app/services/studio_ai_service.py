@@ -39,7 +39,6 @@ async def _introspect_schema(
     from sqlalchemy import text as _text
 
     from app.agents.tools.client_db import (
-        open_client_engine,
         safe_client_connection,
         schema_columns_sql,
     )
@@ -52,20 +51,16 @@ async def _introspect_schema(
     from app.services.studio_query_service import _get_specific_engine
 
     try:
-        if connection_id is not None:
-            conn_row = await get_connection_for_studio(db, org_id, connection_id)
-            if supports_studio_file_queries(conn_row):
-                tables = await fetch_file_source_schema(conn_row)
-                lines = []
-                for t in tables[:20]:
-                    cols = ", ".join(c["name"] for c in t.get("columns", [])[:20])
-                    lines.append(f"table: {t['name']} | columns: {cols}")
-                return "\n".join(lines)
+        conn_row = await get_connection_for_studio(db, org_id, connection_id)
+        if supports_studio_file_queries(conn_row):
+            tables = await fetch_file_source_schema(conn_row)
+            lines = []
+            for t in tables[:20]:
+                cols = ", ".join(c["name"] for c in t.get("columns", [])[:20])
+                lines.append(f"table: {t['name']} | columns: {cols}")
+            return "\n".join(lines)
 
-        if connection_id is not None:
-            engine, conn = await _get_specific_engine(db, org_id, connection_id)
-        else:
-            engine, conn = await open_client_engine(db, org_id)
+        engine, conn = await _get_specific_engine(db, org_id, conn_row.id)
         try:
             db_type = getattr(conn, "db_type", None)
             if db_type == "mysql":

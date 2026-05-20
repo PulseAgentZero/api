@@ -603,6 +603,19 @@ class PipelineOrchestrator:
                 if connection_id is not None:
                     return "Mapped connection is missing or has been deleted"
                 return "No connection configured for this organisation"
+            from app.services.studio_file_source_service import (
+                fetch_file_source_schema,
+                supports_studio_file_queries,
+            )
+
+            if supports_studio_file_queries(conn):
+                await fetch_file_source_schema(conn)
+                return None
+            if not conn.encrypted_dsn:
+                return (
+                    "Connection has no stored credentials. Save or re-create "
+                    "the connection, then run the pipeline again."
+                )
             dsn = decrypt_dsn(conn.encrypted_dsn)
             if parse_pulse_api_payload(dsn) is not None:
                 return (
