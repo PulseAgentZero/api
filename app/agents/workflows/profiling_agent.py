@@ -21,6 +21,7 @@ from app.agents.state import PipelineState
 from app.agents.tools.query_tools import build_query_tools
 from app.config.settings import settings
 from app.infrastructure.external_services.rag import embed_and_store_profiles
+from app.services.procedural_memory import format_procedural_block
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,13 @@ class ProfilingAgent(BaseAgent):
 
         related_tables = state.get("related_tables", [])
         column_semantics = (state.get("schema_analysis") or {}).get("column_semantics", {})
+        entity_table = state.get("entity_table", "")
+        entity_table_columns: list[str] = []
+        raw_schema = state.get("raw_schema") or {}
+        for tbl in raw_schema.get("tables", []):
+            if tbl.get("name") == entity_table or tbl.get("table") == entity_table:
+                entity_table_columns = tbl.get("columns", [])
+                break
 
         prompt = PROFILING_PROMPT.format(
             org_name=state.get("org_name", "Unknown"),
@@ -62,12 +70,17 @@ class ProfilingAgent(BaseAgent):
             business_context=state.get("business_context", ""),
             entity_label=state.get("entity_label", "entities"),
             goal_label=state.get("goal_label", "improve operations"),
-            entity_table=state.get("entity_table", ""),
+            entity_table=entity_table,
             entity_id_col=state.get("entity_id_col", ""),
             entity_name_col=state.get("entity_name_col", ""),
+            entity_table_columns=json.dumps(entity_table_columns),
+            signal_columns=json.dumps(state.get("signal_columns", {})),
             related_tables=json.dumps(related_tables, default=str),
             column_semantics=json.dumps(column_semantics),
             profile_limit=profile_limit,
+            procedural_block=format_procedural_block(
+                state.get("procedural_learnings")
+            ),
         )
 
         user_prompt = (
@@ -96,7 +109,9 @@ class ProfilingAgent(BaseAgent):
             return state
 
         state["entity_profiles"] = result.get("entity_profiles", [])
-        state["profile_stats"] = result.get("profile_stats", {})
+        profile_stats = result.get("profile_stats", {})
+        profile_stats["total_profiled"] = len(state["entity_profiles"])
+        state["profile_stats"] = profile_stats
         state["reasoning_log"].extend(self._reasoning_entries)
 
         # Persist profile embeddings to Qdrant for future-cycle RAG retrieval.

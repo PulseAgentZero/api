@@ -23,6 +23,7 @@ from app.infrastructure.database.repositories.agent_conversation_repository impo
 )
 from app.infrastructure.database.session import get_db
 from app.services.agent_service import (
+    ChatResult,
     run as run_agent,
     run_stream as run_agent_stream,
     update_user_memory_from_message,
@@ -184,13 +185,21 @@ async def chat(
             media_type="text/event-stream",
         )
 
-    reply_text = await run_agent(db, current_user, messages)
+    result: ChatResult = await run_agent(db, current_user, messages, conversation_id=conv_id)
 
-    assistant_msg = {"role": "assistant", "content": reply_text}
+    assistant_msg: dict = {"role": "assistant", "content": result.reply}
+    if result.tool_context:
+        assistant_msg["tool_context"] = result.tool_context
+    if result.tools_called:
+        assistant_msg["tools_called"] = result.tools_called
     await repo.append_messages(conv_id, assistant_msg)
     await db.commit()
+    logger.info(
+        "[Chat] turn complete conversation_id=%s user_id=%s",
+        conv_id, current_user.id,
+    )
 
-    return ChatResponse(reply=reply_text, conversation_id=conv_id)
+    return ChatResponse(reply=result.reply, conversation_id=conv_id)
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -225,9 +234,13 @@ async def chat_without_path_conversation(
             media_type="text/event-stream",
         )
 
-    reply_text = await run_agent(db, current_user, messages)
+    result: ChatResult = await run_agent(db, current_user, messages, conversation_id=conv.id)
 
-    assistant_msg = {"role": "assistant", "content": reply_text}
+    assistant_msg: dict = {"role": "assistant", "content": result.reply}
+    if result.tool_context:
+        assistant_msg["tool_context"] = result.tool_context
+    if result.tools_called:
+        assistant_msg["tools_called"] = result.tools_called
     await repo.append_messages(conv.id, assistant_msg)
     await db.commit()
-    return ChatResponse(reply=reply_text, conversation_id=conv.id)
+    return ChatResponse(reply=result.reply, conversation_id=conv.id)

@@ -263,13 +263,12 @@ def _entity_to_query_text(entity: dict) -> str:
     """Concise dump of an entity's profile + signals for retrieval."""
     parts: list[str] = []
     profile = entity.get("profile") or {}
-    if profile:
-        summary = profile.get("profile_summary", "")
-        if summary:
-            parts.append(str(summary))
-        metrics = profile.get("behavioural_metrics", {})
-        if metrics:
-            parts.append(f"behaviour: {json.dumps(metrics, default=str)}")
+    summary = profile.get("profile_summary") or entity.get("profile_summary") or ""
+    if summary:
+        parts.append(str(summary))
+    metrics = profile.get("behavioural_metrics") or entity.get("behavioural_metrics") or {}
+    if metrics:
+        parts.append(f"behaviour: {json.dumps(metrics, default=str)}")
     signals = entity.get("signal_values") or {}
     if signals:
         parts.append(f"signals: {json.dumps(signals, default=str)}")
@@ -553,15 +552,19 @@ async def enrich_entities_with_similar(
         freshness_days=cfg.freshness_days,
     )
 
-    enriched: list[dict] = []
     wall_t0 = time.perf_counter()
+    sem = asyncio.Semaphore(settings.RAG_ENRICH_CONCURRENCY)
+    stats_lock = asyncio.Lock()
 
-    for entity in entities:
+    async def _enrich_one(entity: dict) -> dict:
+        async with sem:
+            return await _enrich_one_unlocked(entity)
+
+    async def _enrich_one_unlocked(entity: dict) -> dict:
         eid = entity.get("entity_id")
         raw_query = _entity_to_query_text(entity)
         if not raw_query:
-            enriched.append(entity)
-            continue
+            return entity
 
         if cfg.enable_query_rewrite:
             t_rw = time.perf_counter()
@@ -571,7 +574,8 @@ async def enrich_entities_with_similar(
                 logger.debug("[RAG] query rewrite failed (using raw): %s", exc)
                 rewritten = raw_query
             if run_stats is not None:
-                run_stats.total_rewrite_ms += (time.perf_counter() - t_rw) * 1000
+                async with stats_lock:
+                    run_stats.total_rewrite_ms += (time.perf_counter() - t_rw) * 1000
         else:
             rewritten = raw_query
 
@@ -631,14 +635,17 @@ async def enrich_entities_with_similar(
                     filter_condition=filter_condition,
                 )
                 if run_stats is not None:
-                    run_stats.expansion_applied_count += 1
-                    run_stats.expansion_extra_candidates += max(0, len(candidates) - max_single)
+                    async with stats_lock:
+                        run_stats.expansion_applied_count += 1
+                        run_stats.expansion_extra_candidates += max(
+                            0, len(candidates) - max_single
+                        )
         except Exception as exc:
             logger.warning("[RAG] retrieval failed for entity %s: %s", eid, exc)
-            enriched.append(entity)
-            continue
+            return entity
         if run_stats is not None:
-            run_stats.total_search_ms += (time.perf_counter() - t_search) * 1000
+            async with stats_lock:
+                run_stats.total_search_ms += (time.perf_counter() - t_search) * 1000
 
         # Self-exclusion
         candidates = [c for c in candidates if str(c.entity_id) != str(eid)]
@@ -700,7 +707,8 @@ async def enrich_entities_with_similar(
             before_autocut = len(filtered)
             filtered = _autocut_candidates(filtered)
             if run_stats is not None:
-                run_stats.autocut_removed_count += before_autocut - len(filtered)
+                async with stats_lock:
+                    run_stats.autocut_removed_count += before_autocut - len(filtered)
 
         # Rerank with Voyage rerank model over the over-fetched set
         if cfg.enable_rerank and len(filtered) > cfg.top_k:
@@ -717,8 +725,9 @@ async def enrich_entities_with_similar(
                 )
                 filtered = [filtered[i] for i, _ in order]
                 if run_stats is not None:
-                    run_stats.rerank_applied_count += 1
-                    run_stats.total_rerank_ms += (time.perf_counter() - t_rr) * 1000
+                    async with stats_lock:
+                        run_stats.rerank_applied_count += 1
+                        run_stats.total_rerank_ms += (time.perf_counter() - t_rr) * 1000
             except Exception as exc:
                 logger.debug("[RAG] rerank failed (keeping dense order): %s", exc)
                 filtered = filtered[: cfg.top_k]
@@ -742,8 +751,9 @@ async def enrich_entities_with_similar(
                     rejected = len(filtered) - len(valid_indices)
                     filtered = [filtered[i] for i in valid_indices]
                     if run_stats is not None:
-                        run_stats.validation_applied_count += 1
-                        run_stats.validation_rejected_count += rejected
+                        async with stats_lock:
+                            run_stats.validation_applied_count += 1
+                            run_stats.validation_rejected_count += rejected
                     logger.debug(
                         "[RAG] entity=%s: validation kept %d, rejected %d",
                         eid, len(filtered), rejected,
@@ -769,9 +779,12 @@ async def enrich_entities_with_similar(
 
         entity_copy = dict(entity)
         entity_copy["similar_entities"] = similar
-        enriched.append(entity_copy)
         if run_stats is not None:
-            run_stats.entities_enriched += 1
+            async with stats_lock:
+                run_stats.entities_enriched += 1
+        return entity_copy
+
+    enriched = list(await asyncio.gather(*(_enrich_one(e) for e in entities)))
 
     if run_stats is not None:
         run_stats.total_rag_ms = (time.perf_counter() - wall_t0) * 1000

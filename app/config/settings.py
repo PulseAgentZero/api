@@ -285,6 +285,9 @@ class Settings:
     RAG_ENABLE_QUERY_EXPANSION: bool = os.getenv("RAG_ENABLE_QUERY_EXPANSION", "false").lower() == "true"
     RAG_ENABLE_RETRIEVAL_VALIDATION: bool = os.getenv("RAG_ENABLE_RETRIEVAL_VALIDATION", "false").lower() == "true"
     RAG_VALIDATION_MIN_RELEVANT: int = int(os.getenv("RAG_VALIDATION_MIN_RELEVANT", "1"))
+    RAG_ENRICH_CONCURRENCY: int = max(
+        1, int(os.getenv("RAG_ENRICH_CONCURRENCY", "8"))
+    )
     AGENT_CONTEXT_COMPRESS_THRESHOLD: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_THRESHOLD", "60000"))
     AGENT_CONTEXT_COMPRESS_KEEP_RECENT: int = int(os.getenv("AGENT_CONTEXT_COMPRESS_KEEP_RECENT", "6"))
 
@@ -299,6 +302,10 @@ class Settings:
 
     # Conversational agent split (Query Agent + Synthesis Agent)
     CONV_AGENT_SPLIT_ENABLED: bool = os.getenv("CONV_AGENT_SPLIT_ENABLED", "false").lower() == "true"
+
+    # Chat context window
+    CHAT_CONTEXT_WINDOW_MESSAGES: int = int(os.getenv("CHAT_CONTEXT_WINDOW_MESSAGES", "20"))
+    CHAT_CONTEXT_SUMMARY_OVERFLOW: int = int(os.getenv("CHAT_CONTEXT_SUMMARY_OVERFLOW", "6"))
 
     # Semantic intent detection (fast classifier ahead of ReAct loop)
     CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"

@@ -1,7 +1,7 @@
 """add subscriptions table
 
 Revision ID: a1b2c3d4e5f6
-Revises: e8d7c6b5a493
+Revises: f1a2b3c4d5e6
 Create Date: 2026-05-17
 """
 
@@ -14,7 +14,7 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import UUID
 
 revision: str = "a1b2c3d4e5f6"
-down_revision: Union[str, None] = "e8d7c6b5a493"
+down_revision: Union[str, None] = "f1a2b3c4d5e6"
 branch_labels = None
 depends_on = None
 

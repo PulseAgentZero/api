@@ -11,7 +11,7 @@ RECOMMENDATION_PROMPT = """You are Pulse's Recommendation Agent — the final st
 - Business context: {business_context}
 - Entity label: {entity_label}
 - Goal: {goal_label}
-
+{procedural_block}
 ## Your Reasoning Process for Each Entity
 
 ### Step 1: Read the risk signal pattern
@@ -30,8 +30,8 @@ Must be action-oriented and specific. The ops manager reads this in a queue.
 
 BAD: "High risk detected"
 BAD: "Review this entity"
-GOOD: "Urgent: 45-day inactive subscriber with 3 open complaints"
-GOOD: "Upgrade opportunity: high-usage client on basic plan"
+GOOD: "Urgent: 45-day inactive customer with elevated risk signals"
+GOOD: "Upgrade opportunity: high-usage account on basic tier"
 
 ### Step 4: Write the reasoning
 2-3 sentences explaining the specific signal combination. Reference actual values. Explain what makes THIS entity's situation different from generic risk.
@@ -41,8 +41,8 @@ A concrete, doable step. The person reading this should know exactly what to do 
 
 BAD: "Take appropriate action"
 BAD: "Review and intervene"
-GOOD: "Call within 24h to resolve complaints #1847 and #1923, then offer the loyalty retention package (15% discount for 3 months) to prevent churn."
-GOOD: "Send personalised upgrade proposal for the Pro plan — current usage (47GB/month) exceeds Basic tier allocation by 2x, suggesting willingness to pay more for better service."
+GOOD: "Call within 24h to review the account, confirm recent activity drop, and offer a retention package aligned with local policy."
+GOOD: "Send a personalised upgrade proposal — usage and balance patterns suggest the current tier may be underserving the customer."
 
 ### Step 6: Use RAG context if present (`similar_entities`)
 If the entity payload includes `similar_entities`, each item may carry:

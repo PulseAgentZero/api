@@ -113,16 +113,24 @@ async def recall_learnings(
 def format_learnings_for_prompt(learnings: list[SearchResult]) -> str:
     if not learnings:
         return ""
-    lines: list[str] = []
-    for m in learnings:
-        content = (m.payload or {}).get("content", "").strip()
-        if content:
-            lines.append(f"- {content}")
+    texts = [
+        (m.payload or {}).get("content", "")
+        for m in learnings
+    ]
+    return format_procedural_block(texts)
+
+
+def format_procedural_block(learnings: list[str] | None) -> str:
+    """Render recalled procedural learnings for pipeline agent system prompts."""
+    if not learnings:
+        return ""
+    lines = [f"- {text.strip()}" for text in learnings if str(text).strip()]
     if not lines:
         return ""
     return (
-        "Procedural learnings from past pipeline runs for this org "
-        "(use to bias configuration and prioritization):\n"
+        "\n## Prior learnings from past runs (same org)\n"
+        "Use when choosing tools, aggregates, or retrieval strategy. "
+        "Ignore if they conflict with schema facts or current tool errors.\n"
         + "\n".join(lines)
         + "\n"
     )
