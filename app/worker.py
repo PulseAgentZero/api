@@ -42,6 +42,7 @@ async def _handle_pipeline(data: dict) -> None:
 
 async def _handle_introspection(data: dict) -> None:
     from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
+    from app.services.pipeline_trigger import maybe_trigger_initial_pipeline
     from app.services.schema_introspection import trigger_auto_schema_mapping
     from app.services.studio_file_source_service import supports_studio_file_queries
 
@@ -59,8 +60,15 @@ async def _handle_introspection(data: dict) -> None:
                 connection_id,
             )
             return
-        await trigger_auto_schema_mapping(session, org_id=org_id, conn=conn)
+        mapping_id = await trigger_auto_schema_mapping(session, org_id=org_id, conn=conn)
         await session.commit()
+        if mapping_id:
+            await maybe_trigger_initial_pipeline(
+                session,
+                org_id,
+                mapping_id=mapping_id,
+                triggered_by=None,
+            )
     logger.info("Introspection complete connection_id=%s org_id=%s", connection_id, org_id)
 
 

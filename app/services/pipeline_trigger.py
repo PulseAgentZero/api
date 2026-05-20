@@ -97,7 +97,7 @@ async def maybe_trigger_initial_pipeline(
     org_id: UUID,
     *,
     mapping_id: UUID,
-    triggered_by: UUID,
+    triggered_by: UUID | None,
 ) -> tuple[bool, str | None]:
     """Queue the org's first pipeline run after their first schema mapping is saved."""
     repo = PipelineRunRepository(db)

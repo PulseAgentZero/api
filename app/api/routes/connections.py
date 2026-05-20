@@ -42,6 +42,7 @@ from app.services.schema_introspection import (
     introspect_connection_tables,
     trigger_auto_schema_mapping,
 )
+from app.services.pipeline_trigger import maybe_trigger_initial_pipeline
 from app.services.studio_file_source_service import (
     load_file_source_frames,
     supports_studio_file_queries,
@@ -331,8 +332,15 @@ async def _schedule_schema_mapping_after_connection(
 
     queued = await enqueue_introspection_job(connection_id=conn.id, org_id=org_id)
     if not queued:
-        await trigger_auto_schema_mapping(db, org_id=org_id, conn=conn)
+        mapping_id = await trigger_auto_schema_mapping(db, org_id=org_id, conn=conn)
         await db.commit()
+        if mapping_id:
+            await maybe_trigger_initial_pipeline(
+                db,
+                org_id,
+                mapping_id=mapping_id,
+                triggered_by=None,
+            )
 
 
 def _assert_live(conn) -> None:

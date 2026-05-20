@@ -68,7 +68,7 @@ async def auto_create_schema_mapping(
     conn: Connection,
     entity_label: str | None,
     goal_label: str | None,
-) -> None:
+) -> UUID | None:
     """Introspect the client data source and upsert a best-guess schema mapping for the org.
 
     Scores tables by name heuristics, infers key columns, and writes (or updates)
@@ -83,10 +83,10 @@ async def auto_create_schema_mapping(
             "Schema introspection failed for connection %s — skipping auto-mapping",
             connection_id,
         )
-        return
+        return None
 
     if not tables:
-        return
+        return None
 
     entity_kw = (entity_label or "").lower().strip()
 
@@ -138,7 +138,7 @@ async def auto_create_schema_mapping(
     repo = SchemaMappingRepository(db)
     existing = await repo.list_by_org(org_id)
     if existing:
-        await repo.update(
+        mapping = await repo.update(
             existing[0].id,
             connection_id=connection_id,
             entity_table=best.name,
@@ -148,8 +148,9 @@ async def auto_create_schema_mapping(
             target_column=target_col,
             raw_schema=raw_schema,
         )
+        return mapping.id if mapping else None
     else:
-        await repo.create(
+        mapping = await repo.create(
             org_id=org_id,
             connection_id=connection_id,
             entity_table=best.name,
@@ -159,6 +160,7 @@ async def auto_create_schema_mapping(
             target_column=target_col,
             raw_schema=raw_schema,
         )
+        return mapping.id
 
 
 async def trigger_auto_schema_mapping(
@@ -166,12 +168,12 @@ async def trigger_auto_schema_mapping(
     *,
     org_id: UUID,
     conn: Connection,
-) -> None:
+) -> UUID | None:
     """Run auto-mapping using org entity/goal labels (inline fallback when Redis queue is unavailable)."""
     from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
 
     org = await OrganizationRepository(db).get_by_id(org_id)
-    await auto_create_schema_mapping(
+    return await auto_create_schema_mapping(
         db,
         org_id=org_id,
         conn=conn,
