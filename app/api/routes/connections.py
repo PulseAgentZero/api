@@ -447,6 +447,7 @@ async def _stream_upload_to_disk(
     dest_name = f"{uuid_mod.uuid4()}_{safe_name}"
     dest_path = os.path.join(upload_dir, dest_name)
     size = 0
+    limit_mb = max_bytes // (1024 * 1024)
     try:
         with open(dest_path, "wb") as out:
             while True:
@@ -455,8 +456,10 @@ async def _stream_upload_to_disk(
                     break
                 size += len(chunk)
                 if size > max_bytes:
+                    actual_mb = size / (1024 * 1024)
                     raise payload_too_large(
-                        f"File exceeds {max_bytes // (1024 * 1024)} MB limit"
+                        f"'{safe_name}' is {actual_mb:.1f} MB — the upload limit is "
+                        f"{limit_mb} MB. Split or compress the file and try again."
                     )
                 out.write(chunk)
     except PulseHTTPException:
