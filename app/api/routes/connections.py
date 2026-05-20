@@ -25,10 +25,16 @@ from app.api.errors import (
 from app.api.schemas.connection import (
     ConnectionResponse,
     CreateConnectionRequest,
+    FileUploadBatchError,
+    FileUploadBatchResponse,
     IntrospectResponse,
     TablePreviewResponse,
     TestConnectionResponse,
     UpdateConnectionRequest,
+)
+from app.config.constants import (
+    FILE_UPLOAD_MAX_BYTES,
+    FILE_UPLOAD_MAX_FILES_PER_BATCH,
 )
 from app.infrastructure.audit import log_audit
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
@@ -259,14 +265,43 @@ _CONNECTOR_CATALOG = [
     },
     {
         "connector_type": "csv",
-        "display_name": "CSV / File Upload",
+        "display_name": "CSV or Excel file",
         "category": "File",
         "icon_slug": "csv",
-        "description": "Upload a CSV file directly. Max 50 MB. Use POST /connections/upload.",
+        "description": (
+            "Upload CSV, TSV, or Excel (.xlsx / .xls). Excel workbooks import each sheet "
+            "as a separate table. Max 500 MB per file. Use POST /connections/upload "
+            "(single file) or POST /connections/upload/batch (multiple files)."
+        ),
         "fields": [],
         "upload_endpoint": "/api/v1/connections/upload",
+        "upload_accept": [".csv", ".tsv", ".xlsx", ".xls"],
     },
 ]
+
+_UPLOAD_EXTENSIONS_CSV = frozenset({".csv", ".tsv"})
+_UPLOAD_EXTENSIONS_EXCEL = frozenset({".xlsx", ".xls"})
+_UPLOAD_EXTENSIONS_ALLOWED = _UPLOAD_EXTENSIONS_CSV | _UPLOAD_EXTENSIONS_EXCEL
+
+
+def _upload_extension(filename: str | None) -> str:
+    if not filename or "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].lower()
+
+
+def _connector_type_for_upload(filename: str | None) -> tuple[str, str]:
+    """Return (connector_type, file_format) from the uploaded filename."""
+    ext = f".{_upload_extension(filename)}"
+    if ext in _UPLOAD_EXTENSIONS_EXCEL:
+        return "excel", "excel"
+    if ext in _UPLOAD_EXTENSIONS_CSV:
+        return "csv", "csv"
+    allowed = ", ".join(sorted(_UPLOAD_EXTENSIONS_ALLOWED))
+    raise bad_request(
+        "BAD_REQUEST",
+        f"Unsupported file type. Allowed: {allowed}",
+    )
 
 
 @router.get("/catalog")
@@ -398,24 +433,18 @@ async def list_connections(
     return [_connection_to_response(c) for c in conns]
 
 
-@router.post("/upload", response_model=ConnectionResponse, status_code=201)
-async def upload_connection_file(
-    file: UploadFile = File(...),
-    current_user: User = Depends(MANAGER_PLUS),
-    db: AsyncSession = Depends(get_db),
-) -> ConnectionResponse:
-    """Upload a CSV or spreadsheet file as a data source. Max file size: 50 MB.
-
-    Send as `multipart/form-data` with the file in the `file` field. The connection
-    is created with `status: "pending"` — further pipeline configuration is required
-    before the AI pipeline can use it.
-    """
-    await max_cloud_free_connections(db, current_user.org_id, await ConnectionRepository(db).count_active(current_user.org_id))
-    max_bytes = 50 * 1024 * 1024
+async def _stream_upload_to_disk(
+    file: UploadFile,
+    *,
+    org_id: UUID,
+    max_bytes: int = FILE_UPLOAD_MAX_BYTES,
+) -> tuple[str, str]:
+    """Persist an uploaded file under the org upload directory. Returns (dest_path, filename)."""
     storage_root = os.getenv("LOCAL_STORAGE_PATH", "/app/uploads")
-    upload_dir = os.path.join(storage_root, "csv_connections", str(current_user.org_id))
+    upload_dir = os.path.join(storage_root, "csv_connections", str(org_id))
     os.makedirs(upload_dir, exist_ok=True)
-    dest_name = f"{uuid_mod.uuid4()}_{file.filename or 'upload'}"
+    safe_name = os.path.basename(file.filename or "upload")
+    dest_name = f"{uuid_mod.uuid4()}_{safe_name}"
     dest_path = os.path.join(upload_dir, dest_name)
     size = 0
     try:
@@ -426,23 +455,51 @@ async def upload_connection_file(
                     break
                 size += len(chunk)
                 if size > max_bytes:
-                    raise payload_too_large("File too large")
+                    raise payload_too_large(
+                        f"File exceeds {max_bytes // (1024 * 1024)} MB limit"
+                    )
                 out.write(chunk)
     except PulseHTTPException:
         if os.path.isfile(dest_path):
             os.remove(dest_path)
         raise
+    except Exception:
+        if os.path.isfile(dest_path):
+            os.remove(dest_path)
+        raise
+    return dest_path, safe_name
+
+
+async def _create_connection_from_uploaded_file(
+    *,
+    db: AsyncSession,
+    org_id: UUID,
+    file: UploadFile,
+    connection_name: str | None = None,
+) -> ConnectionResponse:
+    """Save one file, create a connection, test it, and schedule schema mapping."""
+    connector_type, file_format = _connector_type_for_upload(file.filename)
+    await max_cloud_free_connections(
+        db,
+        org_id,
+        await ConnectionRepository(db).count_active(org_id),
+    )
+    dest_path, filename = await _stream_upload_to_disk(file, org_id=org_id)
+    display_name = (connection_name or "").strip() or filename or "Uploaded file"
+
     conn = await ConnectionRepository(db).create(
-        org_id=current_user.org_id,
-        name=file.filename or "Uploaded file",
-        connector_type="csv",
-        connection_meta={"kind": "csv"},
+        org_id=org_id,
+        name=display_name,
+        connector_type=connector_type,
+        connection_meta={"kind": connector_type},
     )
-    conn.config = {"upload_path": dest_path, "original_filename": file.filename}
+    conn.config = {
+        "upload_path": dest_path,
+        "original_filename": file.filename or filename,
+        "file_format": file_format,
+    }
     touch_updated_at(conn)
-    success, message, _db_version = await _test_and_mark_connection(
-        conn, db, current_user.org_id
-    )
+    success, message, _db_version = await _test_and_mark_connection(conn, db, org_id)
     await db.commit()
     await db.refresh(conn)
     if not success:
@@ -452,12 +509,89 @@ async def upload_connection_file(
             message=sanitize_connection_test_message(message),
             fields={"success": "false", "connection_id": str(conn.id)},
         )
-    await _schedule_schema_mapping_after_connection(
-        db,
-        org_id=current_user.org_id,
-        conn=conn,
-    )
+    await _schedule_schema_mapping_after_connection(db, org_id=org_id, conn=conn)
     return _connection_to_response(conn)
+
+
+@router.post("/upload", response_model=ConnectionResponse, status_code=201)
+async def upload_connection_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(MANAGER_PLUS),
+    db: AsyncSession = Depends(get_db),
+) -> ConnectionResponse:
+    """Upload one CSV, TSV, or Excel file as a data source (max 500 MB).
+
+    Excel workbooks (.xlsx / .xls) import each sheet as a separate table queryable in
+    Studio. For multiple files at once, use ``POST /connections/upload/batch``.
+    """
+    return await _create_connection_from_uploaded_file(
+        db=db,
+        org_id=current_user.org_id,
+        file=file,
+    )
+
+
+@router.post("/upload/batch", response_model=FileUploadBatchResponse, status_code=201)
+async def upload_connection_files_batch(
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(MANAGER_PLUS),
+    db: AsyncSession = Depends(get_db),
+) -> FileUploadBatchResponse:
+    """Upload multiple files — each becomes its own connection (max 500 MB per file).
+
+    Partial success is allowed: successfully created connections are returned alongside
+    per-file errors. Each file is independently testable and queryable in Studio.
+    """
+    if not files:
+        raise bad_request("BAD_REQUEST", "At least one file is required")
+    if len(files) > FILE_UPLOAD_MAX_FILES_PER_BATCH:
+        raise bad_request(
+            "BAD_REQUEST",
+            f"At most {FILE_UPLOAD_MAX_FILES_PER_BATCH} files per batch",
+        )
+
+    created: list[ConnectionResponse] = []
+    errors: list[FileUploadBatchError] = []
+
+    for upload in files:
+        label = upload.filename or "upload"
+        try:
+            conn = await _create_connection_from_uploaded_file(
+                db=db,
+                org_id=current_user.org_id,
+                file=upload,
+            )
+            created.append(conn)
+        except PulseHTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                message = str(detail.get("message") or exc)
+                code = detail.get("code")
+            else:
+                message = str(exc)
+                code = None
+            errors.append(
+                FileUploadBatchError(filename=label, message=message, code=code)
+            )
+        except Exception as exc:
+            logger.exception("Batch upload failed for %s", label)
+            errors.append(
+                FileUploadBatchError(
+                    filename=label,
+                    message=str(exc),
+                    code="UPLOAD_FAILED",
+                )
+            )
+
+    if not created and errors:
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="BATCH_UPLOAD_FAILED",
+            message=errors[0].message,
+            fields={"errors": [e.model_dump() for e in errors]},
+        )
+
+    return FileUploadBatchResponse(connections=created, errors=errors)
 
 
 @router.post("/test", response_model=TestConnectionResponse)

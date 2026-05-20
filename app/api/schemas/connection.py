@@ -23,6 +23,7 @@ _CONNECTOR_TYPES = frozenset(
         "s3",
         "gcs",
         "csv",
+        "excel",
     }
 )
 
@@ -172,6 +173,17 @@ class TestConnectionResponse(BaseModel):
     success: bool
     message: str
     db_version: str | None = None
+
+
+class FileUploadBatchError(BaseModel):
+    filename: str
+    message: str
+    code: str | None = None
+
+
+class FileUploadBatchResponse(BaseModel):
+    connections: list[ConnectionResponse]
+    errors: list[FileUploadBatchError] = Field(default_factory=list)
 
 
 class ColumnInfo(BaseModel):

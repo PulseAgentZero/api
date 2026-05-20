@@ -27,7 +27,8 @@ from app.services.studio_query_service import (
 
 logger = logging.getLogger(__name__)
 
-STUDIO_FILE_CONNECTOR_TYPES = frozenset({"csv", "google_sheets", "s3"})
+STUDIO_FILE_CONNECTOR_TYPES = frozenset({"csv", "excel", "google_sheets", "s3"})
+_MAX_EXCEL_SHEETS = 20
 _MAX_S3_CSV_FILES = 15
 _MAX_S3_BYTES_PER_FILE = 25 * 1024 * 1024
 _TABLE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
@@ -112,15 +113,86 @@ def _load_csv_upload(conn: Connection) -> dict[str, pd.DataFrame]:
     if not path:
         raise bad_request(
             "CONNECTION_ERROR",
-            "CSV connection has no uploaded file. Re-upload the file in Connections.",
+            "File connection has no uploaded file. Re-upload the file in Connections.",
         )
     filename = (conn.config or {}).get("original_filename") or "data.csv"
     tname = _sanitize_table_name(filename.rsplit(".", 1)[0])
+    is_tsv = filename.lower().endswith(".tsv")
     try:
-        df = pd.read_csv(path, nrows=_MAX_ROWS)
+        df = pd.read_csv(path, nrows=_MAX_ROWS, sep="\t" if is_tsv else ",")
     except Exception as exc:
-        raise bad_request("CLIENT_DB_ERROR", f"Could not read CSV file: {exc}") from exc
+        raise bad_request("CLIENT_DB_ERROR", f"Could not read file: {exc}") from exc
     return {tname: df}
+
+
+def _excel_engine_for_path(path: str, filename: str | None) -> str:
+    name = (filename or path).lower()
+    if name.endswith(".xls") and not name.endswith(".xlsx"):
+        return "xlrd"
+    return "openpyxl"
+
+
+def _load_excel_upload(conn: Connection) -> dict[str, pd.DataFrame]:
+    import zipfile
+
+    path = (conn.config or {}).get("upload_path")
+    if not path:
+        raise bad_request(
+            "CONNECTION_ERROR",
+            "Excel connection has no uploaded file. Re-upload the file in Connections.",
+        )
+    filename = (conn.config or {}).get("original_filename") or path
+    engine = _excel_engine_for_path(path, filename)
+
+    try:
+        workbook = pd.ExcelFile(path, engine=engine)
+    except zipfile.BadZipFile as exc:
+        raise bad_request(
+            "CLIENT_DB_ERROR",
+            "We couldn't read this workbook — make sure it's a valid Excel file.",
+        ) from exc
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "password" in msg or "encrypted" in msg:
+            raise bad_request(
+                "CLIENT_DB_ERROR",
+                "Workbook is password-protected. Save an unprotected copy and re-upload.",
+            ) from exc
+        raise bad_request(
+            "CLIENT_DB_ERROR",
+            f"Could not open Excel file: {exc}",
+        ) from exc
+
+    frames: dict[str, pd.DataFrame] = {}
+    for sheet_name in workbook.sheet_names[:_MAX_EXCEL_SHEETS]:
+        try:
+            df = pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+                nrows=_MAX_ROWS,
+                engine=engine,
+            )
+        except Exception as exc:
+            logger.warning("Skip sheet %s: %s", sheet_name, exc)
+            continue
+
+        if df.empty and len(df.columns) == 0:
+            continue
+
+        # Drop sheets with no usable header row
+        if len(df.columns) == 0 or all(str(c).startswith("Unnamed") for c in df.columns):
+            if df.empty:
+                continue
+
+        tname = _sanitize_table_name(str(sheet_name), fallback="sheet")
+        if tname in frames:
+            tname = f"{tname}_{len(frames)}"
+        frames[tname] = df
+
+    if not frames:
+        raise bad_request("CLIENT_DB_ERROR", "No readable sheets in workbook")
+
+    return frames
 
 
 async def _fetch_google_sheets_frames(
@@ -238,6 +310,8 @@ async def load_file_source_frames(conn: Connection) -> dict[str, pd.DataFrame]:
     ct = conn.connector_type or ""
     if ct == "csv":
         return await asyncio.to_thread(_load_csv_upload, conn)
+    if ct == "excel":
+        return await asyncio.to_thread(_load_excel_upload, conn)
     if ct == "google_sheets":
         if not conn.encrypted_dsn:
             raise bad_request("CONNECTION_ERROR", "Google Sheets credentials missing")

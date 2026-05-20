@@ -72,7 +72,13 @@ CONNECTOR_REGISTRY: dict[str, ConnectorSpec] = {
         "google-cloud-storage",
         "Bucket access for Parquet/CSV objects.",
     ),
-    "csv": ConnectorSpec("csv", "File upload", "temp file + parser", "Existing upload flow."),
+    "csv": ConnectorSpec("csv", "File upload", "temp file + parser", "CSV/TSV upload; queryable in Studio."),
+    "excel": ConnectorSpec(
+        "excel",
+        "File upload",
+        "openpyxl / xlrd + pandas",
+        "Excel workbook; each sheet is a Studio table.",
+    ),
     "airtable": ConnectorSpec("airtable", "PAT / OAuth", "Airtable REST (httpx)", ""),
     "mongodb": ConnectorSpec("mongodb", "URI", "motor (async)", "Read-only usage via find/aggregate in future agents."),
     "databricks": ConnectorSpec(
