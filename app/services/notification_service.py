@@ -207,6 +207,39 @@ async def notify_payment_failed(
     )
 
 
+async def notify_member_joined(
+    db: AsyncSession,
+    org_id: UUID,
+    *,
+    user_id: UUID,
+    user_name: str | None,
+    user_email: str,
+    role: str,
+) -> int:
+    """Notify admins and managers when someone accepts an invitation (not the joiner)."""
+    name = (user_name or "").strip() or user_email
+    result = await db.execute(
+        select(User.id).where(
+            User.org_id == org_id,
+            User.is_active.is_(True),
+            User.role.in_(ADMIN_MANAGER_ROLES),
+            User.id != user_id,
+        )
+    )
+    recipient_ids = [row[0] for row in result.all()]
+    return await notify_users(
+        db,
+        org_id,
+        recipient_ids,
+        title=f"{name} joined your team",
+        body=f"{user_email} joined as {role}.",
+        type="info",
+        source="user",
+        source_id=user_id,
+        action_url=dashboard_url("/dashboard/team"),
+    )
+
+
 async def notify_connection_test_failed(
     db: AsyncSession,
     org_id: UUID,

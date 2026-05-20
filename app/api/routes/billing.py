@@ -68,6 +68,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
+
+MANAGER_PLUS = require_role("admin", "manager")
 from app.api.errors import bad_request, not_found
 from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
@@ -267,7 +270,7 @@ class SelfHostedVerifyResponse(BaseModel):
 )
 async def initialize_payment(
     body: InitializePaymentRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     _require_cloud()
@@ -331,7 +334,7 @@ async def initialize_payment(
 )
 async def verify_payment(
     reference: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     _require_cloud()
@@ -404,7 +407,7 @@ async def verify_payment(
     ),
 )
 async def get_subscription(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     _require_cloud()
@@ -423,7 +426,7 @@ async def get_subscription(
     ),
 )
 async def get_subscription_manage_link(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     _require_cloud()
@@ -466,7 +469,7 @@ async def get_subscription_manage_link(
     ),
 )
 async def cancel_subscription(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     _require_cloud()

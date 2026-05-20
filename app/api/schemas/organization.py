@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class MemberSettingsRequest(BaseModel):
-    """Updatable by any org member (business context + product tour state)."""
+    """Product tour state for any member; org context fields require manager/admin."""
 
     industry: str | None = Field(None, max_length=100)
     business_context: str | None = Field(None, max_length=20_000)

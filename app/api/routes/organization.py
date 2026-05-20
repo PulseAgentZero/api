@@ -36,6 +36,11 @@ router = APIRouter(prefix="/organization", tags=["Organization"])
 AssetCategory = Literal["profile", "logo", "data", "csv", "attachment"]
 
 _MEMBER_FIELDS = ("industry", "business_context", "entity_label", "goal_label")
+MANAGER_PLUS = require_role("admin", "manager")
+
+
+def _can_manage_org_settings(user: User) -> bool:
+    return user.role in {"admin", "manager"}
 
 
 def _merge_tour_guide(existing: dict[str, Any] | None, patch: dict[str, Any] | None) -> dict[str, Any]:
@@ -103,7 +108,7 @@ async def patch_member_settings(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> OrgProfileResponse:
-    """Update business context or tour state — any org member."""
+    """Update member UI state, and org context for managers/admins only."""
     payload = body.model_dump(exclude_unset=True)
     if not payload:
         raise bad_request("BAD_REQUEST", "No fields provided")
@@ -112,6 +117,12 @@ async def patch_member_settings(
         raise not_found("Organization not found")
 
     tour_patch = payload.pop("tour_guide", None)
+    context_updated = any(key in payload for key in _MEMBER_FIELDS)
+    if context_updated and not _can_manage_org_settings(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins and managers can update organization context",
+        )
     for key in _MEMBER_FIELDS:
         if key in payload:
             setattr(org, key, payload[key])
@@ -121,7 +132,7 @@ async def patch_member_settings(
     await db.commit()
     await db.refresh(org)
 
-    if not org.onboarding_done and (org.business_context or "").strip():
+    if context_updated and not org.onboarding_done and (org.business_context or "").strip():
         try:
             await try_auto_complete_setup(
                 db, current_user.org_id, completed_by=current_user.id
@@ -190,7 +201,7 @@ async def confirm_org_delete(
 
 @router.post("/complete-setup", response_model=CompleteSetupResponse)
 async def post_complete_setup(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> CompleteSetupResponse:
     """Finalize org setup and trigger the first pipeline run when ready."""
@@ -256,7 +267,7 @@ async def export_organization_data(
 async def upload_organization_asset(
     category: AssetCategory = Form(..., description="profile | logo | data | csv | attachment"),
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
 ) -> AssetUploadResponse:
     """Upload a file using the configured storage backend (S3, MinIO, or local filesystem)."""
     max_bytes = 50 * 1024 * 1024

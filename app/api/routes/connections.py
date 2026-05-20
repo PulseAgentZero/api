@@ -11,6 +11,9 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
+
+MANAGER_PLUS = require_role("admin", "manager")
 from app.api.dependencies.plan_gate import max_cloud_free_connections
 from app.api.errors import (
     PulseHTTPException,
@@ -390,7 +393,7 @@ async def list_connections(
 @router.post("/upload", response_model=ConnectionResponse, status_code=201)
 async def upload_connection_file(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     """Upload a CSV or spreadsheet file as a data source. Max file size: 50 MB.
@@ -401,7 +404,8 @@ async def upload_connection_file(
     """
     await max_cloud_free_connections(db, current_user.org_id, await ConnectionRepository(db).count_active(current_user.org_id))
     max_bytes = 50 * 1024 * 1024
-    upload_dir = f"/tmp/pulse_uploads/{current_user.org_id}"
+    storage_root = os.getenv("LOCAL_STORAGE_PATH", "/app/uploads")
+    upload_dir = os.path.join(storage_root, "csv_connections", str(current_user.org_id))
     os.makedirs(upload_dir, exist_ok=True)
     dest_name = f"{uuid_mod.uuid4()}_{file.filename or 'upload'}"
     dest_path = os.path.join(upload_dir, dest_name)
@@ -450,7 +454,7 @@ async def upload_connection_file(
 
 @router.post("/test", response_model=TestConnectionResponse)
 async def test_current_connection(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> TestConnectionResponse:
     """Test the org's most recent connection. Returns 422 if the test fails.
@@ -477,7 +481,7 @@ async def test_current_connection(
 @router.put("", response_model=ConnectionResponse)
 async def update_current_connection(
     body: UpdateConnectionRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     conn = await _get_current_connection(db, current_user.org_id)
@@ -487,7 +491,7 @@ async def update_current_connection(
 
 @router.delete("", status_code=204)
 async def delete_current_connection(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ):
     conn = await _get_current_connection(db, current_user.org_id)
@@ -575,7 +579,7 @@ async def get_connection(
 @router.post("", response_model=ConnectionResponse, status_code=201)
 async def create_connection(
     body: CreateConnectionRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     """Create and immediately test a new data source connection.
@@ -631,7 +635,7 @@ async def create_connection(
 async def update_connection(
     connection_id: str,
     body: UpdateConnectionRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
@@ -753,7 +757,7 @@ async def _update_connection_record(
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ):
     connection_uuid = _parse_uuid(connection_id, "connection_id")
@@ -778,7 +782,7 @@ async def delete_connection(
 @router.post("/{connection_id}/test", response_model=TestConnectionResponse)
 async def test_db_connection(
     connection_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> TestConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
@@ -805,7 +809,7 @@ async def test_db_connection(
 @router.post("/{connection_id}/introspect", response_model=IntrospectResponse)
 async def introspect_db_schema(
     connection_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> IntrospectResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))

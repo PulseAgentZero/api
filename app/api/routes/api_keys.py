@@ -32,7 +32,7 @@ class ApiKeyCreate(BaseModel):
 
 @router.get("")
 async def list_api_keys(
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     result = await db.execute(
@@ -61,7 +61,7 @@ async def list_api_keys(
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_api_key(
     body: ApiKeyCreate,
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     await check_api_key_limit(db, current_user.org_id)
@@ -105,7 +105,7 @@ async def create_api_key(
 @router.delete("/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_api_key(
     key_id: UUID,
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "manager")),
     db: AsyncSession = Depends(get_db),
 ):
     row = await db.get(ApiKey, key_id)

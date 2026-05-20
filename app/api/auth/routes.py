@@ -55,6 +55,7 @@ from app.infrastructure.database.repositories.user_repository import UserReposit
 from app.infrastructure.audit import log_audit, request_audit_context
 from app.infrastructure.database.session import get_db
 from app.services.email_queue import queue_email
+from app.services.notification_service import notify_member_joined
 from app.infrastructure.redis import keys as redis_keys
 from app.infrastructure.redis.client import get_redis
 from app.infrastructure.redis import tokens as redis_tokens
@@ -560,6 +561,14 @@ async def _oauth_accept_invite_redirect(
         resource_id=inv.id,
         metadata={"email": user.email, "role": user.role, "auth_provider": "google"},
     )
+    await notify_member_joined(
+        db,
+        inv.org_id,
+        user_id=user.id,
+        user_name=user.full_name,
+        user_email=user.email,
+        role=user.role,
+    )
     await db.commit()
     await db.refresh(user)
     return await _oauth_post_auth_redirect(user, dest, db)
@@ -935,6 +944,14 @@ async def accept_invite(
         resource="invitation",
         resource_id=inv.id,
         metadata={"email": user.email, "role": user.role},
+    )
+    await notify_member_joined(
+        db,
+        inv.org_id,
+        user_id=user.id,
+        user_name=user.full_name,
+        user_email=user.email,
+        role=user.role,
     )
     await db.commit()
     await db.refresh(user)
