@@ -444,6 +444,7 @@ async def verify_payment(
         to=current_user.email,
         org_name=org_display,
         next_payment_date=next_date,
+        plan=tier,
     )
 
     return await _subscription_payload(db, sub)
@@ -553,6 +554,20 @@ async def cancel_subscription(
     await db.commit()
     await db.refresh(sub)
 
+    access_until = (
+        sub.next_payment_date.strftime("%B %d, %Y")
+        if sub.next_payment_date
+        else "the end of your current billing period"
+    )
+    org_display = await _org_name(db, sub.org_id)
+    await queue_email(
+        "subscription_cancelled",
+        to=current_user.email,
+        org_name=org_display,
+        access_until=access_until,
+        plan=sub.plan,
+    )
+
     return await _subscription_payload(db, sub)
 
 
@@ -649,6 +664,7 @@ async def _on_charge_success(db: AsyncSession, data: dict) -> None:
                     to=email,
                     org_name=org,
                     next_payment_date=next_date,
+                    plan=sub.plan,
                 )
 
 
@@ -699,6 +715,7 @@ async def _on_subscription_create(db: AsyncSession, data: dict) -> None:
             to=email,
             org_name=org_display,
             next_payment_date=next_date,
+            plan=tier,
         )
 
 
@@ -742,7 +759,7 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
     email = await _org_admin_email(db, sub.org_id)
     org = await _org_name(db, sub.org_id)
     if email:
-        await queue_email("subscription_failed", to=email, org_name=org)
+        await queue_email("subscription_failed", to=email, org_name=org, plan=sub.plan)
     try:
         from app.services.notification_service import notify_payment_failed
 

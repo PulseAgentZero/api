@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Your {{ plan_label }} subscription has been cancelled</h1>
+<p>Hi {{ org_name }},</p>
+<p>
+  We've turned off auto-renewal for your <strong>{{ plan_label }} plan</strong>.
+  You'll keep full {{ plan_label }} access until your current billing period ends, and
+  then your workspace will move to the <strong>Free plan</strong>. No further
+  charges will be made.
+</p>
+
+<table style="width:100%;background:#f6f8fb;border-radius:8px;padding:20px;margin:0 0 24px;border-collapse:collapse;">
+  <tr>
+    <td style="font-size:13px;color:#6b7280;padding:4px 0;">Current plan</td>
+    <td style="font-size:13px;font-weight:600;color:#1a1a2e;text-align:right;">{{ plan_label }}</td>
+  </tr>
+  <tr>
+    <td style="font-size:13px;color:#6b7280;padding:4px 0;">Access until</td>
+    <td style="font-size:13px;font-weight:600;color:#1a1a2e;text-align:right;">{{ access_until }}</td>
+  </tr>
+  <tr>
+    <td style="font-size:13px;color:#6b7280;padding:4px 0;">Then moves to</td>
+    <td style="font-size:13px;font-weight:600;color:#1a1a2e;text-align:right;">Free</td>
+  </tr>
+</table>
+
+<a href="{{ dashboard_url }}" class="btn">Manage Plan</a>
+
+<hr class="divider" />
+<p style="font-size:14px;color:#4b5563;">
+  Changed your mind? You can re-subscribe at any time from Plan &amp; billing —
+  pick up right where you left off.
+</p>
+<p class="fallback">
+  Questions? Reply to this email or visit our support page.
+</p>
+{% endblock %}

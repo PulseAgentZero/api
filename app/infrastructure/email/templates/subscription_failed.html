@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Payment failed for your Pro subscription</h1>
+<h1>Payment failed for your {{ plan_label }} subscription</h1>
 <p>Hi {{ org_name }},</p>
 <p>
-  We were unable to charge your card for your <strong>Pro plan</strong> renewal.
+  We were unable to charge your card for your <strong>{{ plan_label }} plan</strong> renewal.
   Your subscription is still active for now, but please update your payment method
-  to avoid losing access to Pro features.
+  to avoid losing access to {{ plan_label }} features.
 </p>
 
 <a href="{{ manage_url }}" class="btn">Update Payment Method</a>

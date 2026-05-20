@@ -76,6 +76,7 @@ async def _send_renewal_reminders() -> None:
                     to=admin_row[0],
                     org_name=org_name,
                     renewal_date=renewal_date,
+                    plan=sub.plan,
                 )
                 logger.info("Renewal reminder sent to %s (org %s)", admin_row[0], sub.org_id)
 

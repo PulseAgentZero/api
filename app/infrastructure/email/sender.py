@@ -199,39 +199,103 @@ async def send_invitation_email(to: str, token: str, invited_by: str, org_name: 
     await _send(to=to, subject=f"You've been invited to join {org_name} on Entivia", html=html)
 
 
-async def send_subscription_success_email(to: str, org_name: str, next_payment_date: str) -> None:
+_DEFAULT_PLAN_LABEL = "Pro"
+
+
+def _plan_label(plan: str | None) -> str:
+    """Human-readable plan name used in billing emails."""
+    if not plan:
+        return _DEFAULT_PLAN_LABEL
+    normalized = plan.strip().lower()
+    if not normalized or normalized in {"free", "inactive"}:
+        return _DEFAULT_PLAN_LABEL
+    return normalized.title()
+
+
+async def send_subscription_success_email(
+    to: str,
+    org_name: str,
+    next_payment_date: str,
+    plan: str | None = None,
+) -> None:
     dashboard_url = f"{settings.FRONTEND_URL.rstrip('/')}/dashboard"
+    plan_label = _plan_label(plan)
     html = _render(
         "subscription_success.html",
-        subject="You're now on Entivia Pro",
+        subject=f"You're now on Entivia {plan_label}",
         org_name=org_name,
         next_payment_date=next_payment_date,
         dashboard_url=dashboard_url,
+        plan_label=plan_label,
     )
-    await _send(to=to, subject="You're now on Entivia Pro 🎉", html=html)
+    await _send(to=to, subject=f"You're now on Entivia {plan_label} 🎉", html=html)
 
 
-async def send_subscription_failed_email(to: str, org_name: str) -> None:
+async def send_subscription_failed_email(
+    to: str,
+    org_name: str,
+    plan: str | None = None,
+) -> None:
     manage_url = f"{settings.FRONTEND_URL.rstrip('/')}/settings/billing"
+    plan_label = _plan_label(plan)
     html = _render(
         "subscription_failed.html",
-        subject="Payment failed for your Pro subscription",
+        subject=f"Payment failed for your {plan_label} subscription",
         org_name=org_name,
         manage_url=manage_url,
+        plan_label=plan_label,
     )
-    await _send(to=to, subject="Action required: Entivia Pro payment failed", html=html)
+    await _send(
+        to=to,
+        subject=f"Action required: Entivia {plan_label} payment failed",
+        html=html,
+    )
 
 
-async def send_subscription_renewal_reminder_email(to: str, org_name: str, renewal_date: str) -> None:
+async def send_subscription_cancelled_email(
+    to: str,
+    org_name: str,
+    access_until: str,
+    plan: str | None = None,
+) -> None:
+    dashboard_url = f"{settings.FRONTEND_URL.rstrip('/')}/dashboard/plan"
+    plan_label = _plan_label(plan)
+    html = _render(
+        "subscription_cancelled.html",
+        subject=f"Your Entivia {plan_label} subscription has been cancelled",
+        org_name=org_name,
+        access_until=access_until,
+        dashboard_url=dashboard_url,
+        plan_label=plan_label,
+    )
+    await _send(
+        to=to,
+        subject=f"Your Entivia {plan_label} subscription has been cancelled",
+        html=html,
+    )
+
+
+async def send_subscription_renewal_reminder_email(
+    to: str,
+    org_name: str,
+    renewal_date: str,
+    plan: str | None = None,
+) -> None:
     manage_url = f"{settings.FRONTEND_URL.rstrip('/')}/settings/billing"
+    plan_label = _plan_label(plan)
     html = _render(
         "subscription_renewal_reminder.html",
-        subject="Your Entivia Pro subscription renews tomorrow",
+        subject=f"Your Entivia {plan_label} subscription renews tomorrow",
         org_name=org_name,
         renewal_date=renewal_date,
         manage_url=manage_url,
+        plan_label=plan_label,
     )
-    await _send(to=to, subject="Reminder: Your Entivia Pro subscription renews tomorrow", html=html)
+    await _send(
+        to=to,
+        subject=f"Reminder: Your Entivia {plan_label} subscription renews tomorrow",
+        html=html,
+    )
 
 
 async def send_org_delete_confirm_email(

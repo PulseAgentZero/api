@@ -20,6 +20,7 @@ async def dispatch_email_job(data: dict[str, Any]) -> None:
         send_invitation_email,
         send_license_key_email,
         send_password_reset_email,
+        send_subscription_cancelled_email,
         send_subscription_failed_email,
         send_subscription_renewal_reminder_email,
         send_subscription_success_email,
@@ -50,12 +51,31 @@ async def dispatch_email_job(data: dict[str, Any]) -> None:
                 role=data.get("role", "member"),
             )
         elif email_type == "subscription_success":
-            await send_subscription_success_email(to, data["org_name"], data["next_payment_date"])
+            await send_subscription_success_email(
+                to,
+                data["org_name"],
+                data["next_payment_date"],
+                plan=data.get("plan"),
+            )
         elif email_type == "subscription_failed":
-            await send_subscription_failed_email(to, data["org_name"])
+            await send_subscription_failed_email(
+                to,
+                data["org_name"],
+                plan=data.get("plan"),
+            )
         elif email_type == "subscription_renewal_reminder":
             await send_subscription_renewal_reminder_email(
-                to, data["org_name"], data["renewal_date"]
+                to,
+                data["org_name"],
+                data["renewal_date"],
+                plan=data.get("plan"),
+            )
+        elif email_type == "subscription_cancelled":
+            await send_subscription_cancelled_email(
+                to,
+                data["org_name"],
+                data["access_until"],
+                plan=data.get("plan"),
             )
         elif email_type == "org_delete_confirm":
             await send_org_delete_confirm_email(
