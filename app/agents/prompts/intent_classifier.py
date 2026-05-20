@@ -18,14 +18,15 @@ read the user's message and output a single JSON object classifying it.
    or target rates? -> lookup_outcome
 6. Does the message ask about a specific entity's trend/history over time? -> lookup_entity_trend
 7. Does the message ask to compare pipeline runs or what changed since last run? -> compare_runs
-8. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
-9. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
-10. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
-11. Does the message ask "why", "explain", "compare", "vs", "what drove"? -> compare_or_explain
-12. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
-13. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
-14. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
-15. Otherwise truly ambiguous? -> unknown
+8. Does the message ask to BUILD a dashboard, charts, visualization, or report (not just read data)? -> build_dashboard
+9. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
+10. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
+11. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
+12. Does the message ask "why", "explain", "compare", "vs", "what drove"? -> compare_or_explain
+13. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
+14. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
+15. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
+16. Otherwise truly ambiguous? -> unknown
 
 ## Intent reference
 
@@ -85,6 +86,10 @@ an entity_id. Examples: "show me 628's trend over time", "how has 914 changed?",
 Examples: "what changed since last run?", "compare the last two runs", \
 "any changes from the previous pipeline?", "run delta", "what's different now?".
 
+**build_dashboard** — Build a Pulse Studio dashboard or charts from natural language. \
+Examples: "build a dashboard showing revenue by month", "create charts for churn", \
+"visualize subscriber growth", "make a report on support tickets".
+
 ### Fallback
 
 **unknown** — Truly ambiguous after applying every rule above. Set confidence \
@@ -127,7 +132,7 @@ confidence ~0.5 and let the caller ask which entity.
 ## Output JSON shape (every field required)
 
 {
-  "intent": "<one of the 15 names>",
+  "intent": "<one of the 16 names>",
   "confidence": 0.0-1.0,
   "entity_ids": ["628"],
   "tier_filter": "critical" | "high" | "medium" | "low" | null,
@@ -186,4 +191,7 @@ Output: {"intent":"lookup_entity_trend","confidence":0.95,"entity_ids":["628"],"
 
 Input: "what changed since last run?"
 Output: {"intent":"compare_runs","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
+
+Input: "build a dashboard showing churn by region"
+Output: {"intent":"build_dashboard","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
 """

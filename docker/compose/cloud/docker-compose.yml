@@ -17,6 +17,11 @@
 #   docker compose up                          start everything
 #   docker compose up --scale worker=4        run 4 pipeline workers
 #   docker compose up api worker              start only api + worker
+#
+# Nginx upstream DNS (reverse-proxy_nginx-network aliases):
+#   api      → pulse-api
+#   license  → pulse-license
+#   dashboard frontend (dashboard repo compose) → pulse-frontend
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-app: &app
@@ -30,11 +35,23 @@ x-app: &app
     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
     REDIS_URL: redis://redis:6379/0
     DEPLOYMENT_MODE: cloud
+    # Local file storage path — shared named volume so api + worker see the same files.
+    # Ignored when STORAGE_BACKEND=s3 or minio.
+    # The pulse-cloud entrypoint chowns this path to uid 1001 on startup (see docker-entrypoint.sh).
+    LOCAL_STORAGE_PATH: /app/uploads
   volumes:
     - ../../../app:/app/app
+    # Persists uploaded files (avatars, logos, CSVs) across container restarts.
+    # Only used when STORAGE_BACKEND=local (the default when S3/MinIO are not configured).
+    # Switch to STORAGE_BACKEND=s3 or minio for production multi-replica deployments.
+    - uploads_data:/app/uploads
     - ../../../logs:/app/logs
   networks:
     - pulse
+    - reverse-proxy_nginx-network 
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
   restart: unless-stopped
   depends_on:
     postgres:
@@ -55,10 +72,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-pulse}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5442}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
+      - reverse-proxy_nginx-network 
       - pulse
     restart: unless-stopped
     healthcheck:
@@ -89,9 +107,6 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
-    ports:
-      - "${QDRANT_HTTP_PORT:-6333}:6333"
-      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
@@ -108,6 +123,11 @@ services:
 
   api:
     <<: *app
+    networks:
+      pulse:
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-api
     command: api
     environment:
       PULSE_SERVICE: api
@@ -115,11 +135,13 @@ services:
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       DEPLOYMENT_MODE: cloud
+      # License: cloud orgs do not activate licenses. Set LICENSE_SERVER_URL in .env only
+      # if you run the `license` service and sell self-hosted keys via Paystack billing.
       API_WORKERS: ${API_WORKERS:-2}
       # Internal URL so api can proxy /agent/* requests to the agent service
       AGENT_SERVICE_URL: http://agent:8001
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_PORT:-8040}:8000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 20s
@@ -147,11 +169,11 @@ services:
         condition: service_started    # wait for migrations
     # docker compose up --scale worker=4
     healthcheck:
-      test: ["CMD", "python", "-c", "import app.worker; print('ok')"]
+      test: ["CMD", "python", "scripts/docker/redis_healthcheck.py"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 30s
 
   agent:
     <<: *app
@@ -201,7 +223,7 @@ services:
         condition: service_started
     # Scheduler is a background job process — no HTTP port, no HTTP health check
     healthcheck:
-      test: ["CMD", "python", "-c", "import app.services.schedulers.pipeline_scheduler; print('ok')"]
+      test: ["CMD", "python", "scripts/docker/redis_healthcheck.py"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -209,32 +231,9 @@ services:
     deploy:
       replicas: 1               # always exactly one scheduler
 
-  # frontend:
-  #   # Pulse dashboard — Next.js standalone.
-  #   # NEXT_PUBLIC_API_URL is baked in at build time, so rebuild when the API URL changes.
-  #   build:
-  #     context: ../../../../dashboard
-  #     dockerfile: Dockerfile
-  #     args:
-  #       NEXT_PUBLIC_API_URL: ${FRONTEND_API_URL:-http://localhost:8000}
-  #       NEXT_PUBLIC_DEPLOYMENT_MODE: cloud
-  #   image: pulseai/pulse-frontend:${IMAGE_TAG:-latest}
-  #   ports:
-  #     - "${FRONTEND_PORT:-3000}:3000"
-  #   environment:
-  #     NODE_ENV: production
-  #   networks:
-  #     - pulse
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ || exit 1"]
-  #     interval: 30s
-  #     timeout: 5s
-  #     retries: 3
-  #     start_period: 15s
-
   license:
     # Internal license validation server — not exposed publicly.
+    # Self-hosted instances reach it via public URL (e.g. https://license.pulseai.io).
     build:
       context: ../../..
       dockerfile: docker/images/pulse-license/Dockerfile
@@ -243,10 +242,17 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
       PORT: "8002"
+      LICENSE_JWT_ISSUER: ${LICENSE_JWT_ISSUER:-https://license.pulseai.io}
+      LICENSE_SIGNING_PRIVATE_KEY: ${LICENSE_SIGNING_PRIVATE_KEY:-}
+      LICENSE_SERVER_API_KEY: ${LICENSE_SERVER_API_KEY:-}
+      PULSE_LICENSE_PUBLIC_KEY: ${PULSE_LICENSE_PUBLIC_KEY:-}
     ports:
-      - "${LICENSE_PORT:-8002}:8002"
+      - "${LICENSE_PORT:-8072}:8002"
     networks:
-      - pulse
+      pulse:
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-license
     depends_on:
       postgres:
         condition: service_healthy
@@ -264,8 +270,11 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  uploads_data:    # local asset storage — avatars, logos, CSVs (swap for S3/MinIO in production)
   qdrant_data:
 
 networks:
   pulse:
     driver: bridge
+  reverse-proxy_nginx-network:
+    external: true

@@ -12,7 +12,7 @@ import re
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.tools.base import Tool, ToolParam
@@ -24,6 +24,7 @@ from app.agents.tools.client_db import (
     validate_identifier,
 )
 from app.infrastructure.database.client_queries import ClientDBError, get_schema_mapping
+from app.infrastructure.database.models.connection import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -81,17 +82,6 @@ def _validate_where_clause(where: str | None) -> str | None:
 
 # ─── Audit logging ──────────────────────────────────────────────────────
 
-async def _fetch_table_columns(
-    client_conn: Any, db_type: str, table_name: str
-) -> list[str]:
-    """Return column names for a table from information_schema."""
-    cols_result = await client_conn.execute(
-        text(schema_columns_sql(db_type)),
-        {"tname": table_name},
-    )
-    return [row[0] for row in cols_result.all()]
-
-
 def _log_client_access(
     org_id: UUID,
     table: str,
@@ -116,6 +106,34 @@ def _log_client_access(
 def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     """Build the set of query tools available to autonomous agents."""
 
+    async def _mapped_connection(mapping) -> Connection:
+        result = await db.execute(
+            select(Connection).where(
+                Connection.id == mapping.connection_id,
+                Connection.org_id == org_id,
+                Connection.deleted_at.is_(None),
+            )
+        )
+        conn = result.scalar_one_or_none()
+        if not conn:
+            raise ClientDBError("Mapped connection is missing or has been deleted")
+        return conn
+
+    async def _is_file_connection(conn: Connection) -> bool:
+        from app.services.studio_file_source_service import supports_studio_file_queries
+
+        return supports_studio_file_queries(conn)
+
+    async def _execute_file_select(
+        conn: Connection,
+        sql: str,
+        *,
+        page_size: int = 500,
+    ) -> dict[str, Any]:
+        from app.services.studio_file_source_service import execute_file_source_query
+
+        return await execute_file_source_query(conn, sql, page=1, page_size=page_size)
+
     async def query_entity_table(
         columns: str = "*",
         limit: int | str = 100,
@@ -125,10 +143,30 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         limit = _coerce_limit(limit)
         where = _validate_where_clause(where)
         mapping = await get_schema_mapping(db, org_id)
-        engine, conn = await open_client_engine(db, org_id)
+        conn = await _mapped_connection(mapping)
+        table = validate_identifier(mapping.entity_table, "entity table")
+        if await _is_file_connection(conn):
+            if not columns or columns.strip() == "*":
+                col_list = "*"
+            else:
+                col_names = [
+                    validate_identifier(c.strip(), "column")
+                    for c in columns.split(",")
+                    if c.strip() and c.strip() != "*"
+                ]
+                col_list = ", ".join(f'"{c}"' for c in col_names)
+            sql = f'SELECT {col_list} FROM "{table}"'
+            if where:
+                sql += f" WHERE {where}"
+            sql += f" LIMIT {limit}"
+            result = await _execute_file_select(conn, sql, page_size=limit)
+            rows = result.get("rows", [])
+            _log_client_access(org_id, table, "query_entity_table", len(rows), columns)
+            return {"rows": rows, "count": len(rows), "table": table}
+
+        engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
         try:
             async with safe_client_connection(engine, conn) as client_conn:
-                table = validate_identifier(mapping.entity_table, "entity table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
                 if not columns or columns.strip() == "*":
@@ -175,69 +213,47 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         """Query any table in the client database for cross-table analysis (READ-ONLY)."""
         limit = _coerce_limit(limit)
         where = _validate_where_clause(where)
-        engine, conn = await open_client_engine(db, org_id)
+        mapping = await get_schema_mapping(db, org_id)
+        conn = await _mapped_connection(mapping)
+        table = validate_identifier(table_name, "table")
+        if await _is_file_connection(conn):
+            if not columns or columns.strip() == "*":
+                col_list = "*"
+            else:
+                col_names = [
+                    validate_identifier(c.strip(), "column")
+                    for c in columns.split(",")
+                    if c.strip() and c.strip() != "*"
+                ]
+                col_list = ", ".join(f'"{c}"' for c in col_names)
+            sql = f'SELECT {col_list} FROM "{table}"'
+            if where:
+                sql += f" WHERE {where}"
+            sql += f" LIMIT {limit}"
+            result = await _execute_file_select(conn, sql, page_size=limit)
+            rows = result.get("rows", [])
+            _log_client_access(org_id, table, "query_related_table", len(rows), columns)
+            return {"rows": rows, "count": len(rows), "table": table}
+
+        engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
         try:
             async with safe_client_connection(engine, conn) as client_conn:
-                table = validate_identifier(table_name, "table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
-                available_columns = await _fetch_table_columns(
-                    client_conn, conn.db_type, table
-                )
-                if not available_columns:
-                    return {
-                        "error": f"Table '{table}' not found",
-                        "hint": "Call list_tables and use an exact table name from the result.",
-                    }
-
                 if not columns or columns.strip() == "*":
-                    col_names = available_columns
-                else:
-                    col_names = []
-                    missing: list[str] = []
-                    for raw in columns.split(","):
-                        name = raw.strip()
-                        if not name or name == "*":
-                            continue
-                        try:
-                            col = validate_identifier(name, "column")
-                        except ClientDBError as exc:
-                            return {"error": str(exc), "table": table}
-                        if col not in available_columns:
-                            missing.append(col)
-                        else:
-                            col_names.append(col)
-                    if missing:
-                        err: dict[str, Any] = {
-                            "error": (
-                                f"Column(s) {missing} do not exist on table '{table}'"
-                            ),
-                            "table": table,
-                            "missing_columns": missing,
-                            "available_columns": available_columns,
-                        }
-                        try:
-                            mapping = await get_schema_mapping(db, org_id)
-                            entity_cols = await _fetch_table_columns(
-                                client_conn,
-                                conn.db_type,
-                                mapping.entity_table,
-                            )
-                            if any(c in entity_cols for c in missing):
-                                err["hint"] = (
-                                    f"Column(s) exist on entity table "
-                                    f"'{mapping.entity_table}'; use "
-                                    "query_entity_table instead."
-                                )
-                        except Exception:
-                            pass
-                        return err
+                    cols_result = await client_conn.execute(
+                        text(schema_columns_sql(conn.db_type)),
+                        {"tname": table_name},
+                    )
+                    col_names = [r[0] for r in cols_result.all()]
                     if not col_names:
-                        return {
-                            "error": "No valid columns specified",
-                            "table": table,
-                            "available_columns": available_columns,
-                        }
+                        return {"error": f"Table '{table_name}' not found"}
+                else:
+                    col_names = [
+                        validate_identifier(c.strip(), "column")
+                        for c in columns.split(",")
+                        if c.strip() and c.strip() != "*"
+                    ]
 
                 quoted_cols = [quote_identifier(c, conn.db_type) for c in col_names]
                 sql = f"SELECT {', '.join(quoted_cols) or '*'} FROM {quoted_table}"
@@ -270,81 +286,56 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
     ) -> dict[str, Any]:
         """Run an aggregate query (COUNT, SUM, AVG, MIN, MAX) on the client database (READ-ONLY)."""
         where = _validate_where_clause(where)
-        engine, conn = await open_client_engine(db, org_id)
+        mapping = await get_schema_mapping(db, org_id)
+        conn = await _mapped_connection(mapping)
+        table = validate_identifier(table_name, "table")
+        agg = aggregate.upper()
+        if agg not in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
+            return {"error": f"Unsupported aggregate: {aggregate}"}
+
+        if await _is_file_connection(conn):
+            if column == "*":
+                agg_expr = f"{agg}(*)"
+            else:
+                col = validate_identifier(column, "column")
+                agg_expr = f'{agg}("{col}")'
+            select_cols = ["result"]
+            sql = f"SELECT {agg_expr} AS result"
+            if group_by:
+                gb_col = validate_identifier(group_by, "group_by column")
+                sql = f'SELECT "{gb_col}", {agg_expr} AS result'
+                select_cols = [gb_col, "result"]
+            sql += f' FROM "{table}"'
+            if where:
+                sql += f" WHERE {where}"
+            if group_by:
+                sql += " GROUP BY 1 ORDER BY result DESC LIMIT 50"
+            result = await _execute_file_select(conn, sql, page_size=50)
+            rows = result.get("rows", [])
+            _log_client_access(org_id, table, f"query_aggregate({agg})", len(rows))
+            return {
+                "results": [{key: row.get(key) for key in select_cols} for row in rows],
+                "aggregate": agg,
+                "column": column,
+                "table": table,
+            }
+
+        engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
         try:
             async with safe_client_connection(engine, conn) as client_conn:
-                table = validate_identifier(table_name, "table")
                 quoted_table = quote_identifier(table, conn.db_type)
 
-                agg = aggregate.upper()
-                if agg not in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
-                    return {"error": f"Unsupported aggregate: {aggregate}"}
-
-                available_columns = await _fetch_table_columns(
-                    client_conn, conn.db_type, table
-                )
-                if not available_columns:
-                    return {
-                        "error": f"Table '{table}' not found or has no columns",
-                        "table": table,
-                    }
-
-                if column != "*":
-                    col_name = column.strip()
-                    try:
-                        col = validate_identifier(col_name, "column")
-                    except ClientDBError as exc:
-                        return {"error": str(exc), "table": table}
-
-                    if col not in available_columns:
-                        err: dict[str, Any] = {
-                            "error": (
-                                f"Column '{col}' does not exist on table '{table}'"
-                            ),
-                            "table": table,
-                            "column": col,
-                            "available_columns": available_columns,
-                        }
-                        try:
-                            mapping = await get_schema_mapping(db, org_id)
-                            entity_cols = await _fetch_table_columns(
-                                client_conn,
-                                conn.db_type,
-                                mapping.entity_table,
-                            )
-                            if col in entity_cols:
-                                err["hint"] = (
-                                    f"Column '{col}' is on entity table "
-                                    f"'{mapping.entity_table}'; use query_entity_table "
-                                    f"or query_aggregate on that table."
-                                )
-                        except Exception:
-                            pass
-                        return err
-
-                    agg_expr = f"{agg}({quote_identifier(col, conn.db_type)})"
-                else:
-                    if agg != "COUNT":
-                        return {
-                            "error": "Only COUNT supports column '*'",
-                            "table": table,
-                        }
+                if column == "*":
                     agg_expr = f"{agg}(*)"
+                else:
+                    col = validate_identifier(column, "column")
+                    agg_expr = f"{agg}({quote_identifier(col, conn.db_type)})"
 
                 sql = f"SELECT {agg_expr} AS result"
 
                 select_cols = ["result"]
                 if group_by:
                     gb_col = validate_identifier(group_by, "group_by column")
-                    if gb_col not in available_columns:
-                        return {
-                            "error": (
-                                f"GROUP BY column '{gb_col}' does not exist on "
-                                f"table '{table}'"
-                            ),
-                            "table": table,
-                            "available_columns": available_columns,
-                        }
                     quoted_gb = quote_identifier(gb_col, conn.db_type)
                     sql = f"SELECT {quoted_gb}, {agg_expr} AS result"
                     select_cols = [gb_col, "result"]
@@ -373,7 +364,23 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
     async def list_tables() -> dict[str, Any]:
         """List all tables in the client database with their columns (READ-ONLY)."""
-        engine, conn = await open_client_engine(db, org_id)
+        mapping = await get_schema_mapping(db, org_id)
+        conn = await _mapped_connection(mapping)
+        if await _is_file_connection(conn):
+            from app.services.studio_file_source_service import fetch_file_source_schema
+
+            schema = await fetch_file_source_schema(conn)
+            tables = [
+                {
+                    "table": table["name"],
+                    "columns": [col["name"] for col in table.get("columns") or []],
+                }
+                for table in schema
+            ]
+            _log_client_access(org_id, "file_source_schema", "list_tables", len(tables))
+            return {"tables": tables, "count": len(tables)}
+
+        engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
         try:
             async with safe_client_connection(engine, conn) as client_conn:
                 if conn.db_type == "mysql":
@@ -406,10 +413,23 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
 
     async def get_row_count(table_name: str) -> dict[str, Any]:
         """Get row count of a table in the client database (READ-ONLY)."""
-        engine, conn = await open_client_engine(db, org_id)
+        mapping = await get_schema_mapping(db, org_id)
+        conn = await _mapped_connection(mapping)
+        table = validate_identifier(table_name, "table")
+        if await _is_file_connection(conn):
+            result = await _execute_file_select(
+                conn,
+                f'SELECT COUNT(*) AS row_count FROM "{table}"',
+                page_size=1,
+            )
+            rows = result.get("rows", [])
+            count = int(rows[0].get("row_count", 0)) if rows else 0
+            _log_client_access(org_id, table, "get_row_count", 1)
+            return {"table": table, "row_count": count}
+
+        engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
         try:
             async with safe_client_connection(engine, conn) as client_conn:
-                table = validate_identifier(table_name, "table")
                 quoted = quote_identifier(table, conn.db_type)
                 result = await client_conn.execute(text(f"SELECT COUNT(*) FROM {quoted}"))
                 count = result.scalar_one()
@@ -424,7 +444,25 @@ def build_query_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         table_name: str, column_name: str
     ) -> dict[str, Any]:
         """Check if a column exists in a table (READ-ONLY)."""
-        engine, conn = await open_client_engine(db, org_id)
+        mapping = await get_schema_mapping(db, org_id)
+        conn = await _mapped_connection(mapping)
+        if await _is_file_connection(conn):
+            from app.services.studio_file_source_service import fetch_file_source_schema
+
+            table = validate_identifier(table_name, "table")
+            schema = await fetch_file_source_schema(conn)
+            table_info = next((item for item in schema if item.get("name") == table), None)
+            all_cols = [col["name"] for col in (table_info or {}).get("columns") or []]
+            exists = column_name in all_cols
+            _log_client_access(org_id, table_name, "validate_column_exists", 1)
+            return {
+                "table": table_name,
+                "column": column_name,
+                "exists": exists,
+                "available_columns": all_cols,
+            }
+
+        engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
         try:
             async with safe_client_connection(engine, conn) as client_conn:
                 cols_result = await client_conn.execute(

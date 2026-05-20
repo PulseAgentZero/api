@@ -16,12 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.errors import bad_request, not_found, validation_error
+from app.infrastructure.database.base import touch_updated_at, utcnow
 from app.infrastructure.database.models.pipeline_run import PipelineRun
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.pipeline_run_repository import (
     PipelineRunRepository,
 )
+from app.infrastructure.audit import log_audit
 from app.infrastructure.database.session import get_db
 from app.services.pipeline_trigger import claim_and_trigger_pipeline, serialize_pipeline_run
 
@@ -45,13 +47,27 @@ async def _trigger_common(
     db: AsyncSession,
     mapping_id: UUID | None = None,
 ) -> dict:
-    return await claim_and_trigger_pipeline(
+    result = await claim_and_trigger_pipeline(
         db,
         current_user.org_id,
         mapping_id=mapping_id,
         triggered_by=current_user.id,
         trigger_source="manual",
     )
+    run_id = result.get("run_id")
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="pipeline.triggered",
+        resource="pipeline_run",
+        resource_id=UUID(run_id) if run_id else None,
+        metadata={
+            "trigger_source": "manual",
+            "mapping_id": str(mapping_id) if mapping_id else None,
+        },
+    )
+    return result
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)
@@ -234,6 +250,8 @@ async def cancel_pipeline_run(
     if run.status in ("succeeded", "failed", "cancelled"):
         raise bad_request("BAD_REQUEST", "Run already completed")
     run.status = "cancelled"
+    run.completed_at = utcnow()
+    touch_updated_at(run)
     await db.commit()
     return {"message": "Cancellation requested"}
 

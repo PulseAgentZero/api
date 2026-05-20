@@ -4,6 +4,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.connection import Connection
 
 
@@ -60,6 +61,7 @@ class ConnectionRepository:
         for key, value in fields.items():
             if hasattr(conn, key):
                 setattr(conn, key, value)
+        touch_updated_at(conn)
         await self.db.flush()
         return conn
 
@@ -68,6 +70,7 @@ class ConnectionRepository:
         if conn is None or conn.deleted_at is not None:
             return False
         conn.deleted_at = datetime.now(timezone.utc)
+        touch_updated_at(conn)
         await self.db.flush()
         return True
 

@@ -9,7 +9,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.infrastructure.database.base import Base, UUIDMixin
+from app.infrastructure.database.base import Base, UUIDMixin, utcnow
 
 if TYPE_CHECKING:
     from app.infrastructure.database.models.alert_rule import AlertRule
@@ -36,7 +36,10 @@ class AlertEvent(Base, UUIDMixin):
     affected_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        default=utcnow,
+        server_default=func.now(),
+        nullable=False,
     )
 
     organization: Mapped[Organization] = relationship("Organization", lazy="raise")

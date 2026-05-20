@@ -32,13 +32,12 @@ from app.api.schemas.entity import (
     RecommendationSummary,
     RiskHistoryPoint,
 )
-from app.api.schemas.onboarding import (
-    CompleteOnboardingResponse,
-    OnboardingConnectionResponse,
-    OnboardingContextRequest,
-    OnboardingSchemaMappingResponse,
+from app.api.schemas.organization import (
+    CompleteSetupResponse,
+    MemberSettingsRequest,
+    OrgProfileResponse,
+    UpdateOrgRequest,
 )
-from app.api.schemas.organization import OrgProfileResponse, UpdateOrgRequest
 from app.api.schemas.recommendation import RecommendationResponse, UpdateRecommendationRequest
 from app.api.schemas.schema_mapping import (
     CreateSchemaMappingRequest,
@@ -52,7 +51,7 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "ColumnInfo",
-    "CompleteOnboardingResponse",
+    "CompleteSetupResponse",
     "ConversationListItem",
     "ConversationResponse",
     "ConnectionResponse",
@@ -72,9 +71,7 @@ __all__ = [
     "IntrospectResponse",
     "LoginRequest",
     "MeResponse",
-    "OnboardingConnectionResponse",
-    "OnboardingContextRequest",
-    "OnboardingSchemaMappingResponse",
+    "MemberSettingsRequest",
     "OrgOut",
     "OrgProfileResponse",
     "RecommendationResponse",

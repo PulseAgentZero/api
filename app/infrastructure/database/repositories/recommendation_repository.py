@@ -3,6 +3,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.recommendation import Recommendation
 
 
@@ -62,6 +63,7 @@ class RecommendationRepository:
             return None
         for key, value in fields.items():
             setattr(rec, key, value)
+        touch_updated_at(rec)
         return rec
 
     async def delete(self, recommendation_id: UUID) -> bool:

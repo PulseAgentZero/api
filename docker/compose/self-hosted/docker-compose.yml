@@ -1,14 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Pulse — Self-Hosted
 #
-# Getting started:
-#   1. cp .env.example .env
-#   2. Fill in the required values in .env
-#   3. docker compose up -d
-#   4. Open http://localhost  (or http://your-server-ip)
+# Pull and run (like n8n): one application image plus Postgres and Qdrant.
 #
-# Upgrading:
-#   docker compose pull && docker compose up -d
+#   db      Postgres
+#   qdrant  Vector search
+#   pulse   All-in-one — UI, API, worker, agent, scheduler, Redis, nginx (port 80)
+#
+#   1. cp .env.example .env
+#   2. Fill in required values in .env
+#   3. docker compose up -d
+#   4. Open http://localhost
+#
+# Upgrading: docker compose pull && docker compose up -d
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -29,56 +33,37 @@ services:
       retries: 5
       start_period: 10s
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   pulse:
     image: pulseai/pulse:${PULSE_VERSION:-latest}
+    env_file:
+      - path: .env
+        required: false
     ports:
-      # Single public port — nginx routes frontend and API traffic internally.
-      # Change 80:80 to e.g. 3000:80 to run on a different host port.
       - "${PORT:-80}:80"
     environment:
-      # ── Database ─────────────────────────────────────────────────────────────
       DATABASE_URL: postgresql+asyncpg://pulse:${POSTGRES_PASSWORD}@db:5432/pulse
-
-      # ── Security ─────────────────────────────────────────────────────────────
-      JWT_SECRET: ${JWT_SECRET:?missing — generate with: openssl rand -hex 32}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?missing — see .env.example for generation command}
-
-      # ── App ──────────────────────────────────────────────────────────────────
-      # Must match the public URL users access (for CORS and email links).
-      # e.g. https://pulse.yourcompany.com  or  http://192.168.1.100
-      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
-      ENVIRONMENT: production
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
-      # ── LLM keys (required for AI features) ──────────────────────────────────
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-
-      # ── Email (optional — needed for verify/reset/invite flows) ───────────────
-      RESEND_API_KEY: ${RESEND_API_KEY:-}
-      DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:-noreply@example.com}
-
-      # ── OAuth (optional) ─────────────────────────────────────────────────────
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-
-      # ── Vector search (optional — enables semantic entity search) ─────────────
-      VOYAGEAI_API_KEY: ${VOYAGEAI_API_KEY:-}
-      QDRANT_URL: ${QDRANT_URL:-}
-      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
-
-      # ── License (unlocks Pro features) ───────────────────────────────────────
-      PULSE_LICENSE_KEY: ${PULSE_LICENSE_KEY:-}
-
-      # ── Tuning ───────────────────────────────────────────────────────────────
-      API_WORKERS: ${API_WORKERS:-1}
-      AGENT_WORKERS: ${AGENT_WORKERS:-1}
-      REDIS_MAX_MEMORY: ${REDIS_MAX_MEMORY:-256mb}
-
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://127.0.0.1:6379/0
+      LOCAL_STORAGE_PATH: /app/uploads
     volumes:
-      - pulse_data:/data          # Redis persistence
+      - pulse_data:/data
+      - uploads_data:/app/uploads
     depends_on:
       db:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
@@ -90,4 +75,6 @@ services:
 
 volumes:
   db_data:
+  qdrant_data:
   pulse_data:
+  uploads_data:

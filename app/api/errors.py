@@ -104,6 +104,12 @@ def payload_too_large(message: str) -> PulseHTTPException:
     )
 
 
+def service_unavailable(code: str, message: str, **kwargs: Any) -> PulseHTTPException:
+    return PulseHTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE, code=code, message=message, **kwargs
+    )
+
+
 def validation_error(message: str, fields: dict[str, str]) -> PulseHTTPException:
     return PulseHTTPException(
         status.HTTP_422_UNPROCESSABLE_ENTITY,

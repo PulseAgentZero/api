@@ -3,6 +3,7 @@ from uuid import UUID
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at, utcnow
 from app.infrastructure.database.models.schema_mapping import SchemaMapping
 
 
@@ -67,6 +68,7 @@ class SchemaMappingRepository:
         for key, value in fields.items():
             if hasattr(mapping, key):
                 setattr(mapping, key, value)
+        touch_updated_at(mapping)
         await self.db.flush()
         return mapping
 
@@ -82,6 +84,6 @@ class SchemaMappingRepository:
         await self.db.execute(
             update(SchemaMapping)
             .where(SchemaMapping.connection_id == connection_id)
-            .values(is_active=False)
+            .values(is_active=False, updated_at=utcnow())
         )
         await self.db.flush()

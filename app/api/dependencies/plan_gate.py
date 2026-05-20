@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from calendar import monthrange
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.errors import plan_limit, plan_locked
+from app.api.errors import plan_limit, plan_locked, rate_limited
 from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
+from app.services.billing_entitlements import get_effective_cloud_plan
 from app.services.self_hosted_license import resolve_self_hosted_entitlements
 
 # ── Plan limits ───────────────────────────────────────────────────────────────
@@ -22,17 +24,38 @@ PLAN_LIMITS: dict[str, dict[str, int | None]] = {
         "api_keys": 1,
         "webhook_channels": 1,
         "users": 3,
+        "connections": 5,
         "pipeline_runs_per_month": 20,
         "agent_queries_per_month": 100,
+        "studio_dashboards": 5,
+        "studio_query_executions_per_day": 600,
+    },
+    "growth": {
+        "api_keys": 5,
+        "webhook_channels": 3,
+        "users": 10,
+        "connections": 15,
+        "pipeline_runs_per_month": 100,
+        "agent_queries_per_month": 500,
+        "studio_dashboards": 20,
+        "studio_query_executions_per_day": 2000,
     },
     "pro": {
         "api_keys": None,
         "webhook_channels": None,
         "users": None,
+        "connections": None,
         "pipeline_runs_per_month": None,
         "agent_queries_per_month": None,
+        "studio_dashboards": None,
+        "studio_query_executions_per_day": None,
     },
 }
+
+_PAID_CLOUD_PLANS = frozenset({"growth", "pro", "enterprise"})
+_BILLING_ANCHORED_STATUSES = frozenset(
+    {"active", "attention", "non-renewing", "cancelled", "complete", "completed"}
+)
 
 
 def get_plan_limits(plan: str) -> dict[str, int | None]:
@@ -41,11 +64,83 @@ def get_plan_limits(plan: str) -> dict[str, int | None]:
     return PLAN_LIMITS.get(plan.lower(), PLAN_LIMITS["free"])
 
 
+async def get_org_plan(db: AsyncSession, org_id: UUID) -> str:
+    """Effective plan for limits (grace-period aware on cloud)."""
+    return await get_effective_cloud_plan(db, org_id)
+
+
+def _next_utc_midnight() -> datetime:
+    now = datetime.now(timezone.utc)
+    return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _seconds_until_utc_midnight() -> int:
+    """TTL for daily Redis counters — always expires at 00:00 UTC."""
+    now = datetime.now(timezone.utc)
+    return max(60, int((_next_utc_midnight() - now).total_seconds()))
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Move by calendar months, clamping the day for shorter months."""
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _calendar_month_window(now: datetime) -> tuple[datetime, datetime, str]:
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start, _add_months(start, 1), "calendar_month"
+
+
+def _monthly_usage_window(
+    *,
+    plan: str,
+    next_payment_date: datetime | None,
+    subscription_status: str | None,
+    now: datetime,
+) -> tuple[datetime, datetime, str]:
+    """Return the active monthly quota window.
+
+    Paid and previously paid cloud orgs use the Paystack billing cycle so
+    cancelling keeps the current quota window intact until the already-paid
+    period ends. Free orgs without a subscription anchor keep the existing
+    calendar-month behavior.
+    """
+    has_billing_anchor = (
+        plan.lower() in _PAID_CLOUD_PLANS
+        or (subscription_status or "").lower() in _BILLING_ANCHORED_STATUSES
+    )
+    if (
+        settings.DEPLOYMENT_MODE != "cloud"
+        or not has_billing_anchor
+        or next_payment_date is None
+    ):
+        return _calendar_month_window(now)
+
+    end = _as_utc(next_payment_date)
+    while end <= now:
+        end = _add_months(end, 1)
+
+    start = _add_months(end, -1)
+    while start > now:
+        end = start
+        start = _add_months(end, -1)
+
+    return start, end, "billing_cycle"
+
+
 # ── Cloud: feature -> minimum plans (audit_log still requires pro) ─────────────
 # api_keys and webhook_deliveries are removed — replaced with count-based limits
 # so free users can access them within their quota.
 _CLOUD_FEATURE_PLAN: dict[str, tuple[str, ...]] = {
-    "advanced_analytics": ("pro",),
     "audit_log": ("pro",),
 }
 
@@ -60,7 +155,7 @@ async def require_cloud_plan(db: AsyncSession, org_id: UUID, min_plans: tuple[st
         return
     if settings.DEPLOYMENT_MODE == "self_hosted":
         return
-    plan = (org.plan or "free").lower()
+    plan = await get_org_plan(db, org_id)
     if plan not in min_plans:
         raise plan_locked(
             "plan_upgrade",
@@ -93,10 +188,7 @@ async def require_feature(db: AsyncSession, org_id: UUID, feature: str) -> None:
             upgrade_url=f"{settings.FRONTEND_URL.rstrip('/')}/settings/license",
         )
 
-    org = await _get_org(db, org_id)
-    if org is None:
-        return
-    plan = (org.plan or "free").lower()
+    plan = await get_org_plan(db, org_id)
     if plan not in needed:
         raise plan_locked(
             feature,
@@ -108,11 +200,13 @@ async def require_feature(db: AsyncSession, org_id: UUID, feature: str) -> None:
 async def max_cloud_free_connections(db: AsyncSession, org_id: UUID, active_count: int) -> None:
     if settings.DEPLOYMENT_MODE == "self_hosted":
         return
-    org = await _get_org(db, org_id)
-    if org is None:
-        return
-    if (org.plan or "free").lower() == "free" and active_count >= 5:
-        raise plan_limit("Active connection limit reached for the free plan (max 5).")
+    plan = await get_org_plan(db, org_id)
+    limit = get_plan_limits(plan).get("connections")
+    if limit is not None and active_count >= limit:
+        raise plan_limit(
+            f"Active connection limit reached for your plan (max {limit}). "
+            "Remove an existing connection or upgrade to Pro.",
+        )
 
 
 # ── Count-based limit helpers ─────────────────────────────────────────────────
@@ -123,8 +217,7 @@ async def check_api_key_limit(db: AsyncSession, org_id: UUID) -> None:
         return
     from app.infrastructure.database.models.api_key import ApiKey
 
-    org = await _get_org(db, org_id)
-    plan = (org.plan or "free").lower() if org else "free"
+    plan = await get_org_plan(db, org_id)
     limit = get_plan_limits(plan).get("api_keys")
     if limit is None:
         return
@@ -143,14 +236,72 @@ async def check_api_key_limit(db: AsyncSession, org_id: UUID) -> None:
         )
 
 
+async def check_studio_execution_budget(org_id: UUID, plan: str = "free") -> None:
+    """Raise RATE_LIMITED if the org has exceeded its daily studio query execution budget.
+
+    Only enforced in cloud deployment. Pro plan and self-hosted always pass.
+    Counter stored in Redis per UTC calendar day (resets at 00:00 UTC).
+    Uses get_redis() directly — not the optional cache client passed to execute_studio_query.
+    """
+    if settings.DEPLOYMENT_MODE != "cloud":
+        return
+    limit = get_plan_limits(plan).get("studio_query_executions_per_day")
+    if limit is None:
+        return
+    from app.infrastructure.redis.client import get_redis
+    from app.infrastructure.redis.keys import studio_budget
+
+    r = await get_redis()
+    if r is None:
+        return
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = studio_budget(str(org_id), today)
+    count = await r.incr(key)
+    if count == 1:
+        await r.expire(key, _seconds_until_utc_midnight())
+    if count > limit:
+        raise rate_limited(
+            f"Studio execution budget exceeded ({limit} executions/day on the free plan). "
+            "Upgrade to Pro for unlimited executions.",
+        )
+
+
+async def check_studio_dashboard_limit(db: AsyncSession, org_id: UUID) -> None:
+    """Raise PLAN_LIMIT if the org has reached its studio dashboard quota.
+
+    Free plan (cloud): 5 dashboards max.
+    Pro plan (cloud) and all self-hosted: unlimited.
+    """
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        return
+    from app.infrastructure.database.models.studio_dashboard import StudioDashboard
+
+    plan = await get_org_plan(db, org_id)
+    limit = get_plan_limits(plan).get("studio_dashboards")
+    if limit is None:
+        return
+    count = int(
+        await db.scalar(
+            select(func.count())
+            .select_from(StudioDashboard)
+            .where(StudioDashboard.org_id == org_id)
+        )
+        or 0
+    )
+    if count >= limit:
+        raise plan_limit(
+            f"Studio dashboard limit reached for the free plan (max {limit}). "
+            "Upgrade to Pro for unlimited dashboards.",
+        )
+
+
 async def check_webhook_channel_limit(db: AsyncSession, org_id: UUID) -> None:
     """Raise PLAN_LIMIT if the org has reached its webhook channel quota."""
     if settings.DEPLOYMENT_MODE == "self_hosted":
         return
     from app.infrastructure.database.models.notification_channel import NotificationChannel
 
-    org = await _get_org(db, org_id)
-    plan = (org.plan or "free").lower() if org else "free"
+    plan = await get_org_plan(db, org_id)
     limit = get_plan_limits(plan).get("webhook_channels")
     if limit is None:
         return
@@ -179,16 +330,26 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     from app.infrastructure.database.models.api_key import ApiKey
     from app.infrastructure.database.models.notification_channel import NotificationChannel
     from app.infrastructure.database.models.pipeline_run import PipelineRun
+    from app.infrastructure.database.models.studio_dashboard import StudioDashboard
+    from app.infrastructure.database.models.subscription import Subscription
     from app.infrastructure.database.models.user import User
+    from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
 
-    org = await _get_org(db, org_id)
-    raw_plan = (org.plan or "free").lower() if org else "free"
-    plan = "pro" if settings.DEPLOYMENT_MODE == "self_hosted" else raw_plan
+    plan = await get_org_plan(db, org_id)
     limits = get_plan_limits(plan)
 
     now = datetime.now(timezone.utc)
-    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    sub = (
+        await db.execute(select(Subscription).where(Subscription.org_id == org_id))
+    ).scalar_one_or_none()
+    usage_start, usage_end, usage_window = _monthly_usage_window(
+        plan=plan,
+        next_payment_date=sub.next_payment_date if sub else None,
+        subscription_status=sub.status if sub else None,
+        now=now,
+    )
 
+    connection_count = await ConnectionRepository(db).count_active(org_id)
     api_key_count = int(
         await db.scalar(
             select(func.count()).select_from(ApiKey).where(
@@ -219,7 +380,8 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
         await db.scalar(
             select(func.count()).select_from(PipelineRun).where(
                 PipelineRun.org_id == org_id,
-                PipelineRun.created_at >= first_of_month,
+                PipelineRun.created_at >= usage_start,
+                PipelineRun.created_at < usage_end,
             )
         )
         or 0
@@ -228,22 +390,69 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
         await db.scalar(
             select(func.count()).select_from(AgentConversation).where(
                 AgentConversation.org_id == org_id,
-                AgentConversation.created_at >= first_of_month,
+                AgentConversation.created_at >= usage_start,
+                AgentConversation.created_at < usage_end,
+            )
+        )
+        or 0
+    )
+    studio_dashboard_count = int(
+        await db.scalar(
+            select(func.count()).select_from(StudioDashboard).where(
+                StudioDashboard.org_id == org_id
             )
         )
         or 0
     )
 
-    def slot(used: int, key: str) -> dict:
-        return {"used": used, "limit": limits.get(key)}
+    # Studio execution budget — read from Redis counter for today
+    from app.infrastructure.redis.client import get_redis
+    from app.infrastructure.redis.keys import studio_budget
+    studio_exec_today = 0
+    try:
+        r = await get_redis()
+        if r is not None:
+            today = now.strftime("%Y-%m-%d")
+            val = await r.get(studio_budget(str(org_id), today))
+            studio_exec_today = int(val or 0)
+    except Exception:
+        pass
+
+    def slot(used: int, key: str, *, monthly: bool = False) -> dict:
+        data: dict[str, object] = {"used": used, "limit": limits.get(key)}
+        if monthly:
+            data["resets_at"] = usage_end.isoformat().replace("+00:00", "Z")
+            data["window"] = usage_window
+        return data
+
+    studio_daily_limit = limits.get("studio_query_executions_per_day")
+    studio_executions_slot: dict = {
+        "used": studio_exec_today,
+        "limit": studio_daily_limit,
+    }
+    if studio_daily_limit is not None:
+        studio_executions_slot["resets_at"] = (
+            _next_utc_midnight().isoformat().replace("+00:00", "Z")
+        )
 
     return {
         "plan": plan,
         "limits": {
             "api_keys": slot(api_key_count, "api_keys"),
+            "connections": slot(connection_count, "connections"),
             "webhook_channels": slot(webhook_channel_count, "webhook_channels"),
             "users": slot(user_count, "users"),
-            "pipeline_runs_this_month": slot(pipeline_run_count, "pipeline_runs_per_month"),
-            "agent_queries_this_month": slot(agent_query_count, "agent_queries_per_month"),
+            "pipeline_runs_this_month": slot(
+                pipeline_run_count,
+                "pipeline_runs_per_month",
+                monthly=True,
+            ),
+            "agent_queries_this_month": slot(
+                agent_query_count,
+                "agent_queries_per_month",
+                monthly=True,
+            ),
+            "studio_dashboards": slot(studio_dashboard_count, "studio_dashboards"),
+            "studio_executions_today": studio_executions_slot,
         },
     }

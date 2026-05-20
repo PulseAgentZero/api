@@ -9,6 +9,8 @@ from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.models.entity_profile import EntityProfile
 from app.infrastructure.database.models.entity_risk_history import EntityRiskHistory
 from app.infrastructure.database.models.invitation import Invitation
+from app.infrastructure.database.models.license_activation import LicenseActivation
+from app.infrastructure.database.models.license_issuance import LicenseIssuance
 from app.infrastructure.database.models.license_key import LicenseKey
 from app.infrastructure.database.models.llm_key_store import LlmKeyStore
 from app.infrastructure.database.models.notification_channel import NotificationChannel
@@ -21,6 +23,12 @@ from app.infrastructure.database.models.schema_mapping import SchemaMapping
 from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.usage_event import UsageEvent
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.models.studio_dashboard import StudioDashboard
+from app.infrastructure.database.models.studio_query_run import StudioQueryRun
+from app.infrastructure.database.models.studio_star import StudioStar
+from app.infrastructure.database.models.studio_dashboard_item import StudioDashboardItem
+from app.infrastructure.database.models.studio_query import StudioQuery
+from app.infrastructure.database.models.studio_visualization import StudioVisualization
 from app.infrastructure.database.models.webhook_delivery import WebhookDelivery
 
 __all__ = [
@@ -35,6 +43,8 @@ __all__ = [
     "EntityProfile",
     "EntityRiskHistory",
     "Invitation",
+    "LicenseActivation",
+    "LicenseIssuance",
     "LicenseKey",
     "LlmKeyStore",
     "NotificationChannel",
@@ -48,4 +58,10 @@ __all__ = [
     "UsageEvent",
     "User",
     "WebhookDelivery",
+    "StudioQuery",
+    "StudioQueryRun",
+    "StudioStar",
+    "StudioVisualization",
+    "StudioDashboard",
+    "StudioDashboardItem",
 ]

@@ -9,13 +9,13 @@ from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.entities import router as entities_router
 from app.api.routes.license import router as license_router
 from app.api.routes.notifications import router as notifications_router
-from app.api.routes.onboarding import router as onboarding_router
 from app.api.routes.organization import router as org_router
 from app.api.routes.pipeline import router as pipeline_router
 from app.api.routes.recommendations import router as recommendations_router
 from app.api.routes.schema_mappings import router as schema_mappings_router
 from app.api.routes.settings_llm import router as settings_router
 from app.api.routes.users import router as users_router
+from app.api.routes.studio import router as studio_router
 from app.api.routes.webhooks import router as webhooks_router
 
 __all__ = [
@@ -30,12 +30,12 @@ __all__ = [
     "entities_router",
     "license_router",
     "notifications_router",
-    "onboarding_router",
     "org_router",
     "pipeline_router",
     "recommendations_router",
     "schema_mappings_router",
     "settings_router",
+    "studio_router",
     "users_router",
     "webhooks_router",
 ]

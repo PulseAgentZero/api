@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
@@ -20,6 +20,7 @@ from app.infrastructure.database.models.alert_event import AlertEvent
 from app.infrastructure.database.models.alert_rule import AlertRule
 from app.infrastructure.database.models.notification_channel import NotificationChannel
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.session import get_db
 
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
@@ -53,6 +54,9 @@ async def list_rules(
     return {"rules": [_rule_out(r) for r in rows]}
 
 
+_VALID_OPERATORS = frozenset({"gt", "lt", "gte", "lte", "eq", "ne", ">", ">=", "<", "<=", "==", "!=", "="})
+
+
 class RuleBody(BaseModel):
     name: str
     description: str | None = None
@@ -71,6 +75,16 @@ async def _validate_channels(db: AsyncSession, org_id: UUID, ids: list[UUID]) ->
             raise not_found("Channel not found")
 
 
+def _validate_rule_body(body: RuleBody) -> None:
+    from app.api.errors import bad_request
+
+    if body.operator.strip() not in _VALID_OPERATORS:
+        raise bad_request(
+            "BAD_REQUEST",
+            "operator must be one of: gt, lt, gte, lte, eq, ne (or >, >=, <, <=, ==, !=)",
+        )
+
+
 @router.post("/rules", status_code=status.HTTP_201_CREATED)
 async def create_rule(
     body: RuleBody,
@@ -86,6 +100,7 @@ async def create_rule(
     **cooldown_minutes** — minimum minutes between consecutive alerts for the same rule (default 60).
     """
     await _validate_channels(db, current_user.org_id, body.channel_ids)
+    _validate_rule_body(body)
     row = AlertRule(
         org_id=current_user.org_id,
         created_by=current_user.id,
@@ -116,6 +131,7 @@ async def update_rule(
     if not row or row.org_id != current_user.org_id:
         raise not_found()
     await _validate_channels(db, current_user.org_id, body.channel_ids)
+    _validate_rule_body(body)
     row.name = body.name
     row.description = body.description
     row.metric = body.metric
@@ -124,6 +140,7 @@ async def update_rule(
     row.entity_filter = body.entity_filter
     row.channel_ids = [str(x) for x in body.channel_ids]
     row.cooldown_minutes = body.cooldown_minutes
+    touch_updated_at(row)
     await db.commit()
     await db.refresh(row)
     return _rule_out(row)
@@ -143,6 +160,27 @@ async def delete_rule(
     await db.commit()
 
 
+def _channel_out(c: NotificationChannel) -> dict:
+    from app.services.webhook_dispatch import parse_channel_config, webhook_url_from_config
+
+    out: dict = {
+        "id": str(c.id),
+        "name": c.name,
+        "type": c.type,
+        "is_active": c.is_active,
+        "created_at": c.created_at.isoformat(),
+    }
+    if c.type == "webhook":
+        cfg = parse_channel_config(c)
+        events = cfg.get("events")
+        if isinstance(events, list):
+            out["events"] = [str(x) for x in events]
+        url = webhook_url_from_config(cfg)
+        if url:
+            out["url_hint"] = url if len(url) <= 56 else f"{url[:53]}…"
+    return out
+
+
 @router.get("/channels")
 async def list_channels(
     current_user: User = Depends(require_role("admin", "manager")),
@@ -153,18 +191,7 @@ async def list_channels(
         select(NotificationChannel).where(NotificationChannel.org_id == current_user.org_id)
     )
     rows = list(result.scalars().all())
-    return {
-        "channels": [
-            {
-                "id": str(c.id),
-                "name": c.name,
-                "type": c.type,
-                "is_active": c.is_active,
-                "created_at": c.created_at.isoformat(),
-            }
-            for c in rows
-        ]
-    }
+    return {"channels": [_channel_out(c) for c in rows]}
 
 
 class ChannelBody(BaseModel):
@@ -222,6 +249,7 @@ async def update_channel(
     row.name = body.name
     row.type = body.type
     row.config = encrypt_dsn(json.dumps(body.config)) if body.config else None
+    touch_updated_at(row)
     await db.commit()
     await db.refresh(row)
     return {
@@ -281,10 +309,17 @@ async def list_events(
     Filter by `rule_id` to see events for a specific rule. Paginated, default 50 per page.
     Each event records the metric value, threshold, and how many entities were affected.
     """
-    stmt = select(AlertEvent).where(AlertEvent.org_id == current_user.org_id)
+    conds = [AlertEvent.org_id == current_user.org_id]
     if rule_id:
-        stmt = stmt.where(AlertEvent.rule_id == rule_id)
-    stmt = stmt.order_by(AlertEvent.created_at.desc()).offset((page - 1) * limit).limit(limit)
+        conds.append(AlertEvent.rule_id == rule_id)
+    total = await db.scalar(select(func.count()).select_from(AlertEvent).where(*conds)) or 0
+    stmt = (
+        select(AlertEvent)
+        .where(*conds)
+        .order_by(AlertEvent.created_at.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
     result = await db.execute(stmt)
     rows = list(result.scalars().all())
     out = []
@@ -303,4 +338,4 @@ async def list_events(
                 "created_at": e.created_at.isoformat(),
             }
         )
-    return {"events": out}
+    return {"events": out, "total": int(total), "page": page, "limit": limit}

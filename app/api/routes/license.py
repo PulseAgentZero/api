@@ -146,9 +146,13 @@ async def activate_license(
             msg = (data.get("message") or data.get("reason") or data.get("detail") or msg)
         elif err:
             msg = err
-        raise bad_request("BAD_REQUEST", str(msg))
+        raise bad_request("BAD_REQUEST", "Invalid license key")
     if data.get("valid") is False:
-        raise bad_request("INVALID_LICENSE", str(data.get("reason") or "License is not valid"))
+        reason = str(data.get("reason") or "License is not valid")
+        code = str(data.get("code") or "INVALID_LICENSE")
+        if code == "LICENSE_ALREADY_ACTIVATED":
+            raise bad_request("LICENSE_ALREADY_ACTIVATED", reason)
+        raise bad_request(code if code != "INVALID_LICENSE" else "INVALID_LICENSE", reason)
 
     plan = data.get("plan", "pro")
     features = data.get("features", [])

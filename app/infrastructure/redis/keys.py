@@ -32,6 +32,22 @@ def rate_limit(ip: str, endpoint: str) -> str:
     return f"rate_limit:{ip}:{endpoint}"
 
 
+def auth_rl_ip(ip: str, action: str) -> str:
+    return f"auth_rl:ip:{ip}:{action}"
+
+
+def auth_rl_email(email: str, action: str) -> str:
+    return f"auth_rl:email:{email.strip().lower()}:{action}"
+
+
+def invite_rl_org(org_id) -> str:
+    return f"invite_rl:org:{org_id}"
+
+
+def invite_rl_invitation(invitation_id) -> str:
+    return f"invite_rl:inv:{invitation_id}"
+
+
 def email_verify_rate(user_id) -> str:
     """Rate limit key for resend-verification — TTL 60s."""
     return f"email_verify_rate:{user_id}"
@@ -39,6 +55,47 @@ def email_verify_rate(user_id) -> str:
 
 def oauth_google_state(state: str) -> str:
     return f"oauth_google_state:{state}"
+
+
+def oauth_google_link_pending(token: str) -> str:
+    return f"oauth_google_link_pending:{token}"
+
+
+def oauth_google_signup_pending(token: str) -> str:
+    return f"oauth_google_signup_pending:{token}"
+
+
+def studio_embed(token: str) -> str:
+    return f"studio:embed:{token}"
+
+
+def studio_budget(org_id: str, date_str: str) -> str:
+    return f"studio:budget:{org_id}:{date_str}"
+
+
+def studio_run_result(run_id: str) -> str:
+    """Redis key for storing async studio query run results (TTL 1 hour)."""
+    return f"studio:run_result:{run_id}"
+
+
+def studio_public_rl(ip: str) -> str:
+    return f"studio:public_rl:{ip}"
+
+
+def studio_query_cache(org_id: str, query_hash: str) -> str:
+    return f"studio:qcache:{org_id}:{query_hash}"
+
+
+def mfa_login(token: str) -> str:
+    return f"mfa_login:{token}"
+
+
+def mfa_setup(token: str) -> str:
+    return f"mfa_setup:{token}"
+
+
+def org_delete_code(org_id: str, owner_id: str) -> str:
+    return f"org_delete_code:{org_id}:{owner_id}"
 
 
 def user_sessions_pattern(user_id) -> str:

@@ -7,12 +7,28 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import Request
 
+from app.api.dependencies.plan_gate import get_org_plan
 from app.config.settings import settings
+from app.infrastructure.database.base import utcnow
 from app.infrastructure.database.models.audit_log import AuditLog
-from app.infrastructure.database.models.organization import Organization
 
 logger = logging.getLogger(__name__)
+
+
+def request_audit_context(request: Request | None) -> tuple[str | None, str | None]:
+    """Client IP and User-Agent from an HTTP request (supports X-Forwarded-For)."""
+    if request is None:
+        return None, None
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+    elif request.client:
+        ip = request.client.host
+    else:
+        ip = None
+    return ip, request.headers.get("user-agent")
 
 
 async def log_audit(
@@ -29,12 +45,10 @@ async def log_audit(
 ) -> None:
     """Best-effort audit row; skips if org is not on a plan that includes audit."""
     try:
-        org = await db.get(Organization, org_id)
-        if org is None:
-            return
-        plan = (org.plan or "free").lower()
-        if settings.DEPLOYMENT_MODE == "cloud" and plan not in ("pro", "enterprise"):
-            return
+        if settings.DEPLOYMENT_MODE == "cloud":
+            plan = await get_org_plan(db, org_id)
+            if plan not in ("pro", "enterprise"):
+                return
         row = AuditLog(
             org_id=org_id,
             user_id=user_id,
@@ -44,6 +58,7 @@ async def log_audit(
             metadata_=metadata or {},
             ip_address=ip_address,
             user_agent=user_agent,
+            created_at=utcnow(),
         )
         db.add(row)
         await db.flush()

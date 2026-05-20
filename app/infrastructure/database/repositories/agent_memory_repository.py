@@ -7,6 +7,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.agent_memory import AgentMemory
 
 
@@ -52,6 +53,7 @@ class AgentMemoryRepository:
         else:
             existing.fingerprint = fingerprint
             existing.data = data
+            touch_updated_at(existing)
         await self.db.flush()
         return existing
 
@@ -110,5 +112,6 @@ class AgentMemoryRepository:
             existing.data = data
             if expires_at is not None:
                 existing.expires_at = expires_at
+            touch_updated_at(existing)
         await self.db.flush()
         return existing

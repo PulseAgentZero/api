@@ -1,15 +1,20 @@
 import logging
 import re
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
+
+MANAGER_PLUS = require_role("admin", "manager")
 from app.api.schemas.schema_mapping import (
     CreateSchemaMappingRequest,
     SchemaMappingResponse,
     UpdateSchemaMappingRequest,
 )
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.connection_repository import (
     ConnectionRepository,
@@ -18,6 +23,7 @@ from app.infrastructure.database.repositories.schema_mapping_repository import (
     SchemaMappingRepository,
 )
 from app.infrastructure.database.session import get_db
+from app.services.pipeline_trigger import maybe_trigger_initial_pipeline
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/schema-mappings", tags=["Schema Mappings"])
@@ -70,7 +76,12 @@ def _validate_mapping_payload(payload: dict) -> None:
             )
 
 
-def _mapping_to_response(m) -> SchemaMappingResponse:
+def _mapping_to_response(
+    m,
+    *,
+    pipeline_triggered: bool = False,
+    pipeline_run_id=None,
+) -> SchemaMappingResponse:
     return SchemaMappingResponse(
         id=m.id,
         org_id=m.org_id,
@@ -85,6 +96,8 @@ def _mapping_to_response(m) -> SchemaMappingResponse:
         target_column=m.target_column,
         rag_config=m.rag_config,
         created_at=m.created_at,
+        pipeline_triggered=pipeline_triggered,
+        pipeline_run_id=pipeline_run_id,
     )
 
 
@@ -112,7 +125,7 @@ async def get_schema_mapping(
 @router.post("", response_model=SchemaMappingResponse, status_code=201)
 async def create_schema_mapping(
     body: CreateSchemaMappingRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> SchemaMappingResponse:
     conn = await ConnectionRepository(db).get_by_id(body.connection_id)
@@ -134,14 +147,27 @@ async def create_schema_mapping(
         rag_config=body.rag_config,
     )
     await db.commit()
-    return _mapping_to_response(mapping)
+
+    triggered, run_id_str = await maybe_trigger_initial_pipeline(
+        db,
+        current_user.org_id,
+        mapping_id=mapping.id,
+        triggered_by=current_user.id,
+    )
+    pipeline_run_id = UUID(run_id_str) if run_id_str else None
+
+    return _mapping_to_response(
+        mapping,
+        pipeline_triggered=triggered,
+        pipeline_run_id=pipeline_run_id,
+    )
 
 
 @router.patch("/{mapping_id}", response_model=SchemaMappingResponse)
 async def update_schema_mapping(
     mapping_id: str,
     body: UpdateSchemaMappingRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> SchemaMappingResponse:
     mapping = await SchemaMappingRepository(db).get_by_id(_parse_uuid(mapping_id, "mapping_id"))
@@ -169,6 +195,7 @@ async def update_schema_mapping(
     _validate_mapping_payload(merged)
     for key, value in payload.items():
         setattr(mapping, key, value)
+    touch_updated_at(mapping)
     await db.flush()
     await db.commit()
     return _mapping_to_response(mapping)
@@ -177,7 +204,7 @@ async def update_schema_mapping(
 @router.delete("/{mapping_id}", status_code=204)
 async def delete_schema_mapping(
     mapping_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ):
     mapping_uuid = _parse_uuid(mapping_id, "mapping_id")

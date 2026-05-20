@@ -10,7 +10,7 @@ Pulse lets any organization connect their data sources (databases, spreadsheets,
 ### Cloud (Managed)
 - Hosted by Pulse team. User signs up, verifies email, connects their data.
 - No API key or license key entry in the UI.
-- Billing via subscription (Stripe). Feature access tied to plan.
+- Billing via recurring **Paystack** subscriptions (`free`, `growth`, `pro`). Card details collected on Paystack checkout; renewals via webhooks. Feature access tied to effective plan (includes payment-failure grace period).
 - Backend knows it's cloud via `DEPLOYMENT_MODE=cloud` env var.
 
 ### Self-Hosted

@@ -1,16 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>You're now on Pro 🎉</h1>
+<h1>You're now on {{ plan_label }} 🎉</h1>
 <p>Hi {{ org_name }},</p>
 <p>
-  Your payment was successful and your Pulse account has been upgraded to the
-  <strong>Pro plan</strong>. All Pro features are now active on your workspace.
+  Your payment was successful and your Entivia account has been upgraded to the
+  <strong>{{ plan_label }} plan</strong>. All {{ plan_label }} features are now active on your workspace.
 </p>
 
 <table style="width:100%;background:#f6f8fb;border-radius:8px;padding:20px;margin:0 0 24px;border-collapse:collapse;">
   <tr>
     <td style="font-size:13px;color:#6b7280;padding:4px 0;">Plan</td>
-    <td style="font-size:13px;font-weight:600;color:#1a1a2e;text-align:right;">Pro</td>
+    <td style="font-size:13px;font-weight:600;color:#1a1a2e;text-align:right;">{{ plan_label }}</td>
   </tr>
   <tr>
     <td style="font-size:13px;color:#6b7280;padding:4px 0;">Next billing date</td>

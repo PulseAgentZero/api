@@ -1,13 +1,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Pulse — Self-Hosted All-in-One Image
 #
-# Bundles: Frontend (Next.js) · API · Worker · Agent · Scheduler · Redis · nginx
-# Users only need a Postgres database — everything else is inside this image.
+# All-in-one self-hosted image (n8n-style): Frontend · API · Worker · Agent · Scheduler · Redis · nginx
+# End users pull pulseai/pulse and run docker/compose/self-hosted (Postgres + Qdrant only).
+# Requires Postgres + Qdrant alongside this container; Redis and all app processes are bundled here.
 #
 # Build (from the api/ directory):
 #   docker buildx build \
 #     -f docker/images/pulse/Dockerfile \
 #     --build-context frontend=../dashboard \
+#     --build-arg PULSE_LICENSE_SERVER_URL=https://license.pulseai.io \
+#     --build-arg PULSE_LICENSE_JWT_ISSUER=https://license.pulseai.io \
+#     --build-arg PULSE_LICENSE_PUBLIC_KEY="$(cat license_public.pem)" \
 #     -t pulseai/pulse:latest \
 #     .
 #
@@ -58,9 +62,10 @@ RUN \
 # Copy the rest of the source
 COPY --from=frontend . .
 
-# Build vars baked into the static output
+# Build vars baked into the static output (override only via --build-arg)
+ARG PULSE_DEPLOYMENT_MODE=self_hosted
 ENV NEXT_BUILD_STANDALONE=1
-ENV NEXT_PUBLIC_DEPLOYMENT_MODE=self_hosted
+ENV NEXT_PUBLIC_DEPLOYMENT_MODE=${PULSE_DEPLOYMENT_MODE}
 # Empty = relative URLs → nginx routes /api/* to FastAPI on the same host
 ENV NEXT_PUBLIC_API_URL=""
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -71,16 +76,36 @@ RUN npm run build
 # ── Stage 3: Runtime image ───────────────────────────────────────────────────
 FROM python:3.12-slim
 
+# License + deployment mode: set only at image build (not via customer .env at runtime).
+ARG PULSE_LICENSE_SERVER_URL=https://license.pulseai.io
+ARG PULSE_LICENSE_JWT_ISSUER=https://license.pulseai.io
+ARG PULSE_LICENSE_PUBLIC_KEY=
+
 LABEL org.opencontainers.image.title="Pulse (Self-Hosted)"
 LABEL org.opencontainers.image.vendor="AgentZero"
-LABEL org.opencontainers.image.description="All-in-one self-hosted Pulse image. Requires only a Postgres database."
+LABEL org.opencontainers.image.description="All-in-one self-hosted Pulse image. Requires Postgres and Qdrant; bundles Redis and all app services."
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    DEPLOYMENT_MODE=self_hosted \
     # Tell the backend to allow requests from localhost (nginx in the same container)
     FRONTEND_URL=http://localhost
+
+ENV PULSE_LICENSE_SERVER_URL=${PULSE_LICENSE_SERVER_URL} \
+    PULSE_LICENSE_JWT_ISSUER=${PULSE_LICENSE_JWT_ISSUER} \
+    PULSE_LICENSE_PUBLIC_KEY=${PULSE_LICENSE_PUBLIC_KEY}
+
+RUN mkdir -p /etc/pulse && python3 -c "\
+import json, os; \
+cfg = { \
+    'deployment_mode': 'self_hosted', \
+    'license_server_url': os.environ.get('PULSE_LICENSE_SERVER_URL', '').rstrip('/'), \
+    'license_jwt_issuer': os.environ.get('PULSE_LICENSE_JWT_ISSUER', '').rstrip('/') or None, \
+}; \
+pk = (os.environ.get('PULSE_LICENSE_PUBLIC_KEY') or '').strip(); \
+if pk: cfg['license_public_key'] = pk; \
+open('/etc/pulse/build-config.json', 'w').write(json.dumps(cfg)) \
+"
 
 WORKDIR /app
 
@@ -95,11 +120,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     redis-server \
     curl \
+    gosu \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data/redis /var/log/pulse \
-    && chmod 777 /data/redis /var/log/pulse
+    && useradd -m -u 1001 -s /bin/sh pulse \
+    && mkdir -p /data/redis /var/log/pulse /app/uploads \
+    && chown -R pulse:pulse /var/log/pulse /app/uploads \
+    && chmod 775 /data/redis /var/log/pulse
 
 # Python packages from builder
 COPY --from=py-builder /install /usr/local
@@ -108,6 +136,7 @@ COPY --from=py-builder /install /usr/local
 COPY app/        ./app/
 COPY alembic.ini .
 COPY scripts/    ./scripts/
+RUN chown -R pulse:pulse /app
 
 # Next.js standalone output
 #   .next/standalone/ → the minimal Node.js server (server.js + compiled app)
@@ -116,6 +145,7 @@ COPY scripts/    ./scripts/
 COPY --from=frontend-builder /frontend/.next/standalone/   /frontend/
 COPY --from=frontend-builder /frontend/.next/static/       /frontend/.next/static/
 COPY --from=frontend-builder /frontend/public/             /frontend/public/
+RUN chown -R pulse:pulse /frontend
 
 # nginx config — replace the default site with ours
 RUN rm -f /etc/nginx/sites-enabled/default

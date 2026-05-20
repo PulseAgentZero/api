@@ -3,6 +3,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.agent_conversation import AgentConversation
 
 
@@ -52,6 +53,7 @@ class AgentConversationRepository:
         current = {"messages": list((conv.messages or {}).get("messages", []))}
         current["messages"].extend(messages)
         conv.messages = current
+        touch_updated_at(conv)
         return conv
 
     async def delete(self, conversation_id: UUID) -> bool:

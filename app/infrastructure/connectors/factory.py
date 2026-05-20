@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 from app.api.schemas.connection import CreateConnectionRequest
 from app.api.errors import bad_request
+from app.infrastructure.connectors.connector_credentials import build_bigquery_stored_secret
 from app.infrastructure.connectors.payload import pulse_api_blob
 from app.infrastructure.database.sql_connect import mssql_odbc_query
 
@@ -72,7 +73,23 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
             },
         }
 
-    if ct in ("snowflake", "bigquery", "databricks"):
+    if ct == "bigquery":
+        url = (body.connection_url or "").strip()
+        if not url:
+            raise bad_request("BAD_REQUEST", "connection_url is required for BigQuery")
+        secret = build_bigquery_stored_secret(url, body.bigquery_service_account_json)
+        return {
+            "plaintext_secret": secret,
+            "connector_type": "bigquery",
+            "connection_meta": {
+                "kind": "bigquery",
+                "db_type": "bigquery",
+                "provider": "bigquery",
+                "uses_service_account": bool((body.bigquery_service_account_json or "").strip()),
+            },
+        }
+
+    if ct in ("snowflake", "databricks"):
         url = (body.connection_url or "").strip()
         if not url:
             raise bad_request("BAD_REQUEST", "connection_url is required for this warehouse connector")
@@ -120,20 +137,41 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
         }
 
     if ct == "google_sheets":
-        if not body.google_sheets_api_key or not body.google_spreadsheet_id:
-            raise bad_request("BAD_REQUEST", "google_sheets_api_key and google_spreadsheet_id are required")
-        blob = pulse_api_blob(
-            "google_sheets",
-            api_key=body.google_sheets_api_key.strip(),
-            spreadsheet_id=body.google_spreadsheet_id.strip(),
-        )
+        spreadsheet_id = (body.google_spreadsheet_id or "").strip()
+        if not spreadsheet_id:
+            raise bad_request("BAD_REQUEST", "google_spreadsheet_id is required")
+        api_key = (body.google_sheets_api_key or "").strip()
+        sa_json = (body.google_service_account_json or "").strip()
+        auth = (body.google_auth_method or "").strip().lower()
+        if auth not in ("", "api_key", "service_account"):
+            raise bad_request("BAD_REQUEST", "google_auth_method must be api_key or service_account")
+        use_sa = auth == "service_account" or (sa_json and not api_key)
+        if use_sa:
+            if not sa_json:
+                raise bad_request("BAD_REQUEST", "google_service_account_json is required for service account auth")
+            blob = pulse_api_blob(
+                "google_sheets",
+                spreadsheet_id=spreadsheet_id,
+                service_account_json=sa_json,
+            )
+            auth_mode = "service_account"
+        else:
+            if not api_key:
+                raise bad_request("BAD_REQUEST", "google_sheets_api_key is required for API key auth")
+            blob = pulse_api_blob(
+                "google_sheets",
+                api_key=api_key,
+                spreadsheet_id=spreadsheet_id,
+            )
+            auth_mode = "api_key"
         return {
             "plaintext_secret": blob,
             "connector_type": "google_sheets",
             "connection_meta": {
                 "kind": "google_sheets",
                 "db_type": "google_sheets",
-                "spreadsheet_id": body.google_spreadsheet_id.strip(),
+                "spreadsheet_id": spreadsheet_id,
+                "auth_mode": auth_mode,
             },
         }
 
@@ -157,15 +195,19 @@ def build_encrypted_secret_and_row_fields(body: CreateConnectionRequest) -> dict
             secret_access_key=body.s3_secret_access_key.strip(),
             region=body.s3_region or "us-east-1",
         )
+        meta: dict = {
+            "kind": "s3",
+            "db_type": "s3",
+            "bucket": body.s3_bucket.strip(),
+            "region": body.s3_region or "us-east-1",
+        }
+        prefix = (body.s3_prefix or "").strip()
+        if prefix:
+            meta["prefix"] = prefix
         return {
             "plaintext_secret": blob,
             "connector_type": "s3",
-            "connection_meta": {
-                "kind": "s3",
-                "db_type": "s3",
-                "bucket": body.s3_bucket.strip(),
-                "region": body.s3_region or "us-east-1",
-            },
+            "connection_meta": meta,
         }
 
     if ct == "gcs":

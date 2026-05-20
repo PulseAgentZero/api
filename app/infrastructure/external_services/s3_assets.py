@@ -1,22 +1,28 @@
-"""Upload arbitrary bytes to S3 for org-scoped assets (avatars, logos, CSVs, etc.)."""
+"""Asset upload helpers — delegates to the configured storage backend.
+
+Supported backends (set STORAGE_BACKEND env var):
+  s3     → AWS S3
+  minio  → MinIO or any S3-compatible provider (Cloudflare R2, DO Spaces, etc.)
+  local  → local filesystem (served at /assets by the API)
+
+Auto-detection: MinIO if MINIO_ENDPOINT_URL is set, S3 if ASSETS_S3_BUCKET is set,
+otherwise local.
+
+These helpers are thin wrappers kept for backward compatibility with existing route code.
+New code should import from app.infrastructure.storage directly.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import mimetypes
 import os
 import uuid
-from typing import BinaryIO
 from uuid import UUID
 
-from app.config.settings import settings
+from app.infrastructure.storage.factory import get_storage_backend
 
 logger = logging.getLogger(__name__)
-
-
-def _guess_content_type(filename: str, fallback: str) -> str:
-    guessed, _ = mimetypes.guess_type(filename)
-    return guessed or fallback
 
 
 def build_object_key(
@@ -26,11 +32,13 @@ def build_object_key(
     filename: str,
     prefix: str | None = None,
 ) -> str:
-    """Return S3 object key: ``{prefix}/org/{org_id}/{category}/{uuid}_{safe_name}``."""
-    base = (prefix or settings.ASSETS_S3_PREFIX or "assets").strip("/")
-    safe = os.path.basename(filename).replace(" ", "_")[:200] or "file"
-    uid = uuid.uuid4().hex[:12]
-    return f"{base}/org/{org_id}/{category}/{uid}_{safe}"
+    from app.infrastructure.storage.base import build_object_key as _build
+    return _build(
+        org_id=org_id,
+        category=category,
+        filename=filename,
+        prefix=prefix or os.getenv("ASSETS_S3_PREFIX", "assets"),
+    )
 
 
 def upload_bytes_to_s3(
@@ -42,53 +50,57 @@ def upload_bytes_to_s3(
     content_type: str | None = None,
     object_key: str | None = None,
 ) -> str:
-    """Upload ``data`` to S3 and return a public or virtual-host URL.
+    """Synchronous upload wrapper (runs the async backend in a new event loop).
 
-    Requires ``ASSETS_S3_BUCKET`` and AWS credentials (env, IAM role, or default chain).
-
-    :param category: Logical folder, e.g. ``profile``, ``logo``, ``data``, ``csv``.
-    :raises RuntimeError: If bucket is not configured or boto3 / upload fails.
+    Returns the public URL. Raises RuntimeError on failure.
     """
-    bucket = (settings.ASSETS_S3_BUCKET or "").strip()
-    if not bucket:
-        raise RuntimeError("ASSETS_S3_BUCKET is not configured")
+    backend = get_storage_backend()
+    if not backend.is_configured():
+        raise RuntimeError(
+            f"Storage backend is not configured. "
+            f"Set STORAGE_BACKEND and the required variables for your chosen backend."
+        )
+
+    async def _upload():
+        url, key = await backend.upload(
+            data,
+            org_id=org_id,
+            category=category,
+            filename=filename,
+            content_type=content_type or "application/octet-stream",
+        )
+        return url
 
     try:
-        import boto3
-        from botocore.exceptions import BotoCoreError, ClientError
-    except ImportError as exc:
-        raise RuntimeError("boto3 is required for S3 uploads") from exc
-
-    key = object_key or build_object_key(org_id=org_id, category=category, filename=filename)
-    ct = content_type or _guess_content_type(filename, "application/octet-stream")
-    region = (settings.AWS_REGION or os.getenv("AWS_REGION") or "us-east-1").strip()
-
-    client = boto3.client("s3", region_name=region)
-    try:
-        client.put_object(Bucket=bucket, Key=key, Body=data, ContentType=ct)
-    except (BotoCoreError, ClientError) as exc:
-        logger.exception("S3 put_object failed bucket=%s key=%s", bucket, key)
-        raise RuntimeError(f"S3 upload failed: {exc}") from exc
-
-    if settings.ASSETS_PUBLIC_BASE_URL:
-        base = settings.ASSETS_PUBLIC_BASE_URL.rstrip("/")
-        return f"{base}/{key}"
-    if region == "us-east-1":
-        return f"https://{bucket}.s3.amazonaws.com/{key}"
-    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Already inside an async context (FastAPI) — schedule as task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _upload())
+                return future.result()
+        else:
+            return loop.run_until_complete(_upload())
+    except Exception as exc:
+        raise RuntimeError(f"Upload failed: {exc}") from exc
 
 
-def upload_fileobj_to_s3(
-    fileobj: BinaryIO,
+async def upload_bytes(
+    data: bytes,
     *,
     org_id: UUID,
     category: str,
     filename: str,
     content_type: str | None = None,
-) -> str:
-    data = fileobj.read()
-    if not isinstance(data, bytes):
-        raise TypeError("file object must yield bytes")
-    return upload_bytes_to_s3(
-        data, org_id=org_id, category=category, filename=filename, content_type=content_type
+) -> tuple[str, str]:
+    """Async upload. Returns (public_url, object_key). Preferred over upload_bytes_to_s3."""
+    backend = get_storage_backend()
+    if not backend.is_configured():
+        raise RuntimeError("Storage backend is not configured")
+    return await backend.upload(
+        data,
+        org_id=org_id,
+        category=category,
+        filename=filename,
+        content_type=content_type or "application/octet-stream",
     )

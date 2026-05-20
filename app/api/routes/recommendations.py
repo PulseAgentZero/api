@@ -4,17 +4,17 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 from app.api.errors import bad_request, not_found
-from app.infrastructure.database.models.org_notification import OrgNotification
 from app.infrastructure.database.models.user import User
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.infrastructure.audit import log_audit
 from app.infrastructure.database.session import get_db
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,16 @@ async def action_recommendation(
     rec.actioned_at = datetime.now(timezone.utc)
     if body and body.outcome_notes:
         rec.outcome_notes = body.outcome_notes
+    touch_updated_at(rec)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="recommendation.actioned",
+        resource="recommendation",
+        resource_id=rec.id,
+        metadata={"entity_id": rec.entity_id},
+    )
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
@@ -148,6 +158,16 @@ async def dismiss_recommendation(
     if rec.status in ("actioned", "dismissed"):
         raise bad_request("BAD_REQUEST", "Already actioned or dismissed")
     rec.status = "dismissed"
+    touch_updated_at(rec)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="recommendation.dismissed",
+        resource="recommendation",
+        resource_id=rec.id,
+        metadata={"reason": body.reason if body else None},
+    )
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)
@@ -170,26 +190,28 @@ async def escalate_recommendation(
     if rec.status in ("actioned", "dismissed", "escalated"):
         raise bad_request("BAD_REQUEST", "Recommendation cannot be escalated in its current state")
     rec.status = "escalated"
+    touch_updated_at(rec)
     await db.flush()
-    mgrs = await db.execute(
-        select(User).where(
-            User.org_id == current_user.org_id,
-            User.is_active.is_(True),
-            User.role.in_(("admin", "manager")),
-        )
+    from app.services.notification_service import dashboard_url, notify_admins_and_managers
+
+    await notify_admins_and_managers(
+        db,
+        current_user.org_id,
+        title="Recommendation escalated",
+        body=rec.title,
+        type="warning",
+        source="recommendation",
+        source_id=rec.id,
+        action_url=dashboard_url(f"/dashboard/recommendations"),
     )
-    for u in mgrs.scalars().all():
-        db.add(
-            OrgNotification(
-                org_id=current_user.org_id,
-                user_id=u.id,
-                title="Recommendation escalated",
-                body=rec.title,
-                type="warning",
-                source="recommendation",
-                source_id=rec.id,
-            )
-        )
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="recommendation.escalated",
+        resource="recommendation",
+        resource_id=rec.id,
+    )
     await db.commit()
     await db.refresh(rec)
     return _rec_out(rec)

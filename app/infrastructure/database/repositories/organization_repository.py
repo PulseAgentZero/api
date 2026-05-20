@@ -1,9 +1,10 @@
 import re
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
 
 
@@ -25,6 +26,10 @@ class OrganizationRepository:
         result = await self.db.execute(select(Organization).where(Organization.slug == slug))
         return result.scalar_one_or_none()
 
+    async def count_all(self) -> int:
+        result = await self.db.execute(select(func.count()).select_from(Organization))
+        return int(result.scalar() or 0)
+
     async def create(self, name: str) -> Organization:
         base = _slugify(name)
         slug = base
@@ -37,6 +42,9 @@ class OrganizationRepository:
             slug = f"{base}-{n}"[:80]
 
         org = Organization(name=name, slug=slug)
+        if settings.DEPLOYMENT_MODE == "self_hosted":
+            org.deployment_mode = "self_hosted"
+            org.plan = "pro"
         self.db.add(org)
         await self.db.flush()
         return org

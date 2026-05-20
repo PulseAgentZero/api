@@ -66,4 +66,14 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "ACCOUNT_DEACTIVATED", "message": "Account deactivated"},
         )
+    from app.infrastructure.database.repositories.organization_repository import (
+        OrganizationRepository,
+    )
+
+    org = await OrganizationRepository(db).get_by_id(user.org_id)
+    if org and org.deleted_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "ORG_DELETED", "message": "This organization has been deleted"},
+        )
     return user

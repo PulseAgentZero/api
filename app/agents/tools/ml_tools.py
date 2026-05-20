@@ -32,7 +32,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.tools.base import Tool, ToolParam
@@ -43,6 +43,7 @@ from app.agents.tools.client_db import (
     validate_identifier,
 )
 from app.infrastructure.database.client_queries import get_schema_mapping
+from app.infrastructure.database.models.connection import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -87,20 +88,46 @@ def build_ml_tools(db: AsyncSession, org_id: UUID) -> list[Tool]:
         """
         limit_val = max(1, min(int(limit), 10000))
         mapping = await get_schema_mapping(db, org_id)
-        engine, conn = await open_client_engine(db, org_id)
-        try:
-            async with safe_client_connection(engine, conn) as client_conn:
-                table = validate_identifier(mapping.entity_table, "entity table")
-                quoted_table = quote_identifier(table, conn.db_type)
-                sql = f"SELECT * FROM {quoted_table} LIMIT :lim"
-                result = await client_conn.execute(
-                    text(sql), {"lim": limit_val}
-                )
-                rows = result.all()
-                col_names = list(result.keys())
-                records = [dict(zip(col_names, row)) for row in rows]
-        finally:
-            await engine.dispose()
+        conn_result = await db.execute(
+            select(Connection).where(
+                Connection.id == mapping.connection_id,
+                Connection.org_id == org_id,
+                Connection.deleted_at.is_(None),
+            )
+        )
+        mapped_conn = conn_result.scalar_one_or_none()
+        if not mapped_conn:
+            return {"error": "Mapped connection is missing or has been deleted"}
+
+        from app.services.studio_file_source_service import (
+            execute_file_source_query,
+            supports_studio_file_queries,
+        )
+
+        if supports_studio_file_queries(mapped_conn):
+            table = validate_identifier(mapping.entity_table, "entity table")
+            result = await execute_file_source_query(
+                mapped_conn,
+                f'SELECT * FROM "{table}" LIMIT {limit_val}',
+                page=1,
+                page_size=limit_val,
+            )
+            records = result.get("rows", [])
+        else:
+            engine, conn = await open_client_engine(db, org_id, mapping.connection_id)
+            try:
+                async with safe_client_connection(engine, conn) as client_conn:
+                    table = validate_identifier(mapping.entity_table, "entity table")
+                    quoted_table = quote_identifier(table, conn.db_type)
+                    sql = f"SELECT * FROM {quoted_table} LIMIT :lim"
+                    result = await client_conn.execute(
+                        text(sql), {"lim": limit_val}
+                    )
+                    rows = result.all()
+                    col_names = list(result.keys())
+                    records = [dict(zip(col_names, row)) for row in rows]
+            finally:
+                await engine.dispose()
 
         if not records:
             return {"error": "No data rows found in entity table"}

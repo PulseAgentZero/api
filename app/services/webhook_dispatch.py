@@ -38,6 +38,22 @@ def webhook_url_from_config(cfg: dict[str, Any]) -> str | None:
     return None
 
 
+def is_deliverable_http_channel(row: NotificationChannel) -> bool:
+    """True when the channel can receive JSON POSTs (webhook or Slack incoming webhook)."""
+    if row.type not in ("webhook", "slack"):
+        return False
+    return webhook_url_from_config(parse_channel_config(row)) is not None
+
+
+def channel_subscribes_to_event(cfg: dict[str, Any], event_type: str) -> bool:
+    """If config.events is set, only deliver listed event types; otherwise deliver all."""
+    raw = cfg.get("events")
+    if not isinstance(raw, list) or len(raw) == 0:
+        return True
+    allowed = {str(x) for x in raw}
+    return event_type in allowed
+
+
 async def post_json_webhook(
     url: str,
     payload: dict[str, Any],
@@ -88,10 +104,16 @@ async def execute_pending_delivery(db: AsyncSession, delivery: WebhookDelivery) 
         return
 
     cfg = parse_channel_config(ch)
+    if is_deliverable_http_channel(ch) and not channel_subscribes_to_event(cfg, delivery.event_type):
+        delivery.status = "skipped"
+        delivery.response_body = "Event not subscribed on this channel"
+        delivery.last_attempt_at = datetime.now(timezone.utc)
+        return
+
     url = webhook_url_from_config(cfg)
-    if ch.type != "webhook" or not url:
+    if not is_deliverable_http_channel(ch):
         delivery.status = "failed"
-        delivery.response_body = "Channel is not a webhook or url missing in config"
+        delivery.response_body = "Channel is not a webhook/slack URL channel or url missing in config"
         delivery.last_attempt_at = datetime.now(timezone.utc)
         return
 
@@ -119,8 +141,10 @@ async def send_channel_test(
         return False, "Channel not found"
     cfg = parse_channel_config(row)
     url = webhook_url_from_config(cfg)
-    if row.type != "webhook" or not url:
-        return False, "Configure a webhook channel with type 'webhook' and config.url (https://...)"
+    if not is_deliverable_http_channel(row):
+        return False, (
+            "Configure a webhook or Slack channel with config.url or config.webhook_url (https://...)"
+        )
     payload = {
         "event": _TEST_EVENT,
         "sent_at": datetime.now(timezone.utc).isoformat(),

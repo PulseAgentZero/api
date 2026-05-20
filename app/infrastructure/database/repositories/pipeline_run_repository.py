@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.database.models.pipeline_run import PipelineRun
 
 # Runs in these states are considered "in flight" for dedup purposes
@@ -65,12 +66,14 @@ class PipelineRunRepository:
         run.status = "running"
         run.started_at = datetime.now(timezone.utc)
         run.current_step = "starting"
+        touch_updated_at(run)
         await self.db.flush()
 
     async def update(self, run: PipelineRun, **fields: Any) -> None:
         for key, value in fields.items():
             if hasattr(run, key):
                 setattr(run, key, value)
+        touch_updated_at(run)
         await self.db.flush()
 
     async def finalize(
@@ -109,4 +112,5 @@ class PipelineRunRepository:
         run.step_metrics = step_metrics
         run.generation_caps = generation_caps
         run.rag_metrics = rag_metrics
+        touch_updated_at(run)
         await self.db.flush()

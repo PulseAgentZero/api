@@ -23,13 +23,17 @@ from app.infrastructure.database.models.connection import Connection
 
 
 async def open_client_engine(
-    db: AsyncSession, org_id: UUID
+    db: AsyncSession, org_id: UUID, connection_id: UUID | None = None
 ) -> tuple[AsyncEngine, Connection]:
     """Open an async engine pointed at the org's client database.
 
     Caller owns disposal (`await engine.dispose()`).
     """
-    return await _impl_get_client_engine(db, org_id)
+    if connection_id is None:
+        return await _impl_get_client_engine(db, org_id)
+    from app.infrastructure.database.client_queries import _get_client_engine_for_connection
+
+    return await _get_client_engine_for_connection(db, org_id, connection_id)
 
 
 def safe_client_connection(

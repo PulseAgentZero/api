@@ -34,6 +34,7 @@ class Subscription(Base, UUIDMixin, TimestampMixin):
     paystack_plan_code: Mapped[str | None] = mapped_column(Text)
     authorization_code: Mapped[str | None] = mapped_column(Text)
     next_payment_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=func.now(), onupdate=utcnow

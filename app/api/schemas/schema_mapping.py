@@ -43,3 +43,5 @@ class SchemaMappingResponse(BaseModel):
     target_column: str | None
     rag_config: dict | None
     created_at: datetime
+    pipeline_triggered: bool = False
+    pipeline_run_id: UUID | None = None

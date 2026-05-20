@@ -106,10 +106,51 @@ async def test_connection(
             await engine.dispose()
 
 
+def _introspect_bigquery_service_account_sync(payload: dict[str, object]) -> list[TableInfo]:
+    import json
+
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+
+    from app.infrastructure.connectors.connector_credentials import _parse_bigquery_url
+
+    connection_url = str(payload.get("connection_url", ""))
+    sa_json = str(payload.get("service_account_json", ""))
+    project, dataset = _parse_bigquery_url(connection_url)
+    info = json.loads(sa_json)
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/bigquery"],
+    )
+    client = bigquery.Client(credentials=creds, project=project or info.get("project_id"))
+    tables: list[TableInfo] = []
+    if dataset:
+        for tbl in client.list_tables(f"{project}.{dataset}"):
+            table_ref = client.get_table(tbl)
+            columns = [
+                ColumnInfo(name=f.name, data_type=f.field_type, nullable=f.mode != "REQUIRED")
+                for f in table_ref.schema
+            ]
+            tables.append(TableInfo(name=table_ref.table_id, columns=columns))
+    else:
+        for ds in client.list_datasets(project=project):
+            for tbl in client.list_tables(ds.reference):
+                table_ref = client.get_table(tbl)
+                columns = [
+                    ColumnInfo(name=f.name, data_type=f.field_type, nullable=f.mode != "REQUIRED")
+                    for f in table_ref.schema
+                ]
+                tables.append(TableInfo(name=f"{ds.dataset_id}.{table_ref.table_id}", columns=columns))
+    return tables
+
+
 async def introspect_schema(dsn: str, sslmode: str | None = None) -> list[TableInfo]:
     """Introspect tables + columns."""
     raw = dsn.strip()
-    if parse_pulse_api_payload(raw) is not None:
+    api = parse_pulse_api_payload(raw)
+    if api is not None:
+        if api.get("kind") == "bigquery" and api.get("service_account_json"):
+            return await asyncio.to_thread(_introspect_bigquery_service_account_sync, api)
         raise ValueError("Schema introspection is not available for API or object-storage connectors")
     if uses_sync_sqlalchemy_engine(raw):
         return await asyncio.to_thread(_introspect_schema_sync, raw)

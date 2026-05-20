@@ -5,7 +5,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.role_deps import require_role
@@ -25,12 +25,19 @@ async def list_deliveries(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    stmt = select(WebhookDelivery).where(WebhookDelivery.org_id == current_user.org_id)
+    conds = [WebhookDelivery.org_id == current_user.org_id]
     if channel_id:
-        stmt = stmt.where(WebhookDelivery.channel_id == channel_id)
+        conds.append(WebhookDelivery.channel_id == channel_id)
     if status_filter:
-        stmt = stmt.where(WebhookDelivery.status == status_filter)
-    stmt = stmt.order_by(WebhookDelivery.created_at.desc()).offset((page - 1) * limit).limit(limit)
+        conds.append(WebhookDelivery.status == status_filter)
+    total = await db.scalar(select(func.count()).select_from(WebhookDelivery).where(*conds)) or 0
+    stmt = (
+        select(WebhookDelivery)
+        .where(*conds)
+        .order_by(WebhookDelivery.created_at.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
     result = await db.execute(stmt)
     rows = list(result.scalars().all())
     return {
@@ -46,7 +53,10 @@ async def list_deliveries(
                 "created_at": d.created_at.isoformat(),
             }
             for d in rows
-        ]
+        ],
+        "total": int(total),
+        "page": page,
+        "limit": limit,
     }
 
 

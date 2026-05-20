@@ -6,12 +6,20 @@ Kept in the services layer so the worker process never has to import FastAPI cod
 from __future__ import annotations
 
 import logging
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.schemas.connection import ColumnInfo, TableInfo
+from app.infrastructure.crypto import decrypt_dsn
 from app.infrastructure.database.connection_tester import introspect_schema
+from app.infrastructure.database.models.connection import Connection
 from app.infrastructure.database.repositories.schema_mapping_repository import SchemaMappingRepository
+from app.services.studio_file_source_service import (
+    fetch_file_source_schema,
+    supports_studio_file_queries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,30 +34,59 @@ def infer_col(columns: list, *patterns: str) -> str | None:
     return None
 
 
+def file_schema_dicts_to_table_info(tables: list[dict[str, Any]]) -> list[TableInfo]:
+    """Normalize file-source schema dicts into TableInfo objects."""
+    result: list[TableInfo] = []
+    for table in tables:
+        columns = [
+            ColumnInfo(
+                name=str(col["name"]),
+                data_type=str(col.get("data_type") or "text"),
+                nullable=bool(col.get("nullable", True)),
+            )
+            for col in table.get("columns") or []
+        ]
+        result.append(TableInfo(name=str(table["name"]), columns=columns))
+    return result
+
+
+async def introspect_connection_tables(conn: Connection) -> list[TableInfo]:
+    """Introspect tables for any connection type (SQL DB or file source)."""
+    if supports_studio_file_queries(conn):
+        raw = await fetch_file_source_schema(conn)
+        return file_schema_dicts_to_table_info(raw)
+    if not conn.encrypted_dsn:
+        raise ValueError("Connection has no credentials for schema introspection")
+    dsn = decrypt_dsn(conn.encrypted_dsn)
+    return await introspect_schema(dsn, sslmode=conn.sslmode)
+
+
 async def auto_create_schema_mapping(
     db: AsyncSession,
     *,
     org_id: UUID,
-    connection_id: UUID,
-    plaintext_dsn: str,
-    sslmode: str | None,
+    conn: Connection,
     entity_label: str | None,
     goal_label: str | None,
-) -> None:
-    """Introspect the client DB and upsert a best-guess schema mapping for the org.
+) -> UUID | None:
+    """Introspect the client data source and upsert a best-guess schema mapping for the org.
 
     Scores tables by name heuristics, infers key columns, and writes (or updates)
     the schema_mappings row including the full raw_schema cache used by
     GET /onboarding/connection/schema.
     """
+    connection_id = conn.id
     try:
-        tables = await introspect_schema(plaintext_dsn, sslmode=sslmode)
+        tables = await introspect_connection_tables(conn)
     except Exception:
-        logger.warning("Schema introspection failed for connection %s — skipping auto-mapping", connection_id)
-        return
+        logger.warning(
+            "Schema introspection failed for connection %s — skipping auto-mapping",
+            connection_id,
+        )
+        return None
 
     if not tables:
-        return
+        return None
 
     entity_kw = (entity_label or "").lower().strip()
 
@@ -101,7 +138,7 @@ async def auto_create_schema_mapping(
     repo = SchemaMappingRepository(db)
     existing = await repo.list_by_org(org_id)
     if existing:
-        await repo.update(
+        mapping = await repo.update(
             existing[0].id,
             connection_id=connection_id,
             entity_table=best.name,
@@ -111,8 +148,9 @@ async def auto_create_schema_mapping(
             target_column=target_col,
             raw_schema=raw_schema,
         )
+        return mapping.id if mapping else None
     else:
-        await repo.create(
+        mapping = await repo.create(
             org_id=org_id,
             connection_id=connection_id,
             entity_table=best.name,
@@ -122,3 +160,23 @@ async def auto_create_schema_mapping(
             target_column=target_col,
             raw_schema=raw_schema,
         )
+        return mapping.id
+
+
+async def trigger_auto_schema_mapping(
+    db: AsyncSession,
+    *,
+    org_id: UUID,
+    conn: Connection,
+) -> UUID | None:
+    """Run auto-mapping using org entity/goal labels (inline fallback when Redis queue is unavailable)."""
+    from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
+
+    org = await OrganizationRepository(db).get_by_id(org_id)
+    return await auto_create_schema_mapping(
+        db,
+        org_id=org_id,
+        conn=conn,
+        entity_label=org.entity_label if org else None,
+        goal_label=org.goal_label if org else None,
+    )

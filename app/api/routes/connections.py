@@ -1,6 +1,8 @@
 import logging
 import os
 import uuid as uuid_mod
+
+import pandas as pd
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, unquote
 from uuid import UUID
@@ -9,6 +11,9 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
+from app.api.auth.role_deps import require_role
+
+MANAGER_PLUS = require_role("admin", "manager")
 from app.api.dependencies.plan_gate import max_cloud_free_connections
 from app.api.errors import (
     PulseHTTPException,
@@ -20,18 +25,33 @@ from app.api.errors import (
 from app.api.schemas.connection import (
     ConnectionResponse,
     CreateConnectionRequest,
+    FileUploadBatchError,
+    FileUploadBatchResponse,
     IntrospectResponse,
     TablePreviewResponse,
     TestConnectionResponse,
     UpdateConnectionRequest,
 )
+from app.config.constants import (
+    FILE_UPLOAD_MAX_BYTES,
+    FILE_UPLOAD_MAX_FILES_PER_BATCH,
+)
+from app.infrastructure.audit import log_audit
 from app.infrastructure.crypto import decrypt_dsn, encrypt_dsn
+from app.infrastructure.database.base import touch_updated_at
 from app.infrastructure.connectors.factory import _make_sql_dsn, build_encrypted_secret_and_row_fields
 from app.infrastructure.connectors.payload import parse_pulse_api_payload
-from app.infrastructure.database.connection_tester import (
-    introspect_schema,
-    preview_table_rows,
-    test_connection,
+from app.infrastructure.connectors.connection_test import test_connection_record
+from app.infrastructure.database.connection_tester import preview_table_rows
+from app.api.safe_errors import log_and_bad_request, public_message, sanitize_connection_test_message
+from app.services.schema_introspection import (
+    introspect_connection_tables,
+    trigger_auto_schema_mapping,
+)
+from app.services.pipeline_trigger import maybe_trigger_initial_pipeline
+from app.services.studio_file_source_service import (
+    load_file_source_frames,
+    supports_studio_file_queries,
 )
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
@@ -127,10 +147,16 @@ _CONNECTOR_CATALOG = [
         "display_name": "Google BigQuery",
         "category": "Cloud Warehouse",
         "icon_slug": "bigquery",
-        "description": "Connect to Google BigQuery.",
+        "description": "Connect to Google BigQuery with a project URL and optional service account JSON.",
         "fields": [
             {"key": "connection_url", "label": "Connection URL", "type": "string", "required": True,
-             "placeholder": "bigquery://project/dataset"},
+             "placeholder": "bigquery://my-project/my_dataset",
+             "help": "Format: bigquery://project_id/dataset_id"},
+            {"key": "bigquery_service_account_json", "label": "Service Account JSON",
+             "type": "textarea", "required": False,
+             "placeholder": '{"type": "service_account", "project_id": "...", ...}',
+             "help": "Paste the full JSON key from GCP (IAM → Service Accounts → Keys). "
+                      "Required unless Application Default Credentials are configured on the Pulse host."},
         ],
     },
     {
@@ -188,11 +214,22 @@ _CONNECTOR_CATALOG = [
         "display_name": "Google Sheets",
         "category": "SaaS / Spreadsheet",
         "icon_slug": "google_sheets",
-        "description": "Connect to a Google Spreadsheet using an API key.",
+        "description": "Connect to a Google Spreadsheet with an API key or a service account.",
         "fields": [
-            {"key": "google_sheets_api_key", "label": "Google API Key", "type": "password", "required": True},
+            {"key": "google_auth_method", "label": "Authentication", "type": "select",
+             "required": True, "default": "api_key",
+             "options": ["api_key", "service_account"]},
             {"key": "google_spreadsheet_id", "label": "Spreadsheet ID", "type": "string", "required": True,
-             "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"},
+             "placeholder": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+             "help": "From the sheet URL: docs.google.com/spreadsheets/d/{id}/edit"},
+            {"key": "google_sheets_api_key", "label": "Google API Key", "type": "password",
+             "required": True, "when": {"google_auth_method": "api_key"},
+             "help": "GCP Console → APIs & Services → Credentials → API key (Sheets API enabled)"},
+            {"key": "google_service_account_json", "label": "Service Account JSON",
+             "type": "textarea", "required": True,
+             "when": {"google_auth_method": "service_account"},
+             "placeholder": '{"type": "service_account", "client_email": "...", ...}',
+             "help": "Share the spreadsheet with the service account email (Editor or Viewer)."},
         ],
     },
     {
@@ -206,6 +243,8 @@ _CONNECTOR_CATALOG = [
             {"key": "s3_access_key_id", "label": "Access Key ID", "type": "string", "required": True},
             {"key": "s3_secret_access_key", "label": "Secret Access Key", "type": "password", "required": True},
             {"key": "s3_region", "label": "Region", "type": "string", "required": False, "default": "us-east-1"},
+            {"key": "s3_prefix", "label": "Object prefix (optional)", "type": "string", "required": False,
+             "placeholder": "data/exports/", "help": "Only list CSV files under this prefix."},
         ],
     },
     {
@@ -213,22 +252,56 @@ _CONNECTOR_CATALOG = [
         "display_name": "Google Cloud Storage",
         "category": "Object Storage",
         "icon_slug": "gcs",
-        "description": "Connect to a Google Cloud Storage bucket containing CSV or Parquet files.",
+        "description": "Connect to a GCS bucket with a service account JSON key.",
         "fields": [
-            {"key": "gcs_bucket", "label": "Bucket Name", "type": "string", "required": True},
-            {"key": "gcs_service_account_json", "label": "Service Account JSON", "type": "textarea", "required": True},
+            {"key": "gcs_bucket", "label": "Bucket Name", "type": "string", "required": True,
+             "placeholder": "my-data-bucket"},
+            {"key": "gcs_service_account_json", "label": "Service Account JSON",
+             "type": "textarea", "required": True,
+             "placeholder": '{"type": "service_account", "project_id": "...", ...}',
+             "help": "GCP → IAM → Service Accounts → Keys → Add key → JSON. "
+                      "Grant Storage Object Viewer on the bucket."},
         ],
     },
     {
         "connector_type": "csv",
-        "display_name": "CSV / File Upload",
+        "display_name": "CSV or Excel file",
         "category": "File",
         "icon_slug": "csv",
-        "description": "Upload a CSV file directly. Max 50 MB. Use POST /connections/upload.",
+        "description": (
+            "Upload CSV, TSV, or Excel (.xlsx / .xls). Excel workbooks import each sheet "
+            "as a separate table. Max 500 MB per file. Use POST /connections/upload "
+            "(single file) or POST /connections/upload/batch (multiple files)."
+        ),
         "fields": [],
         "upload_endpoint": "/api/v1/connections/upload",
+        "upload_accept": [".csv", ".tsv", ".xlsx", ".xls"],
     },
 ]
+
+_UPLOAD_EXTENSIONS_CSV = frozenset({".csv", ".tsv"})
+_UPLOAD_EXTENSIONS_EXCEL = frozenset({".xlsx", ".xls"})
+_UPLOAD_EXTENSIONS_ALLOWED = _UPLOAD_EXTENSIONS_CSV | _UPLOAD_EXTENSIONS_EXCEL
+
+
+def _upload_extension(filename: str | None) -> str:
+    if not filename or "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[-1].lower()
+
+
+def _connector_type_for_upload(filename: str | None) -> tuple[str, str]:
+    """Return (connector_type, file_format) from the uploaded filename."""
+    ext = f".{_upload_extension(filename)}"
+    if ext in _UPLOAD_EXTENSIONS_EXCEL:
+        return "excel", "excel"
+    if ext in _UPLOAD_EXTENSIONS_CSV:
+        return "csv", "csv"
+    allowed = ", ".join(sorted(_UPLOAD_EXTENSIONS_ALLOWED))
+    raise bad_request(
+        "BAD_REQUEST",
+        f"Unsupported file type. Allowed: {allowed}",
+    )
 
 
 @router.get("/catalog")
@@ -283,6 +356,28 @@ def _connection_dsn(conn) -> str:
     return decrypt_dsn(conn.encrypted_dsn)
 
 
+async def _schedule_schema_mapping_after_connection(
+    db: AsyncSession,
+    *,
+    org_id: UUID,
+    conn,
+) -> None:
+    """Enqueue background introspection or run inline when Redis is unavailable."""
+    from app.services.pipeline_queue import enqueue_introspection_job
+
+    queued = await enqueue_introspection_job(connection_id=conn.id, org_id=org_id)
+    if not queued:
+        mapping_id = await trigger_auto_schema_mapping(db, org_id=org_id, conn=conn)
+        await db.commit()
+        if mapping_id:
+            await maybe_trigger_initial_pipeline(
+                db,
+                org_id,
+                mapping_id=mapping_id,
+                triggered_by=None,
+            )
+
+
 def _assert_live(conn) -> None:
     if conn.deleted_at is not None:
         raise not_found("Connection not found")
@@ -295,17 +390,36 @@ async def _get_current_connection(db: AsyncSession, org_id) -> object:
     return conns[-1]
 
 
-async def _test_and_mark_connection(conn) -> tuple[bool, str, str | None]:
-    try:
-        dsn = _connection_dsn(conn)
-    except PulseHTTPException as exc:
-        detail = exc.detail
-        msg = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
-        return False, msg, None
-    success, message, db_version = await test_connection(dsn, sslmode=conn.sslmode)
+async def _test_and_mark_connection(
+    conn,
+    db: AsyncSession,
+    org_id: UUID,
+) -> tuple[bool, str, str | None]:
+    previous_status = conn.status
+    success, message, db_version = await test_connection_record(
+        conn,
+        decrypt_dsn=decrypt_dsn,
+    )
     conn.status = "active" if success else "failed"
     conn.last_tested_at = datetime.now(timezone.utc)
     conn.last_test_error = None if success else message
+    touch_updated_at(conn)
+    if not success and previous_status == "active":
+        try:
+            from app.services.notification_service import notify_connection_test_failed
+
+            await notify_connection_test_failed(
+                db,
+                org_id,
+                connection_id=conn.id,
+                connection_name=conn.name or "Connection",
+                error_message=message,
+            )
+        except Exception:
+            logger.exception(
+                "In-app connection-failure notification skipped for connection %s",
+                conn.id,
+            )
     return success, message, db_version
 
 
@@ -319,25 +433,21 @@ async def list_connections(
     return [_connection_to_response(c) for c in conns]
 
 
-@router.post("/upload", response_model=ConnectionResponse, status_code=201)
-async def upload_connection_file(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> ConnectionResponse:
-    """Upload a CSV or spreadsheet file as a data source. Max file size: 50 MB.
-
-    Send as `multipart/form-data` with the file in the `file` field. The connection
-    is created with `status: "pending"` — further pipeline configuration is required
-    before the AI pipeline can use it.
-    """
-    await max_cloud_free_connections(db, current_user.org_id, await ConnectionRepository(db).count_active(current_user.org_id))
-    max_bytes = 50 * 1024 * 1024
-    upload_dir = f"/tmp/pulse_uploads/{current_user.org_id}"
+async def _stream_upload_to_disk(
+    file: UploadFile,
+    *,
+    org_id: UUID,
+    max_bytes: int = FILE_UPLOAD_MAX_BYTES,
+) -> tuple[str, str]:
+    """Persist an uploaded file under the org upload directory. Returns (dest_path, filename)."""
+    storage_root = os.getenv("LOCAL_STORAGE_PATH", "/app/uploads")
+    upload_dir = os.path.join(storage_root, "csv_connections", str(org_id))
     os.makedirs(upload_dir, exist_ok=True)
-    dest_name = f"{uuid_mod.uuid4()}_{file.filename or 'upload'}"
+    safe_name = os.path.basename(file.filename or "upload")
+    dest_name = f"{uuid_mod.uuid4()}_{safe_name}"
     dest_path = os.path.join(upload_dir, dest_name)
     size = 0
+    limit_mb = max_bytes // (1024 * 1024)
     try:
         with open(dest_path, "wb") as out:
             while True:
@@ -346,28 +456,150 @@ async def upload_connection_file(
                     break
                 size += len(chunk)
                 if size > max_bytes:
-                    raise payload_too_large("File too large")
+                    actual_mb = size / (1024 * 1024)
+                    raise payload_too_large(
+                        f"'{safe_name}' is {actual_mb:.1f} MB — the upload limit is "
+                        f"{limit_mb} MB. Split or compress the file and try again."
+                    )
                 out.write(chunk)
     except PulseHTTPException:
         if os.path.isfile(dest_path):
             os.remove(dest_path)
         raise
-    conn = await ConnectionRepository(db).create(
-        org_id=current_user.org_id,
-        name=file.filename or "Uploaded file",
-        connector_type="csv",
-        connection_meta={"kind": "csv"},
+    except Exception:
+        if os.path.isfile(dest_path):
+            os.remove(dest_path)
+        raise
+    return dest_path, safe_name
+
+
+async def _create_connection_from_uploaded_file(
+    *,
+    db: AsyncSession,
+    org_id: UUID,
+    file: UploadFile,
+    connection_name: str | None = None,
+) -> ConnectionResponse:
+    """Save one file, create a connection, test it, and schedule schema mapping."""
+    connector_type, file_format = _connector_type_for_upload(file.filename)
+    await max_cloud_free_connections(
+        db,
+        org_id,
+        await ConnectionRepository(db).count_active(org_id),
     )
-    conn.config = {"upload_path": dest_path, "original_filename": file.filename}
-    conn.status = "pending"
+    dest_path, filename = await _stream_upload_to_disk(file, org_id=org_id)
+    display_name = (connection_name or "").strip() or filename or "Uploaded file"
+
+    conn = await ConnectionRepository(db).create(
+        org_id=org_id,
+        name=display_name,
+        connector_type=connector_type,
+        connection_meta={"kind": connector_type},
+    )
+    conn.config = {
+        "upload_path": dest_path,
+        "original_filename": file.filename or filename,
+        "file_format": file_format,
+    }
+    touch_updated_at(conn)
+    success, message, _db_version = await _test_and_mark_connection(conn, db, org_id)
     await db.commit()
     await db.refresh(conn)
+    if not success:
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="TEST_CONNECTION_FAILED",
+            message=sanitize_connection_test_message(message),
+            fields={"success": "false", "connection_id": str(conn.id)},
+        )
+    await _schedule_schema_mapping_after_connection(db, org_id=org_id, conn=conn)
     return _connection_to_response(conn)
+
+
+@router.post("/upload", response_model=ConnectionResponse, status_code=201)
+async def upload_connection_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(MANAGER_PLUS),
+    db: AsyncSession = Depends(get_db),
+) -> ConnectionResponse:
+    """Upload one CSV, TSV, or Excel file as a data source (max 500 MB).
+
+    Excel workbooks (.xlsx / .xls) import each sheet as a separate table queryable in
+    Studio. For multiple files at once, use ``POST /connections/upload/batch``.
+    """
+    return await _create_connection_from_uploaded_file(
+        db=db,
+        org_id=current_user.org_id,
+        file=file,
+    )
+
+
+@router.post("/upload/batch", response_model=FileUploadBatchResponse, status_code=201)
+async def upload_connection_files_batch(
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(MANAGER_PLUS),
+    db: AsyncSession = Depends(get_db),
+) -> FileUploadBatchResponse:
+    """Upload multiple files — each becomes its own connection (max 500 MB per file).
+
+    Partial success is allowed: successfully created connections are returned alongside
+    per-file errors. Each file is independently testable and queryable in Studio.
+    """
+    if not files:
+        raise bad_request("BAD_REQUEST", "At least one file is required")
+    if len(files) > FILE_UPLOAD_MAX_FILES_PER_BATCH:
+        raise bad_request(
+            "BAD_REQUEST",
+            f"At most {FILE_UPLOAD_MAX_FILES_PER_BATCH} files per batch",
+        )
+
+    created: list[ConnectionResponse] = []
+    errors: list[FileUploadBatchError] = []
+
+    for upload in files:
+        label = upload.filename or "upload"
+        try:
+            conn = await _create_connection_from_uploaded_file(
+                db=db,
+                org_id=current_user.org_id,
+                file=upload,
+            )
+            created.append(conn)
+        except PulseHTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                message = str(detail.get("message") or exc)
+                code = detail.get("code")
+            else:
+                message = str(exc)
+                code = None
+            errors.append(
+                FileUploadBatchError(filename=label, message=message, code=code)
+            )
+        except Exception as exc:
+            logger.exception("Batch upload failed for %s", label)
+            errors.append(
+                FileUploadBatchError(
+                    filename=label,
+                    message=str(exc),
+                    code="UPLOAD_FAILED",
+                )
+            )
+
+    if not created and errors:
+        raise PulseHTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            code="BATCH_UPLOAD_FAILED",
+            message=errors[0].message,
+            fields={"errors": [e.model_dump() for e in errors]},
+        )
+
+    return FileUploadBatchResponse(connections=created, errors=errors)
 
 
 @router.post("/test", response_model=TestConnectionResponse)
 async def test_current_connection(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> TestConnectionResponse:
     """Test the org's most recent connection. Returns 422 if the test fails.
@@ -376,14 +608,16 @@ async def test_current_connection(
     """
     conn = await _get_current_connection(db, current_user.org_id)
     _assert_live(conn)
-    success, message, db_version = await _test_and_mark_connection(conn)
+    success, message, db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
     await db.flush()
     await db.commit()
     if not success:
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false"},
         )
     return TestConnectionResponse(success=True, message=message, db_version=db_version)
@@ -392,7 +626,7 @@ async def test_current_connection(
 @router.put("", response_model=ConnectionResponse)
 async def update_current_connection(
     body: UpdateConnectionRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     conn = await _get_current_connection(db, current_user.org_id)
@@ -402,7 +636,7 @@ async def update_current_connection(
 
 @router.delete("", status_code=204)
 async def delete_current_connection(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ):
     conn = await _get_current_connection(db, current_user.org_id)
@@ -428,8 +662,10 @@ async def list_connection_tables(
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
     _assert_live(conn)
-    dsn = _connection_dsn(conn)
-    tables = await introspect_schema(dsn, sslmode=conn.sslmode)
+    try:
+        tables = await introspect_connection_tables(conn)
+    except ValueError as exc:
+        raise log_and_bad_request("BAD_REQUEST", exc) from exc
     return IntrospectResponse(tables=tables)
 
 
@@ -450,11 +686,24 @@ async def preview_connection_table(
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
     _assert_live(conn)
+    if supports_studio_file_queries(conn):
+        frames = await load_file_source_frames(conn)
+        if table_name not in frames:
+            raise bad_request("BAD_REQUEST", f"Table not found: {table_name}")
+        df = frames[table_name].head(limit)
+        rows = [
+            {
+                str(col): (None if pd.isna(val) else val.item() if hasattr(val, "item") else val)
+                for col, val in record.items()
+            }
+            for record in df.to_dict(orient="records")
+        ]
+        return TablePreviewResponse(table=table_name, rows=rows, limit=limit)
     dsn = _connection_dsn(conn)
     try:
         rows = await preview_table_rows(dsn, table_name, limit=limit, sslmode=conn.sslmode)
     except ValueError as exc:
-        raise bad_request("BAD_REQUEST", str(exc)) from exc
+        raise log_and_bad_request("BAD_REQUEST", exc) from exc
     return TablePreviewResponse(table=table_name, rows=rows, limit=limit)
 
 
@@ -475,7 +724,7 @@ async def get_connection(
 @router.post("", response_model=ConnectionResponse, status_code=201)
 async def create_connection(
     body: CreateConnectionRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     """Create and immediately test a new data source connection.
@@ -497,14 +746,32 @@ async def create_connection(
         connector_type=built.get("connector_type"),
         connection_meta=built.get("connection_meta") or {},
     )
-    success, message, _db_version = await _test_and_mark_connection(conn)
+    success, message, _db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
+    if success:
+        await log_audit(
+            db,
+            org_id=current_user.org_id,
+            user_id=current_user.id,
+            action="connection.created",
+            resource="connection",
+            resource_id=conn.id,
+            metadata={"name": conn.name, "connector_type": conn.connector_type},
+        )
     await db.commit()
     if not success:
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false", "connection_id": str(conn.id)},
+        )
+    if supports_studio_file_queries(conn):
+        await _schedule_schema_mapping_after_connection(
+            db,
+            org_id=current_user.org_id,
+            conn=conn,
         )
     return _connection_to_response(conn)
 
@@ -513,7 +780,7 @@ async def create_connection(
 async def update_connection(
     connection_id: str,
     body: UpdateConnectionRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> ConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
@@ -559,7 +826,9 @@ async def _update_connection_record(
             conn.name = payload["name"]
         if "sslmode" in payload:
             conn.sslmode = payload["sslmode"]
-        success, message, _db_version = await _test_and_mark_connection(conn)
+        success, message, _db_version = await _test_and_mark_connection(
+            conn, db, conn.org_id
+        )
         await db.flush()
         await db.commit()
         if not success:
@@ -617,14 +886,14 @@ async def _update_connection_record(
             )
         )
 
-    success, message, _db_version = await _test_and_mark_connection(conn)
+    success, message, _db_version = await _test_and_mark_connection(conn, db, conn.org_id)
     await db.flush()
     await db.commit()
     if not success:
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false"},
         )
     return _connection_to_response(conn)
@@ -633,7 +902,7 @@ async def _update_connection_record(
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ):
     connection_uuid = _parse_uuid(connection_id, "connection_id")
@@ -643,13 +912,22 @@ async def delete_connection(
     _assert_live(conn)
     await ConnectionRepository(db).soft_delete(connection_uuid)
     await SchemaMappingRepository(db).deactivate_for_connection(connection_uuid)
+    await log_audit(
+        db,
+        org_id=current_user.org_id,
+        user_id=current_user.id,
+        action="connection.deleted",
+        resource="connection",
+        resource_id=connection_uuid,
+        metadata={"name": conn.name},
+    )
     await db.commit()
 
 
 @router.post("/{connection_id}/test", response_model=TestConnectionResponse)
 async def test_db_connection(
     connection_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> TestConnectionResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
@@ -657,14 +935,16 @@ async def test_db_connection(
         raise not_found("Connection not found")
     _assert_live(conn)
 
-    success, message, db_version = await _test_and_mark_connection(conn)
+    success, message, db_version = await _test_and_mark_connection(
+        conn, db, current_user.org_id
+    )
     await db.flush()
     await db.commit()
     if not success:
         raise PulseHTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             code="TEST_CONNECTION_FAILED",
-            message=message,
+            message=sanitize_connection_test_message(message),
             fields={"success": "false"},
         )
 
@@ -674,14 +954,15 @@ async def test_db_connection(
 @router.post("/{connection_id}/introspect", response_model=IntrospectResponse)
 async def introspect_db_schema(
     connection_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(MANAGER_PLUS),
     db: AsyncSession = Depends(get_db),
 ) -> IntrospectResponse:
     conn = await ConnectionRepository(db).get_by_id(_parse_uuid(connection_id, "connection_id"))
     if not conn or conn.org_id != current_user.org_id:
         raise not_found("Connection not found")
     _assert_live(conn)
-
-    dsn = _connection_dsn(conn)
-    tables = await introspect_schema(dsn, sslmode=conn.sslmode)
+    try:
+        tables = await introspect_connection_tables(conn)
+    except ValueError as exc:
+        raise log_and_bad_request("BAD_REQUEST", exc) from exc
     return IntrospectResponse(tables=tables)

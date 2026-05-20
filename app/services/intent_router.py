@@ -168,6 +168,15 @@ def _heuristic_fallback(message: str) -> IntentResult:
     if any(kw in lower for kw in ("critical", "high risk", "high-risk", "at risk", "list", "show")):
         tier = "critical" if "critical" in lower else ("high" if "high" in lower else None)
         return IntentResult("lookup_entities", 0.6, tier_filter=tier)
+    if any(
+        kw in lower
+        for kw in (
+            "dashboard", "build a chart", "build me a chart",
+            "visuali", "visualize", "visualise", "report on",
+            "make a report", "create charts",
+        )
+    ):
+        return IntentResult("build_dashboard", 0.75)
     return IntentResult("unknown", 0.3)
 
 
@@ -257,6 +266,7 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "compare_runs": ("compare_pipeline_runs", "get_pipeline_status"),
     "find_similar": ("find_similar_entities", "get_entity_detail"),
     "generate_draft": ("generate_action_draft", "get_entity_detail"),
+    "build_dashboard": ("build_custom_dashboard",),
     "compare_or_explain": None,
     "unknown": None,
 }
@@ -275,6 +285,7 @@ _FASTPATH_TOOL: dict[str, str] = {
     "compare_runs": "compare_pipeline_runs",
     "find_similar": "find_similar_entities",
     "generate_draft": "generate_action_draft",
+    "build_dashboard": "build_custom_dashboard",
 }
 
 
@@ -316,6 +327,11 @@ def build_fastpath_args(
         if not intent.entity_ids:
             return None
         return tool, {"entity_id": intent.entity_ids[0], "action_type": "message"}
+    if tool == "build_custom_dashboard":
+        goal = (user_message or "").strip()
+        if not goal:
+            return None
+        return tool, {"goal": goal, "max_charts": 4}
     return None
 
 
