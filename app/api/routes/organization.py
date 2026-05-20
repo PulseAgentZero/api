@@ -238,14 +238,26 @@ async def get_organization_usage(
         "connections":                 { "used": 2, "limit": 5 },
         "webhook_channels":            { "used": 0, "limit": 1 },
         "users":                       { "used": 2, "limit": 3 },
-        "pipeline_runs_this_month":    { "used": 3, "limit": 20 },
-        "agent_queries_this_month":    { "used": 12, "limit": 100 },
+        "pipeline_runs_this_month": {
+          "used": 3,
+          "limit": 20,
+          "resets_at": "2025-06-20T10:00:00Z",
+          "window": "billing_cycle"
+        },
+        "agent_queries_this_month": {
+          "used": 12,
+          "limit": 100,
+          "resets_at": "2025-06-20T10:00:00Z",
+          "window": "billing_cycle"
+        },
         "studio_executions_today":     { "used": 5, "limit": 600, "resets_at": "2025-05-20T00:00:00Z" }
       }
     }
     ```
 
     `limit: null` means unlimited (Pro plan or self-hosted).
+    Monthly counters use the Paystack billing cycle for paid cloud subscriptions,
+    and fall back to calendar-month windows otherwise.
     `resets_at` on `studio_executions_today` is the next **00:00 UTC** (daily counter key rolls on UTC date).
     """
     return await get_usage_summary(db, current_user.org_id)

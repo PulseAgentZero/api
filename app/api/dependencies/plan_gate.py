@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from calendar import monthrange
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -51,6 +52,11 @@ PLAN_LIMITS: dict[str, dict[str, int | None]] = {
     },
 }
 
+_PAID_CLOUD_PLANS = frozenset({"growth", "pro", "enterprise"})
+_BILLING_ANCHORED_STATUSES = frozenset(
+    {"active", "attention", "non-renewing", "cancelled", "complete", "completed"}
+)
+
 
 def get_plan_limits(plan: str) -> dict[str, int | None]:
     if settings.DEPLOYMENT_MODE == "self_hosted":
@@ -72,6 +78,63 @@ def _seconds_until_utc_midnight() -> int:
     """TTL for daily Redis counters — always expires at 00:00 UTC."""
     now = datetime.now(timezone.utc)
     return max(60, int((_next_utc_midnight() - now).total_seconds()))
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Move by calendar months, clamping the day for shorter months."""
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _calendar_month_window(now: datetime) -> tuple[datetime, datetime, str]:
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start, _add_months(start, 1), "calendar_month"
+
+
+def _monthly_usage_window(
+    *,
+    plan: str,
+    next_payment_date: datetime | None,
+    subscription_status: str | None,
+    now: datetime,
+) -> tuple[datetime, datetime, str]:
+    """Return the active monthly quota window.
+
+    Paid and previously paid cloud orgs use the Paystack billing cycle so
+    cancelling keeps the current quota window intact until the already-paid
+    period ends. Free orgs without a subscription anchor keep the existing
+    calendar-month behavior.
+    """
+    has_billing_anchor = (
+        plan.lower() in _PAID_CLOUD_PLANS
+        or (subscription_status or "").lower() in _BILLING_ANCHORED_STATUSES
+    )
+    if (
+        settings.DEPLOYMENT_MODE != "cloud"
+        or not has_billing_anchor
+        or next_payment_date is None
+    ):
+        return _calendar_month_window(now)
+
+    end = _as_utc(next_payment_date)
+    while end <= now:
+        end = _add_months(end, 1)
+
+    start = _add_months(end, -1)
+    while start > now:
+        end = start
+        start = _add_months(end, -1)
+
+    return start, end, "billing_cycle"
 
 
 # ── Cloud: feature -> minimum plans (audit_log still requires pro) ─────────────
@@ -268,6 +331,7 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     from app.infrastructure.database.models.notification_channel import NotificationChannel
     from app.infrastructure.database.models.pipeline_run import PipelineRun
     from app.infrastructure.database.models.studio_dashboard import StudioDashboard
+    from app.infrastructure.database.models.subscription import Subscription
     from app.infrastructure.database.models.user import User
     from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
 
@@ -275,7 +339,15 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     limits = get_plan_limits(plan)
 
     now = datetime.now(timezone.utc)
-    first_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    sub = (
+        await db.execute(select(Subscription).where(Subscription.org_id == org_id))
+    ).scalar_one_or_none()
+    usage_start, usage_end, usage_window = _monthly_usage_window(
+        plan=plan,
+        next_payment_date=sub.next_payment_date if sub else None,
+        subscription_status=sub.status if sub else None,
+        now=now,
+    )
 
     connection_count = await ConnectionRepository(db).count_active(org_id)
     api_key_count = int(
@@ -308,7 +380,8 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
         await db.scalar(
             select(func.count()).select_from(PipelineRun).where(
                 PipelineRun.org_id == org_id,
-                PipelineRun.created_at >= first_of_month,
+                PipelineRun.created_at >= usage_start,
+                PipelineRun.created_at < usage_end,
             )
         )
         or 0
@@ -317,7 +390,8 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
         await db.scalar(
             select(func.count()).select_from(AgentConversation).where(
                 AgentConversation.org_id == org_id,
-                AgentConversation.created_at >= first_of_month,
+                AgentConversation.created_at >= usage_start,
+                AgentConversation.created_at < usage_end,
             )
         )
         or 0
@@ -344,8 +418,12 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
     except Exception:
         pass
 
-    def slot(used: int, key: str) -> dict:
-        return {"used": used, "limit": limits.get(key)}
+    def slot(used: int, key: str, *, monthly: bool = False) -> dict:
+        data: dict[str, object] = {"used": used, "limit": limits.get(key)}
+        if monthly:
+            data["resets_at"] = usage_end.isoformat().replace("+00:00", "Z")
+            data["window"] = usage_window
+        return data
 
     studio_daily_limit = limits.get("studio_query_executions_per_day")
     studio_executions_slot: dict = {
@@ -364,8 +442,16 @@ async def get_usage_summary(db: AsyncSession, org_id: UUID) -> dict:
             "connections": slot(connection_count, "connections"),
             "webhook_channels": slot(webhook_channel_count, "webhook_channels"),
             "users": slot(user_count, "users"),
-            "pipeline_runs_this_month": slot(pipeline_run_count, "pipeline_runs_per_month"),
-            "agent_queries_this_month": slot(agent_query_count, "agent_queries_per_month"),
+            "pipeline_runs_this_month": slot(
+                pipeline_run_count,
+                "pipeline_runs_per_month",
+                monthly=True,
+            ),
+            "agent_queries_this_month": slot(
+                agent_query_count,
+                "agent_queries_per_month",
+                monthly=True,
+            ),
             "studio_dashboards": slot(studio_dashboard_count, "studio_dashboards"),
             "studio_executions_today": studio_executions_slot,
         },
