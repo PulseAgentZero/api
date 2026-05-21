@@ -45,11 +45,11 @@ async def persist_entity_profiles_from_pipeline(
     if not scored:
         return
 
+    # Only one mapping's profiles should be latest per org (avoids inflated chat counts).
     await session.execute(
         update(EntityProfile)
         .where(
             EntityProfile.org_id == org_id,
-            EntityProfile.mapping_id == mapping_id,
             EntityProfile.is_latest.is_(True),
         )
         .values(is_latest=False)

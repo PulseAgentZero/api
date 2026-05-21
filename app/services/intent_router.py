@@ -89,10 +89,15 @@ _COMPARE_PATTERNS = (
     "what changed", "any changes",
 )
 
+_DATA_ACCESS_PATTERNS = (
+    "database", "data base", "sql", "schema", "table", "tables", "raw data",
+    "query my db", "query the db", "sql query", "run a query",
+)
+
 _OFF_TOPIC_PATTERNS = (
     "weather", "joke", "tell me a story", "are you real", "are you human",
     "your favorite", "what's your name", "who made you", "write code", "write me code",
-    "code for", "python", "javascript", "sql to", "translate", "summarize this",
+    "code for", "python", "javascript", "translate", "summarize this",
     "news", "stock price", "bitcoin", "movie", "music", "song", "recipe",
     "what time", "what day", "what year",
 )
@@ -121,6 +126,37 @@ def apply_pipeline_intent_override(intent: IntentResult, message: str) -> Intent
             raw=intent.raw,
         )
     return intent
+
+
+def apply_data_access_intent_override(intent: IntentResult, message: str) -> IntentResult:
+    """Route SQL/schema questions to data_access instead of off_topic refusal."""
+    if intent.intent != "off_topic":
+        return intent
+    lower = message.lower()
+    if any(p in lower for p in _DATA_ACCESS_PATTERNS):
+        return IntentResult(
+            intent="data_access",
+            confidence=max(intent.confidence, 0.88),
+            entity_ids=intent.entity_ids,
+            tier_filter=intent.tier_filter,
+            urgency_filter=intent.urgency_filter,
+            raw=intent.raw,
+        )
+    return intent
+
+
+def _critical_count_negated(text: str) -> bool:
+    """True when assistant said there are zero/no critical entities."""
+    return bool(
+        re.search(
+            r"\b(?:zero|no|none|0)\s+critical\b|\bno\s+critical\b|\bcritical\s+flags?\s+and\s+came\s+out\s+with\s+zero",
+            text,
+        )
+    )
+
+
+def _assistant_tail(text: str, max_chars: int = 600) -> str:
+    return text[-max_chars:] if len(text) > max_chars else text
 
 
 def _heuristic_fallback(message: str) -> IntentResult:
@@ -247,7 +283,7 @@ async def classify_intent(
 
 # Conversational intents bypass the ReAct loop entirely — handled by
 # agent_service._conversational_reply with no tool calls.
-CONVERSATIONAL_INTENTS = frozenset({"greeting", "help", "off_topic", "unknown"})
+CONVERSATIONAL_INTENTS = frozenset({"greeting", "help", "data_access", "off_topic", "unknown"})
 
 # Tool subset the ReAct loop should see when this intent fires.
 # None = no prefilter (give the agent all tools).
@@ -410,11 +446,21 @@ def resolve_followup_query(
     if re.search(r"pull\s+(?:the\s+)?(?:full\s+)?list", assistant):
         return "show all high-risk entities"
 
-    # Priority 4: Topic-level matching.
-    if "critical" in assistant and ("entit" in assistant or "customer" in assistant):
+    # Priority 4: Topic-level matching (prefer tail where the offer usually lives).
+    tail = _assistant_tail(assistant)
+    if (
+        ("high-risk" in tail or "high risk" in tail or re.search(r"\b\d+\s+high(?:-risk)?", tail))
+        and ("entit" in tail or "customer" in tail or "recommendation" in tail)
+    ):
+        return "show all high-risk entities"
+    if (
+        "critical" in tail
+        and ("entit" in tail or "customer" in tail)
+        and not _critical_count_negated(tail)
+    ):
         return "show critical entities"
-    if "high" in assistant and "risk" in assistant:
-        return "show high-risk entities"
+    if "high" in tail and "risk" in tail:
+        return "show all high-risk entities"
     if "recommendation" in assistant or "action" in assistant:
         return "what recommendations can you give me?"
     if "pipeline" in assistant or "last run" in assistant or "latest run" in assistant:
