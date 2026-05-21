@@ -42,6 +42,12 @@ class ScheduleBody(BaseModel):
     mapping_id: UUID | None = None
 
 
+class SchedulePreviewBody(BaseModel):
+    cron_expression: str = Field(..., description="5-field crontab expression")
+    timezone: str = "UTC"
+    count: int = Field(5, ge=1, le=20)
+
+
 async def _trigger_common(
     current_user: User,
     db: AsyncSession,
@@ -283,6 +289,104 @@ async def get_schedule(
     }
 
 
+@router.post("/schedule/preview-next")
+async def preview_schedule_next(
+    body: SchedulePreviewBody,
+    current_user: User = Depends(require_role("admin", "manager")),
+) -> dict:
+    """Return the next N fire times for a cron expression and timezone — without persisting.
+
+    Lets the UI preview "Next 5 runs" before the user clicks Save. Returns both UTC and
+    timezone-localized ISO timestamps so the UI can show whichever is clearer.
+    """
+    try:
+        croniter(body.cron_expression)
+    except Exception:
+        raise validation_error(
+            "Invalid cron expression",
+            fields={"cron_expression": "Unparseable cron expression"},
+        )
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(body.timezone or "UTC")
+    except Exception:
+        raise validation_error(
+            "Invalid timezone",
+            fields={"timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos"},
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    base = now_utc.astimezone(tz)
+    it = croniter(body.cron_expression, base)
+    next_runs = []
+    for _ in range(body.count):
+        nxt_local = it.get_next(datetime)
+        nxt_utc = nxt_local.astimezone(timezone.utc)
+        next_runs.append({
+            "utc": nxt_utc.isoformat(),
+            "local": nxt_local.isoformat(),
+        })
+
+    return {
+        "cron_expression": body.cron_expression,
+        "timezone": body.timezone,
+        "next_runs": next_runs,
+    }
+
+
+@router.get("/scheduler/status")
+async def scheduler_status(
+    current_user: User = Depends(require_role("admin", "manager")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Surface scheduler freshness, health, and invocation counters to the UI.
+
+    `healthy` is true when the most recent heartbeat is fresher than the configured
+    stale-after window (default 180s). `age_seconds` is null until the scheduler
+    process writes its first heartbeat.
+    """
+    from app.infrastructure.database.models.scheduler_heartbeat import (
+        SchedulerHeartbeat,
+    )
+    from app.services.schedulers.pipeline_scheduler import (
+        HEARTBEAT_KIND,
+        HEARTBEAT_STALE_AFTER_SECONDS,
+    )
+
+    r = await db.execute(
+        select(SchedulerHeartbeat).where(SchedulerHeartbeat.kind == HEARTBEAT_KIND).limit(1)
+    )
+    row = r.scalar_one_or_none()
+    if row is None:
+        return {
+            "kind": HEARTBEAT_KIND,
+            "last_seen_at": None,
+            "age_seconds": None,
+            "healthy": False,
+            "process_id": None,
+            "host": None,
+            "scheduled_runs_total": 0,
+            "stale_after_seconds": HEARTBEAT_STALE_AFTER_SECONDS,
+        }
+
+    now = datetime.now(timezone.utc)
+    last_seen = row.last_seen_at
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    age = (now - last_seen).total_seconds()
+    return {
+        "kind": row.kind,
+        "last_seen_at": last_seen.isoformat(),
+        "age_seconds": round(age, 1),
+        "healthy": age <= HEARTBEAT_STALE_AFTER_SECONDS,
+        "process_id": row.process_id,
+        "host": row.host,
+        "scheduled_runs_total": int(row.scheduled_runs_total or 0),
+        "stale_after_seconds": HEARTBEAT_STALE_AFTER_SECONDS,
+    }
+
+
 @router.put("/schedule")
 async def put_schedule(
     body: ScheduleBody,
@@ -302,12 +406,24 @@ async def put_schedule(
             "Invalid cron expression",
             fields={"cron_expression": "Unparseable cron expression"},
         )
+    try:
+        from zoneinfo import ZoneInfo
+
+        schedule_tz = ZoneInfo(body.timezone or "UTC")
+    except Exception:
+        raise validation_error(
+            "Invalid timezone",
+            fields={"timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos"},
+        )
     r = await db.execute(
         select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
     )
     row = r.scalar_one_or_none()
     now = datetime.now(timezone.utc)
-    next_at = croniter(body.cron_expression, now).get_next(datetime)
+    next_at = None
+    if body.is_active:
+        base = now.astimezone(schedule_tz)
+        next_at = croniter(body.cron_expression, base).get_next(datetime)
     if row:
         row.cron_expression = body.cron_expression
         row.timezone = body.timezone
@@ -326,6 +442,11 @@ async def put_schedule(
         db.add(row)
     await db.commit()
     await db.refresh(row)
+
+    from app.services.schedulers.pipeline_scheduler import publish_schedule_reload
+
+    await publish_schedule_reload()
+
     return {
         "id": str(row.id),
         "cron_expression": row.cron_expression,

@@ -61,6 +61,22 @@ def _industry_currency_block(industry: str, business_context: str) -> str:
     return ""
 
 
+DASHBOARD_BUILDER_RULES = """\
+## Dashboard and chart building (Pulse Studio)
+When the user asks to build, create, or generate a dashboard, charts, visualizations, or a report:
+1. Call **start_dashboard_intake** first. Never call **build_dashboard_from_plan** from a vague request.
+2. Ask the clarifying questions returned by intake. ALWAYS ask the user what to name the dashboard (the intake form returns a dashboard_name question). If multiple connections exist, ask which to use; never guess.
+3. After the user answers, call **draft_dashboard_plan** with the chosen dashboard_name and show the proposed queries, chart types, and parameters for review.
+4. Only call **build_dashboard_from_plan** after explicit approval (e.g. "yes", "go", "build it", "looks good").
+5. If the user wants edits BEFORE the build, call **draft_dashboard_plan** again with revisions.
+
+When the user asks to change, fix, edit, or iterate on a dashboard that already exists:
+1. Identify the dashboard_id (ask the user to confirm if ambiguous).
+2. Call **propose_dashboard_changes** with the user's feedback. Show the summary and the proposed changes for review.
+3. Only call **apply_dashboard_changes** after explicit approval. Tell the user which changes were applied and which were skipped.
+"""
+
+
 def render_chat_system_prompt(
     *,
     org_name: str,
@@ -72,6 +88,7 @@ def render_chat_system_prompt(
     memory_block: str,
     handoff_block: str,
     recalled_block: str,
+    dashboard_block: str = "",
 ) -> str:
     """Assemble the conversational agent's system prompt.
 
@@ -114,7 +131,7 @@ knowledge or hallucination. Tool results are the source of truth.
   user asked for a structured breakdown.
 - Stay focused on operational analysis. If asked about unrelated topics, redirect gently.
 
-{pipeline_block}{memory_block}{handoff_block}{recalled_block}## Output
+{dashboard_block}{pipeline_block}{memory_block}{handoff_block}{recalled_block}## Output
 Lead with what matters to the operator; support with data; offer a natural next step \
 when it helps.
 """

@@ -460,6 +460,20 @@ class PipelineOrchestrator:
             rag_metrics=rag_metrics_payload,
         )
 
+        if trigger_source == "scheduled":
+            try:
+                from app.services.schedulers.pipeline_scheduler import (
+                    touch_pipeline_schedule_after_run,
+                )
+
+                await touch_pipeline_schedule_after_run(org_id)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] Failed to update schedule timestamps for org %s: %s",
+                    org_id,
+                    e,
+                )
+
         # Procedural memory commit: extract a durable learning from this run.
         # Best-effort; never blocks the response or surfaces errors to callers.
         try:

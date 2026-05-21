@@ -19,6 +19,7 @@ from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.pipeline_run import PipelineRun
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.recommendation import Recommendation
+from app.infrastructure.database.models.scheduler_heartbeat import SchedulerHeartbeat
 from app.infrastructure.database.models.schema_mapping import SchemaMapping
 from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.usage_event import UsageEvent
@@ -53,6 +54,7 @@ __all__ = [
     "PipelineRun",
     "PipelineSchedule",
     "Recommendation",
+    "SchedulerHeartbeat",
     "SchemaMapping",
     "Subscription",
     "UsageEvent",

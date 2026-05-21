@@ -310,6 +310,12 @@ class Settings:
     # Semantic intent detection (fast classifier ahead of ReAct loop)
     CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"
     CHAT_INTENT_FASTPATH_CONFIDENCE: float = float(os.getenv("CHAT_INTENT_FASTPATH_CONFIDENCE", "0.85"))
+    CHAT_DASHBOARD_INTAKE_ENABLED: bool = (
+        os.getenv("CHAT_DASHBOARD_INTAKE_ENABLED", "true").lower() == "true"
+    )
+    DASHBOARD_ITERATION_ALLOW_NEW_SQL: bool = (
+        os.getenv("DASHBOARD_ITERATION_ALLOW_NEW_SQL", "false").lower() == "true"
+    )
 
     # ------------------------------------------------------------------
     # Groq API (LLM)
