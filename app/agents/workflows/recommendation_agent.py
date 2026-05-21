@@ -11,6 +11,7 @@ specific signal combinations to generate tailored interventions.
 
 import json
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
@@ -36,6 +37,77 @@ from app.services.procedural_memory import format_procedural_block
 logger = logging.getLogger(__name__)
 
 DEFAULT_RECOMMENDATION_LIMIT = 50
+
+_ML_JARGON_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b\d+(?:\.\d+)?%\s*importance\b", re.I), ""),
+    (re.compile(r"\bfeature\s+importances?\b", re.I), "main factors"),
+    (re.compile(r"\bml\s+model\b", re.I), "Entivia"),
+    (re.compile(r"\b(\d*\.?\d+)\s+predicted chance of\b", re.I), r"\1 likelihood of"),
+    (re.compile(r"\bfeature\s*\(([^)]+)\)\s*\([^)]*\)", re.I), r"\1"),
+    (re.compile(r"\badds?\s+\d+(?:\.\d+)?%\s+importance[,.]?\s*", re.I), "also matters. "),
+    (re.compile(r"\s{2,}"), " "),
+]
+
+
+def _humanize_signal_key(key: str) -> str:
+    cleaned = re.sub(r"[_-]+", " ", str(key)).strip()
+    if not cleaned:
+        return str(key)
+    return cleaned.title()
+
+
+def _slim_entity_for_recommendation(entity: dict) -> dict:
+    """Payload for the LLM: business facts only, no ML diagnostics."""
+    signals = entity.get("signal_values") or {}
+    key_facts: dict[str, Any] = {}
+    for k, v in signals.items():
+        if isinstance(v, (int, float, str, bool)) or v is None:
+            key_facts[_humanize_signal_key(str(k))] = v
+
+    slim: dict[str, Any] = {
+        "entity_id": entity.get("entity_id"),
+        "entity_name": entity.get("entity_name"),
+        "risk_level": entity.get("risk_tier"),
+        "priority_score": round(float(entity.get("risk_score", 0) or 0), 3),
+        "key_facts": key_facts,
+    }
+    narrative = str(entity.get("risk_narrative") or "").strip()
+    if narrative:
+        slim["analyst_note"] = narrative[:400]
+    similar = entity.get("similar_entities") or []
+    if similar:
+        slim["similar_cases"] = []
+        for s in similar[:3]:
+            case: dict[str, Any] = {
+                "entity_id": s.get("entity_id"),
+                "summary": (s.get("profile_summary") or "")[:180],
+                "risk_level": s.get("risk_tier"),
+            }
+            past = s.get("past_recommendations")
+            if past:
+                case["past_recommendations"] = [
+                    {
+                        "type": pr.get("type"),
+                        "urgency": pr.get("urgency"),
+                        "title": pr.get("title"),
+                        "suggested_action": (pr.get("suggested_action") or "")[:200],
+                        "status": pr.get("status"),
+                    }
+                    for pr in past[:5]
+                    if isinstance(pr, dict)
+                ]
+            slim["similar_cases"].append(case)
+    return slim
+
+
+def _businessize_copy(text: str) -> str:
+    """Strip common ML phrases that slip through the prompt."""
+    if not text:
+        return text
+    out = text.strip()
+    for pattern, repl in _ML_JARGON_PATTERNS:
+        out = pattern.sub(repl, out)
+    return re.sub(r"\s+([,.])", r"\1", out).strip()
 
 
 class RecommendationAgent(BaseAgent):
@@ -103,7 +175,9 @@ class RecommendationAgent(BaseAgent):
             if p.get("entity_id") is not None
         }
         enriched_at_risk = [
-            _augment_with_profile(e, profile_index.get(e.get("entity_id")))
+            _slim_entity_for_recommendation(
+                _augment_with_profile(e, profile_index.get(e.get("entity_id")))
+            )
             for e in at_risk
         ]
 
@@ -176,6 +250,7 @@ class RecommendationAgent(BaseAgent):
                         title=rec_data.get("title", "Risk intervention required"),
                         reasoning=rec_data.get("reasoning", ""),
                         suggested_action=rec_data.get("suggested_action", ""),
+                        expected_impact=rec_data.get("expected_impact"),
                         status="open",
                         pipeline_run_id=pipeline_run_id,
                     )
@@ -255,10 +330,10 @@ class RecommendationAgent(BaseAgent):
 
         entity_data = json.dumps(batch, default=str)
         user_prompt = (
-            f"Generate personalised recommendations for these {len(batch)} "
+            f"Generate business-friendly recommendations for these {len(batch)} "
             f"at-risk {state.get('entity_label', 'entities')}. "
-            f"Each one has specific signal values driving their risk — "
-            f"reference those values in your reasoning and suggested actions.\n\n"
+            f"Write for a manager, not a data scientist: use key_facts in plain English, "
+            f"never mention features, importance %, or model scores.\n\n"
             f"Entities:\n{entity_data}"
         )
 
@@ -305,16 +380,21 @@ class RecommendationAgent(BaseAgent):
             if not entity or entity_id in seen:
                 continue
             seen.add(entity_id)
+            title = _businessize_copy(rec.get("title") or "Review required")
+            reasoning = _businessize_copy(rec.get("reasoning") or "")
+            action = _businessize_copy(rec.get("suggested_action") or "")
+            impact = _businessize_copy(rec.get("expected_impact") or "")
             normalized.append({
                 "entity_id": entity_id,
                 "entity_name": rec.get("entity_name") or entity.get("entity_name"),
-                "risk_score": rec.get("risk_score", entity.get("risk_score", 0)),
-                "risk_tier": rec.get("risk_tier", entity.get("risk_tier", "high")),
+                "risk_score": rec.get("risk_score", entity.get("priority_score", 0)),
+                "risk_tier": rec.get("risk_tier", entity.get("risk_level", "high")),
                 "type": rec.get("type") or "retention_intervention",
                 "urgency": rec.get("urgency") or "high",
-                "title": rec.get("title") or "Risk intervention required",
-                "reasoning": rec.get("reasoning") or "",
-                "suggested_action": rec.get("suggested_action") or "",
+                "title": title or "Review required",
+                "reasoning": reasoning,
+                "suggested_action": action,
+                "expected_impact": impact or None,
             })
 
         missing = [
@@ -332,26 +412,35 @@ class RecommendationAgent(BaseAgent):
     ) -> list[dict]:
         """Generate template-based recommendations as fallback when LLM fails."""
         recs = []
+        label = state.get("entity_label", "entity")
         for entity in batch:
-            tier = entity.get("risk_tier", "high")
-            signals = entity.get("signal_values", {})
-            top_signal = max(signals, key=lambda k: _to_float(signals[k])) if signals else "unknown"
+            tier = entity.get("risk_level") or entity.get("risk_tier") or "high"
+            eid = entity.get("entity_id", "")
+            facts = entity.get("key_facts") or entity.get("signal_values") or {}
+            top_label = "several factors"
+            if facts:
+                top_key = max(facts, key=lambda k: _to_float(facts[k]))
+                top_label = _humanize_signal_key(str(top_key))
 
             recs.append({
-                "entity_id": entity.get("entity_id", ""),
+                "entity_id": eid,
                 "entity_name": entity.get("entity_name"),
-                "risk_score": entity.get("risk_score", 0),
+                "risk_score": entity.get("priority_score", entity.get("risk_score", 0)),
                 "risk_tier": tier,
-                "type": "retention_intervention",
+                "type": "account_review",
                 "urgency": "critical" if tier == "critical" else "high",
-                "title": f"{tier.title()} risk — intervention required",
+                "title": f"Review {eid} — {tier} priority",
                 "reasoning": (
-                    f"Risk score of {entity.get('risk_score', 0):.2f} ({tier} tier). "
-                    f"Primary risk driver: {top_signal}."
+                    f"This {label.rstrip('s')} ({eid}) needs attention: {top_label} "
+                    f"stands out compared to similar cases. "
+                    f"Review details before the next approval step."
                 ),
                 "suggested_action": (
-                    f"Review this {state.get('entity_label', 'entity')}'s profile "
-                    f"and take appropriate {state.get('goal_label', 'retention')} action."
+                    f"Open the profile for {eid}, confirm the latest activity, "
+                    f"and assign a follow-up aligned with {state.get('goal_label', 'your goal')}."
+                ),
+                "expected_impact": (
+                    "Early review usually prevents avoidable losses on flagged cases."
                 ),
             })
         return recs

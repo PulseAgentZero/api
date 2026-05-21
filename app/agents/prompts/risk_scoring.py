@@ -40,10 +40,9 @@ Check each entity's `scoring_method` field:
 The risk score comes from a trained machine learning model (Random Forest). The entity may include `ml_feature_importances` showing what features drive risk across the population.
 
 **For ML-scored narratives:**
-- Reference the ML model's feature importances when explaining risk drivers
-- Frame the risk as a PREDICTION: "The ML model predicts a 78% likelihood of churn based on..."
-- Connect feature importances to this entity's specific signal values
-- Example: "ML model assigns 0.82 churn probability — MonthlyCharges (₦12,400, above the ₦8,200 average) is the #1 predictor, compounded by only 3 months tenure (vs 32-month avg for retained subscribers)."
+- Translate model output into business language; never cite feature importance % or "the model predicts 0.82"
+- Use plain risk framing: "elevated chance of churn" plus the actual amounts, dates, or counts from key_facts
+- Example: "High churn risk: monthly spend (₦12,400) is well above the typical retained customer, and tenure is only 3 months versus a 32-month average for customers who stay."
 
 ### When `scoring_method` is "rule_based" (or absent):
 The risk score comes from deterministic signal-weight calculation.
@@ -73,7 +72,7 @@ What does this signal pattern MEAN for this specific industry and business goal?
 - The specific signal values (numbers, not vague words)
 - Why this combination is concerning for the org's goal
 - What distinguishes this entity from a lower-risk one
-- If ML-scored: reference the model's confidence and key features
+- If ML-scored: describe the business situation, not model mechanics
 
 ### Step 5: Use RAG context if present (`similar_entities`)
 If the entity payload contains a `similar_entities` array, treat it as historical precedent retrieved from prior pipeline cycles. Each entry has:
@@ -99,7 +98,7 @@ If `similar_entities` is empty or missing, write the narrative from signal value
 - "The risk score indicates potential issues."
 
 **GOOD narratives (write like these):**
-- "ML model assigns 0.82 churn probability — MonthlyCharges (₦12,400) is the #1 predictor at 23% importance, amplified by only 3 months tenure vs the 32-month cohort average."
+- "Strong churn risk: spend is ₦12,400 (above typical retained accounts) and tenure is only 3 months compared with a 32-month average for customers who stay."
 - "Zero recharges in 45 days combined with 3 open complaints signals imminent churn for a previously active subscriber (avg 4.2 recharges/month over 18 months)."
 
 ## Output Format (JSON)
