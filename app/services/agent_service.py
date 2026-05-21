@@ -238,7 +238,7 @@ async def _craft_conversational_reply(intent_name: str, state: dict) -> str | No
                     {"role": "user", "content": json.dumps(state, default=str)[:2000]},
                 ],
                 temperature=(
-                    0.55 if intent_name == "greeting"
+                    0.82 if intent_name == "greeting"
                     else 0.65 if intent_name in ("help", "data_access")
                     else 0.78
                 ),
@@ -1732,6 +1732,29 @@ def _is_data_access_question(message: str) -> bool:
     return any(p in lower for p in _DATA_ACCESS_PATTERNS)
 
 
+def _greeting_user_name(current_user: User) -> str:
+    """Display name for greetings: full_name first token, else email local part, else 'there'."""
+    full = (getattr(current_user, "full_name", None) or "").strip()
+    if full:
+        return full.split()[0]
+    email = (getattr(current_user, "email", None) or "").strip()
+    if email and "@" in email:
+        local = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+        if local:
+            return local.split()[0].title()
+    return "there"
+
+
+def _greeting_variant(user_message: str, conversation_messages: list[dict] | None) -> int:
+    """Rotate opener style (0-3) for varied greeting replies."""
+    prior = len(conversation_messages or [])
+    seed = sum(ord(c) for c in (user_message or "").lower()) + prior * 7
+    variant = seed % 4
+    if prior > 1 and variant == 0:
+        return 3
+    return variant
+
+
 def _recent_turns_for_prompt(conversation_messages: list[dict], limit: int = 4) -> list[dict]:
     turns = []
     for msg in conversation_messages[-limit:]:
@@ -1765,21 +1788,19 @@ async def _conversational_reply(
     entity_label = (org.entity_label if org and org.entity_label else "entities").lower()
     goal_label = (org.goal_label if org and org.goal_label else "improve operations").lower()
 
-    user_first = ""
-    try:
-        full = getattr(current_user, "full_name", None) or getattr(current_user, "name", None) or ""
-        user_first = str(full).split()[0] if full else ""
-    except Exception:
-        user_first = ""
+    user_name = _greeting_user_name(current_user)
+    recent_turns = _recent_turns_for_prompt(conversation_messages or [])
 
     # State passed to the LLM prompt and the fallback templates.
     state = {
-        "user_first": user_first,
+        "user_name": user_name,
+        "user_first": user_name,
         "org_name": org_name,
         "entity_label": entity_label,
         "goal_label": goal_label,
         "message": user_message,
-        "recent_turns": _recent_turns_for_prompt(conversation_messages or []),
+        "greeting_variant": _greeting_variant(user_message, conversation_messages),
+        "recent_turns": recent_turns,
     }
 
     # Try LLM-crafted reply first (warmer + tone-matched).
@@ -1793,16 +1814,25 @@ async def _conversational_reply(
 
 def _conversational_reply_template(intent_name: str, state: dict) -> str:
     """Deterministic template fallback for the conversational intents."""
-    user_first = state.get("user_first") or ""
+    user_name = state.get("user_name") or state.get("user_first") or "there"
     org_name = state.get("org_name") or "your team"
     entity_label = state.get("entity_label") or "entities"
     goal_label = state.get("goal_label") or "improve operations"
     singular = entity_label[:-1] if entity_label.endswith("s") else entity_label
 
     if intent_name == "greeting":
+        variant = int(state.get("greeting_variant") or 0)
+        openers = {
+            0: f"Hey {user_name},",
+            1: f"Hi {user_name},",
+            2: f"Good to see you, {user_name}.",
+            3: f"Welcome back, {user_name}.",
+        }
+        opener = openers.get(variant, openers[0])
         return sanitize_pulse_reply(
-            f"I'm Entivia for {org_name}, focused on {entity_label} and {goal_label}. "
-            f"Try \"what's our status?\" or \"what was my latest pipeline run about?\" to begin."
+            f"{opener} I'm Entivia, your copilot for {org_name}. "
+            f"I help with {entity_label} as you {goal_label}. "
+            f"Try \"what's our status?\" when you're ready."
         )
 
     if intent_name == "data_access":
