@@ -1,9 +1,10 @@
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
@@ -22,8 +23,10 @@ from app.api.schemas.user import (
     UserResponse,
 )
 from app.infrastructure.audit import log_audit
+from app.infrastructure.database.models.agent_conversation import AgentConversation
 from app.infrastructure.database.models.invitation import Invitation
 from app.infrastructure.database.models.organization import Organization
+from app.infrastructure.database.models.recommendation import Recommendation
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.repositories.organization_repository import OrganizationRepository
 from app.infrastructure.database.repositories.user_repository import UserRepository
@@ -37,6 +40,8 @@ from app.infrastructure.redis.rate_limit import (
     INVITE_RESEND_COOLDOWN_SEC,
     enforce_fixed_window_limit,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -147,12 +152,36 @@ async def delete_my_account(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Self-delete account. Organization owners must delete the org instead."""
-    from app.infrastructure.audit import log_audit
-    from app.services.totp_service import clear_totp_fields, user_totp_enabled, verify_totp_code
+    """Permanently delete the current user's account and personal data.
+
+    Organization owners must delete the org first — they cannot self-delete
+    while still listed as owner.
+
+    What this removes
+    -----------------
+    Hard-deleted:
+      - The `users` row (email, name, password hash, TOTP secret, avatar URL)
+      - Personal agent chat history (`agent_conversations`)
+      - Invitations the user sent that are still pending (FK cascade)
+      - API keys created by this user (FK cascade)
+      - Direct notifications addressed to this user (FK cascade)
+
+    Anonymized (organization keeps the data, attribution goes to NULL):
+      - Studio queries / dashboards / visualizations / saved query runs
+        / stars / alert rules / pipeline runs they created
+      - Recommendations they actioned
+      - Audit log entries referencing the user
+        (the entry remains for compliance; user metadata is preserved
+        inside the audit row's `metadata` JSON for traceability)
+
+    After commit the user's refresh tokens are revoked and a best-effort
+    delete of the avatar object in object storage is attempted.
+    """
+    from app.api.auth.org_helpers import is_org_owner as _is_org_owner
+    from app.services.totp_service import user_totp_enabled, verify_totp_code
 
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
-    if is_org_owner(current_user, org):
+    if _is_org_owner(current_user, org):
         raise forbidden(
             "OWNER_CANNOT_DELETE_ACCOUNT",
             "Organization owners cannot delete their account. Delete the organization instead.",
@@ -163,20 +192,83 @@ async def delete_my_account(
     if user_totp_enabled(current_user):
         if not body.totp_code or not verify_totp_code(current_user, body.totp_code):
             raise bad_request("INVALID_TOTP", "Valid two-factor code is required")
-    await redis_tokens.revoke_all_refresh_tokens_for_user(current_user.id)
-    clear_totp_fields(current_user)
-    current_user.is_active = False
-    current_user.email = f"deleted+{current_user.id}@deleted.local"
-    current_user.password_hash = None
+
+    user_id = current_user.id
+    org_id = current_user.org_id
+    email = current_user.email
+    profile_image_url = current_user.profile_image_url
+
+    # Audit FIRST so the row exists in this txn. audit_logs.user_id has
+    # ondelete=SET NULL, so once we delete the user the FK becomes NULL —
+    # we stash identifying info in metadata for compliance traceability.
     await log_audit(
         db,
-        org_id=current_user.org_id,
-        user_id=current_user.id,
+        org_id=org_id,
+        user_id=user_id,
         action="user.self_deleted",
         resource="user",
-        resource_id=current_user.id,
+        resource_id=user_id,
+        metadata={"email": email, "user_id": str(user_id)},
     )
+
+    # Recommendations.actioned_by has no ondelete; null it manually so the
+    # FK doesn't block the user row deletion. The recommendation belongs to
+    # the org, not the user, so we keep it.
+    await db.execute(
+        sa_update(Recommendation)
+        .where(Recommendation.actioned_by == user_id)
+        .values(actioned_by=None),
+    )
+
+    # Personal chat history is PII — hard delete it.
+    await db.execute(
+        sa_delete(AgentConversation).where(AgentConversation.user_id == user_id),
+    )
+
+    # Finally the user row. CASCADE/SET NULL FKs on every other reference
+    # (invitations, api_keys, org_notifications, audit_logs, studio_*, alert_rule,
+    # pipeline_run) are configured at the schema level so this single delete
+    # is enough.
+    await db.delete(current_user)
     await db.commit()
+
+    # Post-commit cleanup. Failures here are non-fatal — the DB row is gone.
+    try:
+        await redis_tokens.revoke_all_refresh_tokens_for_user(user_id)
+    except Exception:  # pragma: no cover - best-effort cleanup
+        logger.exception("Failed to revoke refresh tokens for deleted user %s", user_id)
+
+    if profile_image_url:
+        try:
+            from app.infrastructure.storage.factory import get_storage_backend
+            backend = get_storage_backend()
+            if backend.is_configured():
+                object_key = _object_key_from_url(profile_image_url)
+                if object_key:
+                    await backend.delete(object_key)
+        except Exception:  # pragma: no cover - best-effort cleanup
+            logger.exception("Failed to delete avatar for deleted user %s", user_id)
+
+
+def _object_key_from_url(url: str) -> str | None:
+    """Best-effort: derive a storage object key from a public asset URL.
+
+    Asset keys are formed as ``{prefix}/org/{org_id}/{category}/{uid}_{name}``.
+    For S3/MinIO public URLs the key is the path after the host. For local
+    storage the URL is ``/assets/{key}``.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        path = urlparse(url).path.lstrip("/")
+        if not path:
+            return None
+        # Local backend exposes assets under /assets/{key} — strip the mount.
+        if path.startswith("assets/"):
+            path = path[len("assets/"):]
+        return path or None
+    except Exception:
+        return None
 
 
 @router.put("/me/password")

@@ -179,7 +179,18 @@ async def confirm_org_delete(
     current_user: User = Depends(require_org_owner()),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    from app.infrastructure.audit import log_audit
+    """Hard-delete the caller's organization and everything it owns.
+
+    The deletion is final: users, connections, schema mappings,
+    recommendations, audit logs, billing records, studio assets,
+    notifications, and every other org-scoped row are removed from the
+    database. Refresh tokens for all members are revoked. Uploaded logos
+    and avatars are purged from object storage on a best-effort basis.
+
+    A structured ``logger.warning`` is emitted inside the service before
+    the cascade fires so the deletion is traceable in external log
+    aggregators after the audit_log rows are themselves cascade-deleted.
+    """
     from app.services.org_deletion_service import confirm_org_deletion
 
     await confirm_org_deletion(
@@ -188,15 +199,6 @@ async def confirm_org_delete(
         owner_id=current_user.id,
         code=body.code,
     )
-    await log_audit(
-        db,
-        org_id=current_user.org_id,
-        user_id=current_user.id,
-        action="org.deleted",
-        resource="organization",
-        resource_id=current_user.org_id,
-    )
-    await db.commit()
 
 
 @router.post("/complete-setup", response_model=CompleteSetupResponse)
