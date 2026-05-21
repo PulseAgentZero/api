@@ -124,6 +124,21 @@ async def query_agent_run(
         return {}
 
 
+def _format_recent_turns_block(recent_turns: list[dict] | None) -> str:
+    if not recent_turns:
+        return ""
+    lines = []
+    for turn in recent_turns[-6:]:
+        role = turn.get("role", "user")
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content[:500]}")
+    if not lines:
+        return ""
+    return "## Recent conversation (continue this thread naturally)\n" + "\n".join(lines) + "\n\n"
+
+
 async def synthesis_agent_run(
     db: AsyncSession,
     current_user: User,
@@ -132,28 +147,35 @@ async def synthesis_agent_run(
     *,
     base_system_prompt: str,
     extra_instruction: str = "",
+    effective_user_message: str | None = None,
+    recent_turns: list[dict] | None = None,
 ) -> str:
     """Run the Synthesis agent: produce a natural-language reply from retrieved data."""
     if not settings.is_anthropic_configured():
         return ""
 
-    user_question = ""
-    for msg in reversed(conversation_messages):
-        if msg.get("role") == "user" and msg.get("content"):
-            content = msg["content"]
-            if isinstance(content, str):
-                user_question = content
-                break
+    user_question = (effective_user_message or "").strip()
+    if not user_question:
+        for msg in reversed(conversation_messages):
+            if msg.get("role") == "user" and msg.get("content"):
+                content = msg["content"]
+                if isinstance(content, str):
+                    user_question = content.strip()
+                    break
 
     if not user_question:
         return ""
 
     payload_json = json.dumps(retrieved_data, default=str)[:6000]
+    thread_block = _format_recent_turns_block(recent_turns)
     user_msg = (
-        f"User question: {user_question}\n\n"
+        f"{thread_block}"
+        f"User question (answer this): {user_question}\n\n"
         f"Data gathered by the Query agent:\n{payload_json}\n\n"
-        "Write a natural, conversational reply now as Pulse AI, an intelligent copilot. "
-        "Warm and helpful, grounded only in the data above. Never use em dashes (—) or "
+        "Write a natural, conversational reply now as Entivia (never Pulse or Pulse AI). "
+        "Warm and helpful, grounded only in the data above. Reference prior turns when "
+        "the user is following up (e.g. yes, who are they, tell me more). Do not repeat "
+        "your previous answer verbatim if you already covered it. Never use em dashes (—) or "
         "en dashes (–); use commas, colons, or periods instead."
     )
     if extra_instruction.strip():
@@ -195,6 +217,10 @@ async def run_split(
     return await synthesis_agent_run(
         db, current_user, conversation_messages, retrieved,
         base_system_prompt=base_system_prompt,
+        recent_turns=[
+            m for m in conversation_messages[-8:]
+            if m.get("role") in {"user", "assistant"} and isinstance(m.get("content"), str)
+        ],
     )
 
 

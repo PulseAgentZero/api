@@ -82,6 +82,7 @@ from app.agents.prompts.conversational import (
 )
 from app.services.intent_router import (
     CONVERSATIONAL_INTENTS,
+    apply_data_access_intent_override,
     apply_pipeline_intent_override,
     build_fastpath_args,
     classify_intent,
@@ -90,6 +91,102 @@ from app.services.intent_router import (
 )
 
 CHAT_LOGGER = logging.getLogger("pulse.chat")
+
+_PROFILE_TIER_MAP = {
+    "critical": "critical",
+    "high": "high",
+    "medium": "medium",
+    "low": "low",
+    "healthy": "low",
+}
+
+
+def _profile_internal_tier(display_tier: str | None) -> str:
+    """Map persisted display tier (High/Medium/Healthy) to internal tier keys."""
+    raw = (display_tier or "low").strip().lower()
+    if raw == "critical":
+        return "critical"
+    if raw in ("high",):
+        return "high"
+    if raw in ("medium",):
+        return "medium"
+    return _PROFILE_TIER_MAP.get(raw, "low")
+
+
+def _dedupe_profiles_by_entity(profiles: list[EntityProfile]) -> list[EntityProfile]:
+    """Keep highest-scored row per entity_id when stale duplicate profiles exist."""
+    best: dict[str, EntityProfile] = {}
+    for p in profiles:
+        eid = str(p.entity_id)
+        prev = best.get(eid)
+        if prev is None or float(p.risk_score or 0) >= float(prev.risk_score or 0):
+            best[eid] = p
+    return sorted(best.values(), key=lambda x: float(x.risk_score or 0), reverse=True)
+
+
+def _profile_row_dict(p: EntityProfile) -> dict:
+    return {
+        "entity_id": p.entity_id,
+        "entity_label": p.entity_name,
+        "risk_score": float(p.risk_score or 0),
+        "risk_tier": _profile_internal_tier(p.risk_tier),
+        "signals": (p.profile_data or {}).get("signal_values", {}),
+    }
+
+
+def _profile_matches_tier(p: EntityProfile, risk_tier: str | None) -> bool:
+    if not risk_tier:
+        return True
+    return _profile_internal_tier(p.risk_tier) == risk_tier.lower()
+
+
+async def _latest_succeeded_pipeline_run_id(
+    db: AsyncSession, org_id: UUID,
+) -> UUID | None:
+    from app.infrastructure.database.repositories.pipeline_run_repository import (
+        PipelineRunRepository,
+    )
+
+    for run in await PipelineRunRepository(db).list_by_org(org_id, limit=8):
+        if run.status == "succeeded":
+            return run.id
+    return None
+
+
+async def _fetch_active_mapping_profiles(
+    db: AsyncSession,
+    org_id: UUID,
+    *,
+    risk_tier: str | None = None,
+    search: str | None = None,
+) -> list[EntityProfile]:
+    """Latest ML profiles for the org's active mapping and latest succeeded run."""
+    mapping = await get_schema_mapping(db, org_id)
+    run_id = await _latest_succeeded_pipeline_run_id(db, org_id)
+    conds = [
+        EntityProfile.org_id == org_id,
+        EntityProfile.mapping_id == mapping.id,
+        EntityProfile.is_latest.is_(True),
+    ]
+    if run_id is not None:
+        conds.append(EntityProfile.pipeline_run_id == run_id)
+    if search:
+        like = f"%{search.lower()}%"
+        conds.append(
+            sa_func.lower(EntityProfile.entity_name).like(like)
+            | sa_func.lower(EntityProfile.entity_id).like(like)
+        )
+    profiles = list(
+        (await db.execute(
+            sa_select(EntityProfile)
+            .where(*conds)
+            .order_by(EntityProfile.risk_score.desc().nullslast())
+        )).scalars().all()
+    )
+    deduped = _dedupe_profiles_by_entity(profiles)
+    if risk_tier:
+        deduped = [p for p in deduped if _profile_matches_tier(p, risk_tier)]
+    return deduped
 
 
 _conv_groq_client: AsyncGroq | None = None
@@ -140,7 +237,11 @@ async def _craft_conversational_reply(intent_name: str, state: dict) -> str | No
                     {"role": "system", "content": system},
                     {"role": "user", "content": json.dumps(state, default=str)[:2000]},
                 ],
-                temperature=0.78,
+                temperature=(
+                    0.82 if intent_name == "greeting"
+                    else 0.65 if intent_name in ("help", "data_access")
+                    else 0.78
+                ),
                 max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             ),
@@ -357,40 +458,25 @@ async def _overview(db: AsyncSession, org_id: UUID) -> dict:
     pipeline's risk scoring step) when available. Falls back to live
     recomputation from the client DB when no profiles exist.
     """
-    # Try ML-predicted profiles first.
-    profile_count = await db.scalar(
-        sa_select(sa_func.count())
-        .select_from(EntityProfile)
-        .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
-    ) or 0
-
-    if profile_count > 0:
-        # Use persisted ML-predicted risk tiers.
-        profiles = list(
-            (await db.execute(
-                sa_select(EntityProfile)
-                .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
-                .order_by(EntityProfile.risk_score.desc().nullslast())
-            )).scalars().all()
-        )
-        # Map display tiers back to internal tier names for consistency.
-        _tier_map = {"high": "high", "medium": "medium", "low": "low", "healthy": "low"}
+    profiles = await _fetch_active_mapping_profiles(db, org_id)
+    if profiles:
         breakdown = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for p in profiles:
-            tier = _tier_map.get((p.risk_tier or "low").lower(), "low")
-            breakdown[tier] += 1
+            breakdown[_profile_internal_tier(p.risk_tier)] += 1
         top = profiles[:3]
         active_recs = await RecommendationRepository(db).list_by_org(org_id, status="open")
+        mapping = await get_schema_mapping(db, org_id)
         return {
             "total_entities": len(profiles),
             "risk_breakdown": breakdown,
             "active_recommendations": len(active_recs),
+            "mapping_id": str(mapping.id),
             "top_at_risk": [
                 {
                     "entity_id": p.entity_id,
                     "entity_label": p.entity_name,
                     "risk_score": float(p.risk_score or 0),
-                    "risk_tier": _tier_map.get((p.risk_tier or "low").lower(), "low"),
+                    "risk_tier": _profile_internal_tier(p.risk_tier),
                 }
                 for p in top
             ],
@@ -432,56 +518,16 @@ async def _entities(
 
     Prefers ML-predicted profiles from entity_profiles when available.
     """
-    # Try ML-predicted profiles first.
-    profile_count = await db.scalar(
-        sa_select(sa_func.count())
-        .select_from(EntityProfile)
-        .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
-    ) or 0
-
-    _tier_map = {"high": "high", "medium": "medium", "low": "low", "healthy": "low"}
-
-    if profile_count > 0:
-        conds = [
-            EntityProfile.org_id == org_id,
-            EntityProfile.is_latest.is_(True),
-        ]
-        if risk_tier:
-            # Map internal tier to display tiers for the DB query.
-            display_tiers = [k for k, v in _tier_map.items() if v == risk_tier]
-            if not display_tiers:
-                display_tiers = [risk_tier]
-            conds.append(EntityProfile.risk_tier.in_([t.title() for t in display_tiers] + display_tiers))
-        if search:
-            like = f"%{search.lower()}%"
-            conds.append(
-                sa_func.lower(EntityProfile.entity_name).like(like)
-                | sa_func.lower(EntityProfile.entity_id).like(like)
-            )
-
-        profiles = list(
-            (await db.execute(
-                sa_select(EntityProfile)
-                .where(*conds)
-                .order_by(EntityProfile.risk_score.desc().nullslast())
-                .limit(limit)
-            )).scalars().all()
-        )
-        total = await db.scalar(
-            sa_select(sa_func.count()).select_from(EntityProfile).where(*conds)
-        ) or 0
-
-        rows = [
-            {
-                "entity_id": p.entity_id,
-                "entity_label": p.entity_name,
-                "risk_score": float(p.risk_score or 0),
-                "risk_tier": _tier_map.get((p.risk_tier or "low").lower(), "low"),
-                "signals": (p.profile_data or {}).get("signal_values", {}),
-            }
-            for p in profiles
-        ]
-        return {"entities": rows, "total": int(total)}
+    profiles = await _fetch_active_mapping_profiles(
+        db, org_id, risk_tier=risk_tier, search=search,
+    )
+    if profiles:
+        rows = [_profile_row_dict(p) for p in profiles[:limit]]
+        return {
+            "entities": rows,
+            "total": len(profiles),
+            "unique_count": len(profiles),
+        }
 
     # Fallback: live recomputation from client DB.
     mapping = await get_schema_mapping(db, org_id)
@@ -687,33 +733,16 @@ async def _outcome_analysis(db: AsyncSession, org_id: UUID) -> dict:
     Works for any domain: churn, fraud, readmission, delivery failure, etc.
     The target column is configured per-org in the schema mapping.
     """
-    # Try entity profiles first (ML-predicted).
-    total_profiles = await db.scalar(
-        sa_select(sa_func.count())
-        .select_from(EntityProfile)
-        .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
-    ) or 0
+    profiles = await _fetch_active_mapping_profiles(db, org_id)
+    if profiles:
+        tier_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for p in profiles:
+            tier = _profile_internal_tier(p.risk_tier)
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
-    if total_profiles > 0:
-        # Count by risk tier.
-        _tier_map = {"high": "high", "medium": "medium", "low": "low", "healthy": "low"}
-        profiles = list(
-            (await db.execute(
-                sa_select(EntityProfile.risk_tier, sa_func.count().label("cnt"))
-                .where(EntityProfile.org_id == org_id, EntityProfile.is_latest.is_(True))
-                .group_by(EntityProfile.risk_tier)
-            )).all()
-        )
-        tier_counts = {}
-        for tier_val, cnt in profiles:
-            mapped = _tier_map.get((tier_val or "low").lower(), "low")
-            tier_counts[mapped] = tier_counts.get(mapped, 0) + cnt
-
-        # Also try to get the actual outcome count from client DB.
         outcome_data = await _query_outcome_from_client_db(db, org_id)
-
         result = {
-            "total_entities": total_profiles,
+            "total_entities": len(profiles),
             "risk_tier_breakdown": tier_counts,
             "high_risk_count": tier_counts.get("high", 0),
         }
@@ -742,17 +771,32 @@ async def _query_outcome_from_client_db(db: AsyncSession, org_id: UUID) -> dict 
 
         # Count positive-outcome entities.
         total = len(entities)
-        positive = sum(
-            1 for e in entities
-            if e.get(target_col) in (1, True, "1", "true", "yes", "True", "Yes")
+        true_values = (1, True, "1", "true", "yes", "True", "Yes")
+        with_target_true = sum(
+            1 for e in entities if e.get(target_col) in true_values
         )
-        return {
+        retained = total - with_target_true
+        rate = round(with_target_true / total * 100, 2) if total > 0 else 0
+        glossary = (
+            f"For column '{target_col}', value=1 (or true/yes) counts as the positive "
+            "target condition (e.g. churned when target is has_churned)."
+        )
+        out = {
             "total_entities": total,
-            "positive_outcome_count": positive,
-            "outcome_rate": round(positive / total * 100, 2) if total > 0 else 0,
-            "negative_outcome_count": total - positive,
             "target_column": target_col,
+            "entities_with_target_true": with_target_true,
+            "entities_with_target_false": retained,
+            "target_true_rate_pct": rate,
+            "positive_outcome_count": with_target_true,
+            "negative_outcome_count": retained,
+            "outcome_rate": rate,
+            "glossary": glossary,
         }
+        if "churn" in target_col.lower():
+            out["churned_count"] = with_target_true
+            out["not_churned_count"] = retained
+            out["churn_rate_pct"] = rate
+        return out
     except Exception as exc:
         logger.debug("[outcome_analysis] client DB query failed: %s", exc)
         return None
@@ -1615,12 +1659,16 @@ async def _guarded_synthesis(
     base_system_prompt: str,
     industry: str,
     business_context: str,
+    effective_user_message: str | None = None,
+    recent_turns: list[dict] | None = None,
 ) -> str:
     """Synthesis with retries for em dashes, forbidden $, then deterministic fallback."""
     extra_parts: list[str] = []
     reply = await synthesis_agent_run(
         db, current_user, conversation_messages, retrieved_data,
         base_system_prompt=base_system_prompt,
+        effective_user_message=effective_user_message,
+        recent_turns=recent_turns,
     )
     if reply and reply_contains_em_dash(reply):
         extra_parts.append(
@@ -1636,6 +1684,8 @@ async def _guarded_synthesis(
             db, current_user, conversation_messages, retrieved_data,
             base_system_prompt=base_system_prompt,
             extra_instruction=" ".join(extra_parts),
+            effective_user_message=effective_user_message,
+            recent_turns=recent_turns,
         )
     if reply and _reply_has_forbidden_currency(reply, industry, business_context):
         rec_data = retrieved_data.get("get_recommendations")
@@ -1682,6 +1732,29 @@ def _is_data_access_question(message: str) -> bool:
     return any(p in lower for p in _DATA_ACCESS_PATTERNS)
 
 
+def _greeting_user_name(current_user: User) -> str:
+    """Display name for greetings: full_name first token, else email local part, else 'there'."""
+    full = (getattr(current_user, "full_name", None) or "").strip()
+    if full:
+        return full.split()[0]
+    email = (getattr(current_user, "email", None) or "").strip()
+    if email and "@" in email:
+        local = email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+        if local:
+            return local.split()[0].title()
+    return "there"
+
+
+def _greeting_variant(user_message: str, conversation_messages: list[dict] | None) -> int:
+    """Rotate opener style (0-3) for varied greeting replies."""
+    prior = len(conversation_messages or [])
+    seed = sum(ord(c) for c in (user_message or "").lower()) + prior * 7
+    variant = seed % 4
+    if prior > 1 and variant == 0:
+        return 3
+    return variant
+
+
 def _recent_turns_for_prompt(conversation_messages: list[dict], limit: int = 4) -> list[dict]:
     turns = []
     for msg in conversation_messages[-limit:]:
@@ -1715,21 +1788,19 @@ async def _conversational_reply(
     entity_label = (org.entity_label if org and org.entity_label else "entities").lower()
     goal_label = (org.goal_label if org and org.goal_label else "improve operations").lower()
 
-    user_first = ""
-    try:
-        full = getattr(current_user, "full_name", None) or getattr(current_user, "name", None) or ""
-        user_first = str(full).split()[0] if full else ""
-    except Exception:
-        user_first = ""
+    user_name = _greeting_user_name(current_user)
+    recent_turns = _recent_turns_for_prompt(conversation_messages or [])
 
     # State passed to the LLM prompt and the fallback templates.
     state = {
-        "user_first": user_first,
+        "user_name": user_name,
+        "user_first": user_name,
         "org_name": org_name,
         "entity_label": entity_label,
         "goal_label": goal_label,
         "message": user_message,
-        "recent_turns": _recent_turns_for_prompt(conversation_messages or []),
+        "greeting_variant": _greeting_variant(user_message, conversation_messages),
+        "recent_turns": recent_turns,
     }
 
     # Try LLM-crafted reply first (warmer + tone-matched).
@@ -1743,24 +1814,30 @@ async def _conversational_reply(
 
 def _conversational_reply_template(intent_name: str, state: dict) -> str:
     """Deterministic template fallback for the conversational intents."""
-    user_first = state.get("user_first") or ""
+    user_name = state.get("user_name") or state.get("user_first") or "there"
     org_name = state.get("org_name") or "your team"
     entity_label = state.get("entity_label") or "entities"
     goal_label = state.get("goal_label") or "improve operations"
     singular = entity_label[:-1] if entity_label.endswith("s") else entity_label
 
     if intent_name == "greeting":
-        opener = f"Hey {user_first}," if user_first else "Hey,"
+        variant = int(state.get("greeting_variant") or 0)
+        openers = {
+            0: f"Hey {user_name},",
+            1: f"Hi {user_name},",
+            2: f"Good to see you, {user_name}.",
+            3: f"Welcome back, {user_name}.",
+        }
+        opener = openers.get(variant, openers[0])
         return sanitize_pulse_reply(
-            f"{opener} I'm Pulse AI, your intelligent copilot for {org_name}. "
-            f"I can help with {entity_label}, risk, and recommendations as you "
-            f"{goal_label}. Try \"what's our status?\" or "
-            f"\"what was my latest pipeline run about?\" to get started."
+            f"{opener} I'm Entivia, your copilot for {org_name}. "
+            f"I help with {entity_label} as you {goal_label}. "
+            f"Try \"what's our status?\" when you're ready."
         )
 
     if intent_name == "data_access":
         return sanitize_pulse_reply(
-            f"I'm Pulse AI, your copilot. I can't run arbitrary SQL or browse your schema, but I can answer "
+            f"I'm Entivia. I can't run arbitrary SQL or browse your schema, but I can answer "
             f"real questions about {org_name}'s live {entity_label}: risk, outcomes, trends, "
             f"recommendations, and more. Try \"what's our status?\" or "
             f"\"what recommendations can you give me?\""
@@ -1768,19 +1845,18 @@ def _conversational_reply_template(intent_name: str, state: dict) -> str:
 
     if intent_name == "help":
         return sanitize_pulse_reply(
-            f"I'm Pulse AI, your intelligent copilot for {org_name}. I can give you the big picture "
-            f"on {entity_label}, pull up a specific one by ID, surface what to action today, "
-            f"check the latest pipeline run, dig into model performance, track trends, "
-            f"find lookalikes, or draft outreach. "
+            f"I'm Entivia for {org_name}. I can summarize {entity_label}, look up IDs, "
+            f"surface actions, check pipeline runs, review model metrics, track trends, "
+            f"find similar records, or draft outreach. "
             f"Try \"show critical {entity_label}\" or \"tell me about 628\". "
-            f"What do you want to look at first?"
+            f"What should we look at first?"
         )
 
     if intent_name == "off_topic":
         return sanitize_pulse_reply(
-            f"That's a bit outside what I cover as Pulse AI. I'm here for {org_name}'s "
+            f"That's outside what Entivia covers. I'm focused on {org_name}'s "
             f"{entity_label} and what to do about them. Try \"what's our status?\" or "
-            f"\"show critical {entity_label}\" and I'll jump in."
+            f"\"show critical {entity_label}\"."
         )
 
     return sanitize_pulse_reply(
@@ -1889,6 +1965,7 @@ async def run(
     # Semantic intent detection: fast-path high-confidence simple intents past
     # the full ReAct loop; otherwise prefilter the tool list for the ReAct loop.
     tools_for_run = TOOLS
+    recent_for_synthesis = _recent_turns_for_prompt(conversation_messages, limit=6)
     if settings.CHAT_INTENT_DETECTION_ENABLED and latest_user:
         recent_for_intent = []
         for m in conversation_messages[-6:]:
@@ -1903,6 +1980,7 @@ async def run(
         intent = await classify_intent(effective_user, convo_history=recent_for_intent)
         if intent:
             intent = apply_pipeline_intent_override(intent, effective_user)
+            intent = apply_data_access_intent_override(intent, effective_user)
             chat_intent = intent.intent
             chat_confidence = intent.confidence
 
@@ -1956,6 +2034,8 @@ async def run(
                         base_system_prompt=base_system,
                         industry=industry,
                         business_context=business_context,
+                        effective_user_message=effective_user,
+                        recent_turns=recent_for_synthesis,
                     )
                     if synthesis_reply:
                         try:

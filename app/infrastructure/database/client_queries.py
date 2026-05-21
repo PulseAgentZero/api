@@ -330,10 +330,40 @@ async def fetch_entities(
         await engine.dispose()
 
 
+def _entity_id_column_type(mapping: SchemaMapping) -> str:
+    """Best-effort SQL type name for the mapped entity ID column (from introspection)."""
+    id_col = mapping.entity_id_col
+    if not id_col:
+        return ""
+    raw = mapping.raw_schema or {}
+    for tbl in raw.get("tables", []):
+        if tbl.get("name") != mapping.entity_table and tbl.get("table") != mapping.entity_table:
+            continue
+        for col in tbl.get("columns", []):
+            if not isinstance(col, dict):
+                continue
+            name = col.get("name") or col.get("column")
+            if name == id_col:
+                return str(col.get("type") or col.get("data_type") or "").lower()
+    return ""
+
+
+def _coerce_entity_id_bind(entity_id: str, mapping: SchemaMapping) -> str | int:
+    """Bind value for entity ID queries (int columns need int, not str)."""
+    col_type = _entity_id_column_type(mapping)
+    if col_type and any(t in col_type for t in ("int", "serial", "bigint", "smallint")):
+        try:
+            return int(entity_id)
+        except (TypeError, ValueError):
+            pass
+    return entity_id
+
+
 async def fetch_entity_by_id(
     db: AsyncSession, org_id, entity_id: str, mapping: SchemaMapping
 ) -> dict | None:
     """Fetch a single entity from the client DB by ID."""
+    bind_eid = _coerce_entity_id_bind(entity_id, mapping)
     conn = await _get_connection(db, org_id, mapping.connection_id)
     frames = await _load_file_source_frames_if_supported(conn)
     if frames is not None:
@@ -344,7 +374,7 @@ async def fetch_entity_by_id(
             raise ClientDBError("Mapped entity table was not found in the file source")
         if id_col not in frame.columns:
             raise ClientDBError("Mapped entity ID column was not found in the file source")
-        match = frame[frame[id_col].astype(str) == str(entity_id)]
+        match = frame[frame[id_col].astype(str) == str(bind_eid)]
         if match.empty:
             return None
         row = match.head(1).where(match.head(1).notna(), None).to_dict(orient="records")[0]
@@ -367,7 +397,7 @@ async def fetch_entity_by_id(
                 f"{_quote_identifier(mapping.entity_table, _conn.db_type)} "
                 f"WHERE {_quote_identifier(mapping.entity_id_col, _conn.db_type)} = :eid"
             )
-            result = await client_conn.execute(text(sql), {"eid": entity_id})
+            result = await client_conn.execute(text(sql), {"eid": bind_eid})
             row = result.one_or_none()
             if row is None:
                 return None
@@ -388,6 +418,7 @@ async def fetch_entity_trend(
     if not mapping.timestamp_col:
         raise ClientDBError("No timestamp column configured for this organization")
 
+    bind_eid = _coerce_entity_id_bind(entity_id, mapping)
     conn = await _get_connection(db, org_id, mapping.connection_id)
     frames = await _load_file_source_frames_if_supported(conn)
     table_name = _validate_identifier(mapping.entity_table, "entity table")
@@ -407,7 +438,7 @@ async def fetch_entity_trend(
         missing = [col for col in required_cols if col not in frame.columns]
         if missing:
             raise ClientDBError(f"Mapped columns not found in file source: {', '.join(missing)}")
-        subset = frame[frame[id_col].astype(str) == str(entity_id)].copy()
+        subset = frame[frame[id_col].astype(str) == str(bind_eid)].copy()
         subset = subset.sort_values(ts_col, ascending=False).head(limit)
         points = []
         for row in reversed(subset.where(subset.notna(), None).to_dict(orient="records")):
@@ -438,7 +469,7 @@ async def fetch_entity_trend(
                     f"SELECT {col_list} FROM {q_table} WHERE {q_id} = :eid "
                     f"ORDER BY {q_ts} DESC LIMIT :limit"
                 )
-            result = await client_conn.execute(text(sql), {"eid": entity_id, "limit": limit})
+            result = await client_conn.execute(text(sql), {"eid": bind_eid, "limit": limit})
             rows = result.all()
             points = []
             for row in reversed(rows):

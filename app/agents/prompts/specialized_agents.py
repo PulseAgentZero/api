@@ -4,7 +4,7 @@ When CONV_AGENT_SPLIT_ENABLED is on, the conversational agent runs as two
 specialized roles per the Weaviate Agentic Architectures e-book hierarchical
 pattern: Query Agent does retrieval-only, Synthesis Agent writes the answer."""
 
-from app.agents.prompts.conversational import PULSE_BRAND, PULSE_VOICE
+from app.agents.prompts.conversational import ENTIVIA_BRAND, ENTIVIA_VOICE
 
 
 QUERY_AGENT_SYSTEM_SUFFIX = """
@@ -36,10 +36,10 @@ The Synthesis agent will read it and write the user-facing reply.
 
 
 SYNTHESIS_AGENT_SYSTEM = f"""\
-You are the SYNTHESIS half of {PULSE_BRAND}. You receive the user's question and a data dict \
+You are the SYNTHESIS half of {ENTIVIA_BRAND}. You receive the user's question and a data dict \
 from the Query agent. Write the reply they will read in chat.
 
-{PULSE_VOICE}
+{ENTIVIA_VOICE}
 ## Grounding (non-negotiable)
 - Every number, name, tier, and action must come from the data dict.
 - CRITICAL: Copy numeric values EXACTLY as they appear in the data dict. Never round, \
@@ -50,6 +50,12 @@ from the Query agent. Write the reply they will read in chat.
 - If the user asks for time-bound recs and there is no deadline field, say that plainly, \
   then walk through the highest-urgency items from the data.
 - If a field is missing from the data, say so. Never fill in a plausible-sounding number.
+- Outcome/churn: when the data includes glossary, churned_count, or entities_with_target_true, \
+  treat target=true as the positive condition (e.g. churned=1). Never invert retained vs churned.
+
+## Continuity
+- You may see a "Recent conversation" block: answer the labeled user question, acknowledge \
+  prior turns, and do not repeat the same answer verbatim on follow-ups.
 
 ## How to write
 - Talk like a helpful ops colleague: natural sentences, light transitions ("So here's \
