@@ -45,8 +45,8 @@ services:
       retries: 5
       start_period: 10s
 
-  pulse:
-    image: pulseai/pulse:${PULSE_VERSION:-latest}
+  entivia:
+    image: entivia/entivia:${PULSE_VERSION:-latest}
     env_file:
       - path: .env
         required: false
@@ -54,12 +54,16 @@ services:
       - "${PORT:-80}:80"
     environment:
       DATABASE_URL: postgresql+asyncpg://pulse:${POSTGRES_PASSWORD}@db:5432/pulse
+      DATABASE_SSLMODE: disable
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://127.0.0.1:6379/0
       LOCAL_STORAGE_PATH: /app/uploads
+      HOME: /home/pulse
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
     volumes:
       - pulse_data:/data
       - uploads_data:/app/uploads
+      - pulse_logs:/var/log/pulse/streams
     depends_on:
       db:
         condition: service_healthy
@@ -77,4 +81,5 @@ volumes:
   db_data:
   qdrant_data:
   pulse_data:
+  pulse_logs:
   uploads_data:

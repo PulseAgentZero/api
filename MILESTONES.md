@@ -421,7 +421,7 @@ connections.last_tested_at: timestamp
 
 #### Backend
 - `POST /api/v1/license/activate` — org submits license key.
-  - Backend calls Pulse license server: `POST https://license.pulseai.io/validate` with `{ license_key, org_id, version, machine_fingerprint }`.
+  - Backend calls Entivia license server: `POST https://license.entivia.online/validate` with `{ license_key, org_id, version, machine_fingerprint }`.
   - On success: stores `{ plan, features, expires_at, seat_limit }` in `license_keys` table.
   - Caches validation result for 7 days (so offline operation works up to 7 days after last contact).
 - `GET /api/v1/license` — returns current license status, plan, features, expiry.

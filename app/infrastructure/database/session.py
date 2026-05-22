@@ -1,13 +1,17 @@
+import os
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config.settings import settings
+from app.infrastructure.database.sql_connect import connect_args_for_async_url
 
 DATABASE_URL = settings.get_async_database_url()
+DATABASE_SSLMODE = os.getenv("DATABASE_SSLMODE", "").strip() or None
 
 engine = create_async_engine(
     DATABASE_URL,
+    connect_args=connect_args_for_async_url(DATABASE_URL, DATABASE_SSLMODE),
     pool_size=settings.DATABASE_POOL_SIZE,
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
     pool_timeout=settings.DATABASE_POOL_TIMEOUT,

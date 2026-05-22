@@ -19,6 +19,7 @@ async def dispatch_email_job(data: dict[str, Any]) -> None:
     from app.infrastructure.email.sender import (
         send_invitation_email,
         send_license_key_email,
+        send_license_portal_link_email,
         send_password_reset_email,
         send_subscription_cancelled_email,
         send_subscription_failed_email,
@@ -87,6 +88,10 @@ async def dispatch_email_job(data: dict[str, Any]) -> None:
         elif email_type == "license_key":
             await send_license_key_email(
                 to, data["license_key"], data.get("expires_at")
+            )
+        elif email_type == "license_portal_link":
+            await send_license_portal_link_email(
+                to, data["link"], ip=data.get("ip")
             )
         else:
             logger.warning("Unknown email job type: %s", email_type)

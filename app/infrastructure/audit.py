@@ -62,5 +62,19 @@ async def log_audit(
         )
         db.add(row)
         await db.flush()
+        logger.info(
+            "audit %s",
+            action,
+            extra={
+                "event_category": "audit",
+                "org_id": str(org_id),
+                "audit_action": action,
+                "audit_resource": resource,
+                "audit_user_id": str(user_id) if user_id else None,
+            },
+        )
     except Exception:
-        logger.exception("audit log write failed for action=%s org=%s", action, org_id)
+        logger.exception(
+            "audit log write failed",
+            extra={"event_category": "audit", "org_id": str(org_id), "audit_action": action},
+        )

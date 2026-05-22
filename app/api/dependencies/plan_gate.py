@@ -137,6 +137,13 @@ def _monthly_usage_window(
     return start, end, "billing_cycle"
 
 
+# ── Self-hosted license feature flags (also in license JWT `features` claim) ───
+LICENSE_FEATURE_AUDIT_LOG = "audit_log"
+LICENSE_FEATURE_SSO = "sso"
+LICENSE_FEATURE_LOG_STREAMING = "log_streaming"
+LICENSE_FEATURE_LDAP_SYNC = "ldap_sync"
+LICENSE_FEATURE_HIGH_CONCURRENCY = "high_concurrency"
+
 # ── Cloud: feature -> minimum plans (audit_log still requires pro) ─────────────
 # api_keys and webhook_deliveries are removed — replaced with count-based limits
 # so free users can access them within their quota.

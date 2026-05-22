@@ -37,6 +37,20 @@ class ChatResult:
     reply: str
     tool_context: dict[str, Any] = field(default_factory=dict)
     tools_called: list[str] = field(default_factory=list)
+    # Full, uncondensed tool payloads for tools that drive structured UI cards
+    # (e.g. start_dashboard_intake, draft_dashboard_plan, propose_dashboard_changes).
+    artifacts: dict[str, Any] = field(default_factory=dict)
+
+
+# Tool names whose raw results are surfaced to the frontend as structured UI cards.
+# These bypass the LLM-context condensation so the UI can render them faithfully.
+UI_ARTIFACT_TOOLS: frozenset[str] = frozenset({
+    "start_dashboard_intake",
+    "draft_dashboard_plan",
+    "build_dashboard_from_plan",
+    "propose_dashboard_changes",
+    "apply_dashboard_changes",
+})
 
 
 from app.config.settings import settings
@@ -72,6 +86,7 @@ from app.infrastructure.database.models.entity_profile import EntityProfile
 
 from app.agents.prompts.conversational import (
     CLARIFICATION_REPLY_PROMPT,
+    DASHBOARD_BUILDER_RULES,
     DATA_ACCESS_REPLY_PROMPT,
     GREETING_REPLY_PROMPT,
     HELP_REPLY_PROMPT,
@@ -373,41 +388,143 @@ TOOLS = [
         },
     },
     {
-        "name": "build_custom_dashboard",
+        "name": "start_dashboard_intake",
         "description": (
-            "Build a complete Pulse Studio dashboard from a natural language goal. "
-            "Introspects the client database schema, generates SQL queries, picks chart types, "
-            "creates visualizations, and returns a link to the new dashboard. "
-            "Use when the user asks to 'build a dashboard', 'create charts', "
-            "'show me X visually', 'make a report on Y', or 'visualise Z'."
+            "FIRST step when the user asks to build/create a dashboard or charts. "
+            "Returns clarifying questions, available connections, and schema preview. "
+            "Does NOT create anything. Always call this before drafting or building."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "goal": {
                     "type": "string",
-                    "description": "Natural language description of what the dashboard should show",
-                },
-                "dashboard_name": {
-                    "type": "string",
-                    "description": "Name for the new dashboard (optional, defaults to goal summary)",
-                },
-                "is_public": {
-                    "type": "boolean",
-                    "description": "Whether to make the dashboard publicly shareable via a link. Default false.",
-                },
-                "max_charts": {
-                    "type": "integer",
-                    "description": "Maximum number of charts to generate (1–6). Default 4.",
-                    "minimum": 1,
-                    "maximum": 6,
+                    "description": "The user's dashboard request in their own words",
                 },
             },
             "required": ["goal"],
             "additionalProperties": False,
         },
     },
+    {
+        "name": "draft_dashboard_plan",
+        "description": (
+            "SECOND step after intake answers: produce a reviewable dashboard plan "
+            "(queries, chart types, parameters) without saving. Show the plan to the user."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "connection_id": {"type": "string", "description": "UUID of the data connection"},
+                "goal": {"type": "string"},
+                "time_window": {"type": "string"},
+                "segments": {"type": "string"},
+                "filters_to_parameterize": {"type": "string"},
+                "compare_period": {"type": "string"},
+                "max_charts": {"type": "integer", "minimum": 1, "maximum": 6},
+                "dashboard_name": {"type": "string"},
+            },
+            "required": ["connection_id", "goal"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "build_dashboard_from_plan",
+        "description": (
+            "FINAL step: persist an approved plan from draft_dashboard_plan. "
+            "Only call after explicit user approval (yes, go, build it, looks good)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "object",
+                    "description": "The full plan object returned by draft_dashboard_plan",
+                },
+                "is_public": {
+                    "type": "boolean",
+                    "description": "Whether to make the dashboard publicly shareable",
+                },
+            },
+            "required": ["plan"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "propose_dashboard_changes",
+        "description": (
+            "Use when the user wants to iterate on an EXISTING dashboard "
+            "(rename, add/remove/replace a chart, change filters, share publicly). "
+            "Returns proposed structured changes WITHOUT persisting. Show them to the user."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {
+                    "type": "string",
+                    "description": "UUID of the dashboard to modify",
+                },
+                "feedback": {
+                    "type": "string",
+                    "description": "The user's feedback in their own words",
+                },
+            },
+            "required": ["dashboard_id", "feedback"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_dashboard_changes",
+        "description": (
+            "Persist a list of approved changes from propose_dashboard_changes. "
+            "Only call after the user explicitly approves the proposal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {"type": "string"},
+                "changes": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "The approved changes from propose_dashboard_changes",
+                },
+            },
+            "required": ["dashboard_id", "changes"],
+            "additionalProperties": False,
+        },
+    },
 ]
+
+_LEGACY_DASHBOARD_TOOL = {
+    "name": "build_custom_dashboard",
+    "description": (
+        "Build a complete Pulse Studio dashboard from a natural language goal (legacy one-shot)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string"},
+            "dashboard_name": {"type": "string"},
+            "is_public": {"type": "boolean"},
+            "max_charts": {"type": "integer", "minimum": 1, "maximum": 6},
+        },
+        "required": ["goal"],
+        "additionalProperties": False,
+    },
+}
+
+
+def get_agent_tools() -> list[dict]:
+    """Return chat tools; legacy one-shot dashboard builder when intake is disabled."""
+    if settings.CHAT_DASHBOARD_INTAKE_ENABLED:
+        return TOOLS
+    return [t for t in TOOLS if t["name"] not in (
+        "start_dashboard_intake",
+        "draft_dashboard_plan",
+        "build_dashboard_from_plan",
+        "propose_dashboard_changes",
+        "apply_dashboard_changes",
+    )] + [_LEGACY_DASHBOARD_TOOL]
 
 
 def _json_ready(value: Any) -> Any:
@@ -1266,6 +1383,68 @@ async def _run_tool(
                 str(tool_input["entity_id"]),
                 limit=int(tool_input.get("limit") or 10),
             )
+        if name == "start_dashboard_intake":
+            if current_user is None:
+                return {"error": "start_dashboard_intake requires an authenticated user"}
+            from app.services.dashboard_builder_service import start_dashboard_intake
+
+            return await start_dashboard_intake(
+                db, org_id, goal=str(tool_input["goal"]),
+            )
+        if name == "draft_dashboard_plan":
+            if current_user is None:
+                return {"error": "draft_dashboard_plan requires an authenticated user"}
+            from app.services.dashboard_builder_service import draft_dashboard_plan
+
+            return await draft_dashboard_plan(
+                db,
+                org_id,
+                connection_id=UUID(str(tool_input["connection_id"])),
+                goal=str(tool_input["goal"]),
+                time_window=tool_input.get("time_window"),
+                segments=tool_input.get("segments"),
+                filters_to_parameterize=tool_input.get("filters_to_parameterize"),
+                compare_period=tool_input.get("compare_period"),
+                max_charts=int(tool_input.get("max_charts") or 4),
+                dashboard_name=tool_input.get("dashboard_name"),
+            )
+        if name == "build_dashboard_from_plan":
+            if current_user is None:
+                return {"error": "build_dashboard_from_plan requires an authenticated user"}
+            from app.services.dashboard_builder_service import build_dashboard_from_plan
+
+            plan = tool_input.get("plan")
+            if not isinstance(plan, dict):
+                return {"error": "plan must be the object from draft_dashboard_plan"}
+            if tool_input.get("is_public") is not None:
+                plan = {**plan, "is_public": bool(tool_input["is_public"])}
+            return await build_dashboard_from_plan(db, org_id, current_user, plan)
+        if name == "propose_dashboard_changes":
+            if current_user is None:
+                return {"error": "propose_dashboard_changes requires an authenticated user"}
+            from app.services.dashboard_builder_service import propose_dashboard_changes
+
+            return await propose_dashboard_changes(
+                db,
+                org_id,
+                dashboard_id=UUID(str(tool_input["dashboard_id"])),
+                feedback=str(tool_input["feedback"]),
+            )
+        if name == "apply_dashboard_changes":
+            if current_user is None:
+                return {"error": "apply_dashboard_changes requires an authenticated user"}
+            from app.services.dashboard_builder_service import apply_dashboard_changes
+
+            changes = tool_input.get("changes")
+            if not isinstance(changes, list):
+                return {"error": "changes must be the array from propose_dashboard_changes"}
+            return await apply_dashboard_changes(
+                db,
+                org_id,
+                current_user,
+                dashboard_id=UUID(str(tool_input["dashboard_id"])),
+                changes=changes,
+            )
         if name == "build_custom_dashboard":
             if current_user is None:
                 return {"error": "build_custom_dashboard requires an authenticated user"}
@@ -1508,6 +1687,8 @@ async def _system_prompt(
             "for context on what was discussed earlier.\n\n"
         )
 
+    dashboard_block = DASHBOARD_BUILDER_RULES if settings.CHAT_DASHBOARD_INTAKE_ENABLED else ""
+
     return render_chat_system_prompt(
         org_name=org_name,
         entity_label=entity_label,
@@ -1518,6 +1699,7 @@ async def _system_prompt(
         memory_block=memory_block,
         handoff_block=handoff_block + overflow_block,
         recalled_block=recalled_block,
+        dashboard_block=dashboard_block,
     )
 
 
@@ -1909,11 +2091,13 @@ async def run(
             reply=clean,
             tool_context=dict(last_tool_context),
             tools_called=list(chat_tools),
+            artifacts=dict(last_artifacts),
         )
 
     latest_user = _latest_user_message(conversation_messages)
     effective_user = latest_user
     last_tool_context: dict[str, Any] = {}
+    last_artifacts: dict[str, Any] = {}
     followup_rewrite = resolve_followup_query(conversation_messages, latest_user)
     if followup_rewrite:
         effective_user = followup_rewrite
@@ -1964,7 +2148,7 @@ async def run(
 
     # Semantic intent detection: fast-path high-confidence simple intents past
     # the full ReAct loop; otherwise prefilter the tool list for the ReAct loop.
-    tools_for_run = TOOLS
+    tools_for_run = get_agent_tools()
     recent_for_synthesis = _recent_turns_for_prompt(conversation_messages, limit=6)
     if settings.CHAT_INTENT_DETECTION_ENABLED and latest_user:
         recent_for_intent = []
@@ -2023,6 +2207,8 @@ async def run(
                     last_tool_context[tool_name] = _condense_tool_result(
                         _json_ready(tool_result)
                     )
+                    if tool_name in UI_ARTIFACT_TOOLS:
+                        last_artifacts[tool_name] = _json_ready(tool_result)
                     base_system = await _system_prompt(
                         db, current_user,
                         recalled_block=recalled_block, handoff_block=handoff_block,
@@ -2051,10 +2237,10 @@ async def run(
                         "[agent_service] fast-path failed, falling back to ReAct: %s", exc,
                     )
         if intent:
-            tools_for_run = filter_tools_by_intent(TOOLS, intent)
+            tools_for_run = filter_tools_by_intent(get_agent_tools(), intent)
             logger.debug(
                 "[agent_service] intent=%s confidence=%.2f tools=%d/%d",
-                intent.intent, intent.confidence, len(tools_for_run), len(TOOLS),
+                intent.intent, intent.confidence, len(tools_for_run), len(get_agent_tools()),
             )
 
     # Optional Query+Synthesis split (hierarchical pattern from Agentic Architectures e-book).
@@ -2128,6 +2314,8 @@ async def run(
                 last_tool_context[tool_use.name] = _condense_tool_result(
                     _json_ready(result)
                 )
+                if tool_use.name in UI_ARTIFACT_TOOLS:
+                    last_artifacts[tool_use.name] = _json_ready(result)
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -2228,7 +2416,7 @@ async def run_stream(
                 model=settings.ANTHROPIC_LLM_MODEL,
                 max_tokens=900,
                 system=system_prompt,
-                tools=TOOLS,
+                tools=get_agent_tools(),
                 messages=messages,
             ) as stream:
                 async for text_chunk in stream.text_stream:

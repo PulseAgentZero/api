@@ -11,6 +11,7 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 
 from app.license_server.settings import (
+    DEFAULT_LICENSE_LIMITS,
     DEFAULT_PLAN,
     DEFAULT_SEAT_LIMIT,
     DEFAULT_SELF_HOSTED_FEATURES,
@@ -48,6 +49,7 @@ def issue_license_jwt(
     plan: str = DEFAULT_PLAN,
     features: list[str] | None = None,
     seat_limit: int | None = DEFAULT_SEAT_LIMIT,
+    limits: dict[str, int] | None = None,
     expires_at: datetime | None = None,
 ) -> tuple[str, datetime, str]:
     """Return (full plc_* key, expires_at, jti)."""
@@ -66,6 +68,9 @@ def issue_license_jwt(
     }
     if seat_limit is not None:
         payload["seat_limit"] = seat_limit
+    lim = dict(limits if limits is not None else DEFAULT_LICENSE_LIMITS)
+    if lim:
+        payload["limits"] = lim
     iss = get_jwt_issuer()
     if iss:
         payload["iss"] = iss

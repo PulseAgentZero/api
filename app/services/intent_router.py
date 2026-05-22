@@ -302,7 +302,11 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "compare_runs": ("compare_pipeline_runs", "get_pipeline_status"),
     "find_similar": ("find_similar_entities", "get_entity_detail"),
     "generate_draft": ("generate_action_draft", "get_entity_detail"),
-    "build_dashboard": ("build_custom_dashboard",),
+    "build_dashboard": (
+        "start_dashboard_intake",
+        "draft_dashboard_plan",
+        "build_dashboard_from_plan",
+    ),
     "compare_or_explain": None,
     "unknown": None,
 }
@@ -321,8 +325,11 @@ _FASTPATH_TOOL: dict[str, str] = {
     "compare_runs": "compare_pipeline_runs",
     "find_similar": "find_similar_entities",
     "generate_draft": "generate_action_draft",
-    "build_dashboard": "build_custom_dashboard",
 }
+
+if not settings.CHAT_DASHBOARD_INTAKE_ENABLED:
+    INTENT_TOOLS["build_dashboard"] = ("build_custom_dashboard",)
+    _FASTPATH_TOOL["build_dashboard"] = "build_custom_dashboard"
 
 
 def build_fastpath_args(

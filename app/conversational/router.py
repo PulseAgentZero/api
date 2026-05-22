@@ -192,6 +192,8 @@ async def chat(
         assistant_msg["tool_context"] = result.tool_context
     if result.tools_called:
         assistant_msg["tools_called"] = result.tools_called
+    if result.artifacts:
+        assistant_msg["artifacts"] = result.artifacts
     await repo.append_messages(conv_id, assistant_msg)
     await db.commit()
     logger.info(
@@ -199,7 +201,12 @@ async def chat(
         conv_id, current_user.id,
     )
 
-    return ChatResponse(reply=result.reply, conversation_id=conv_id)
+    return ChatResponse(
+        reply=result.reply,
+        conversation_id=conv_id,
+        tools_called=result.tools_called or None,
+        artifacts=result.artifacts or None,
+    )
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -241,6 +248,13 @@ async def chat_without_path_conversation(
         assistant_msg["tool_context"] = result.tool_context
     if result.tools_called:
         assistant_msg["tools_called"] = result.tools_called
+    if result.artifacts:
+        assistant_msg["artifacts"] = result.artifacts
     await repo.append_messages(conv.id, assistant_msg)
     await db.commit()
-    return ChatResponse(reply=result.reply, conversation_id=conv.id)
+    return ChatResponse(
+        reply=result.reply,
+        conversation_id=conv.id,
+        tools_called=result.tools_called or None,
+        artifacts=result.artifacts or None,
+    )

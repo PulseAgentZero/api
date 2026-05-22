@@ -102,3 +102,15 @@ def configure_logging(level: str | None = None, fmt: str | None = None) -> None:
         for existing in list(lg.handlers):
             lg.removeHandler(existing)
         lg.propagate = True
+
+    # Self-hosted log streaming (no-op until manager is started in process lifespan).
+    try:
+        from app.config.settings import settings
+        from app.infrastructure.logging.streams.handler import StreamingHandler
+
+        if settings.DEPLOYMENT_MODE == "self_hosted":
+            stream_handler = StreamingHandler()
+            stream_handler.setLevel(logging.DEBUG)
+            root.addHandler(stream_handler)
+    except Exception:
+        pass
