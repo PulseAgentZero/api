@@ -961,13 +961,14 @@ async def verify_selfhosted_purchase(
         "License server did not return key for payment %s (org %s) — will retry delivery",
         reference, purchaser_org_id or "pending",
     )
+    portal_url = f"{settings.MARKETING_URL.rstrip('/')}/pricing/self-hosted/portal"
     return {
         "status": "success",
         "message": (
             f"Payment confirmed. Your license key will be emailed to {delivery_email} "
-            "within a few minutes. If it doesn't arrive, use the customer portal at "
-            f"/pricing/self-hosted/portal to re-email it, or contact support with your "
-            f"payment reference: {reference}"
+            "within a few minutes (we retry automatically for up to 7 days). If it doesn't "
+            f"arrive, use the customer portal at {portal_url} to re-email it, or contact "
+            f"support with your payment reference: {reference}"
         ),
         "license_key": None,
     }
@@ -1058,7 +1059,18 @@ async def _issue_and_deliver_self_hosted_license(
         org_id=purchaser_org_id,
     )
     if not license_key:
+        from app.services.selfhost_license_pending import enqueue_pending_issuance
+
+        await enqueue_pending_issuance(
+            payment_reference=payment_reference,
+            delivery_email=delivery_email,
+            purchaser_org_id=purchaser_org_id,
+        )
         return None, None
+
+    from app.services.selfhost_license_pending import remove_pending_issuance
+
+    await remove_pending_issuance(payment_reference)
 
     if await _claim_selfhost_email_delivery(payment_reference):
         await queue_email(

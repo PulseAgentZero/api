@@ -230,7 +230,11 @@ class Settings:
     # Self-hosted only: when set, the instance auto-activates this plc_… key on
     # first GET /license call by the admin. Lets ops teams ship a pre-activated
     # instance from a Docker .env without ever opening the dashboard manually.
-    PULSE_LICENSE_KEY: Optional[str] = (os.getenv("PULSE_LICENSE_KEY") or "").strip() or None
+    # PULSE_LICENSE_KEY is accepted as a backward-compatible alias.
+    ENTIVIA_LICENSE_KEY: Optional[str] = (
+        (os.getenv("ENTIVIA_LICENSE_KEY") or os.getenv("PULSE_LICENSE_KEY") or "").strip()
+        or None
+    )
 
     # ------------------------------------------------------------------
     # Qdrant (vector search for entity retrieval)

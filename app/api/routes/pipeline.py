@@ -349,7 +349,7 @@ async def scheduler_status(
     from app.infrastructure.database.models.scheduler_heartbeat import (
         SchedulerHeartbeat,
     )
-    from app.services.schedulers.pipeline_scheduler import (
+    from app.services.schedulers.heartbeat import (
         HEARTBEAT_KIND,
         HEARTBEAT_STALE_AFTER_SECONDS,
     )

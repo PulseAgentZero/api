@@ -48,14 +48,14 @@ async def _maybe_bootstrap_env_license(
     org_id: UUID,
     user_id: UUID,
 ) -> tuple[LicenseKey | None, str | None]:
-    """Activate ``PULSE_LICENSE_KEY`` from env on first read if no license is stored.
+    """Activate ``ENTIVIA_LICENSE_KEY`` from env on first read if no license is stored.
 
     Returns ``(license_row, error_message)``. Both ``None`` means no env key
     was configured. A non-``None`` ``error_message`` means the env key failed
     validation (logged, surfaced to UI as ``env_provision_error``) but does
     not raise — the dashboard still loads.
     """
-    env_key = (settings.PULSE_LICENSE_KEY or "").strip()
+    env_key = (settings.ENTIVIA_LICENSE_KEY or "").strip()
     if not env_key:
         return None, None
 
@@ -67,19 +67,19 @@ async def _maybe_bootstrap_env_license(
         try:
             decode_license_jwt_payload(env_key)
         except (jwt.PyJWTError, ValueError) as exc:
-            msg = f"PULSE_LICENSE_KEY signature invalid: {exc}"
+            msg = f"ENTIVIA_LICENSE_KEY signature invalid: {exc}"
             import logging as _log
             _log.getLogger(__name__).warning(msg)
-            return None, "PULSE_LICENSE_KEY signature could not be verified"
+            return None, "ENTIVIA_LICENSE_KEY signature could not be verified"
 
     code, data, err = await post_validate_license(env_key, org_id)
     if code == 0 or code >= 400 or not isinstance(data, dict) or data.get("valid") is False:
         reason = (data or {}).get("reason") if isinstance(data, dict) else err
         import logging as _log
         _log.getLogger(__name__).warning(
-            "PULSE_LICENSE_KEY env auto-activation failed for org %s: %s", org_id, reason
+            "ENTIVIA_LICENSE_KEY env auto-activation failed for org %s: %s", org_id, reason
         )
-        return None, f"PULSE_LICENSE_KEY could not be activated: {reason or 'unreachable'}"
+        return None, f"ENTIVIA_LICENSE_KEY could not be activated: {reason or 'unreachable'}"
 
     now = datetime.now(timezone.utc)
     expires_at = data.get("expires_at")
@@ -133,7 +133,7 @@ async def get_license(
     Return the current license status for this org: plan, active features, seat usage,
     expiry date, and whether the instance is locked. No license → `plan: "free"`, `is_valid: false`.
 
-    When ``PULSE_LICENSE_KEY`` is set in the instance environment and no license
+    When ``ENTIVIA_LICENSE_KEY`` is set in the instance environment and no license
     is stored locally, the key is auto-activated on this call so admins do not
     need to paste it into the dashboard manually.
     """
@@ -147,9 +147,9 @@ async def get_license(
         )
 
     env_provisioned = bool(
-        settings.PULSE_LICENSE_KEY
+        settings.ENTIVIA_LICENSE_KEY
         and row is not None
-        and row.license_key == settings.PULSE_LICENSE_KEY
+        and row.license_key == settings.ENTIVIA_LICENSE_KEY
     )
 
     ent = await resolve_self_hosted_entitlements(db, current_user.org_id)

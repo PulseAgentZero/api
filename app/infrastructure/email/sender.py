@@ -316,7 +316,7 @@ async def send_org_delete_confirm_email(
 
 
 async def send_license_key_email(to: str, license_key: str, expires_at: str | None = None) -> None:
-    base = settings.FRONTEND_URL.rstrip("/")
+    base = settings.MARKETING_URL.rstrip("/")
     activate_docs_url = f"{base}/docs/license-activation"
     portal_url = f"{base}/pricing/self-hosted/portal"
     html = _render(

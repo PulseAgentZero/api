@@ -12,7 +12,6 @@ import asyncio
 import logging
 import os
 import random
-import socket
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -23,17 +22,20 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from croniter import croniter
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config.settings import settings
 from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
-from app.infrastructure.database.models.scheduler_heartbeat import SchedulerHeartbeat
 from app.infrastructure.database.repositories.pipeline_run_repository import (
     PipelineRunRepository,
 )
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.redis.client import get_redis
+from app.services.schedulers.heartbeat import (
+    HEARTBEAT_KIND,
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_STALE_AFTER_SECONDS,
+)
 from app.services.self_hosted_license import get_concurrent_pipeline_limit
 
 logger = logging.getLogger(__name__)
@@ -51,13 +53,12 @@ else:
     PIPELINE_ORG_DISCOVERY_INTERVAL_SECONDS = 60
 
 SCHEDULE_RELOAD_CHANNEL = "pulse:schedule:reload"
-HEARTBEAT_KIND = "pipeline"
-HEARTBEAT_INTERVAL_SECONDS = int(
-    os.getenv("PIPELINE_SCHEDULER_HEARTBEAT_SECONDS", "60")
-)
-# Stale threshold = how long without a heartbeat before the UI shows "unhealthy".
-HEARTBEAT_STALE_AFTER_SECONDS = int(
-    os.getenv("PIPELINE_SCHEDULER_HEARTBEAT_STALE_SECONDS", "180")
+# Heartbeat constants are re-exported from ``heartbeat.py`` for backward
+# compatibility with callers that import them from this module.
+__all_heartbeat__ = (
+    "HEARTBEAT_KIND",
+    "HEARTBEAT_INTERVAL_SECONDS",
+    "HEARTBEAT_STALE_AFTER_SECONDS",
 )
 
 _scheduler: AsyncIOScheduler | None = None
@@ -218,34 +219,6 @@ async def _run_pipeline_for_org(
 
     org_id = UUID(org_id_str)
     await trigger_pipeline_now(org_id, trigger_source=trigger_source)
-
-
-async def _write_heartbeat() -> None:
-    """Upsert the scheduler heartbeat row. Best-effort; never raises."""
-    try:
-        async with async_session_factory() as session:
-            now_utc = datetime.now(timezone.utc)
-            stmt = pg_insert(SchedulerHeartbeat).values(
-                kind=HEARTBEAT_KIND,
-                last_seen_at=now_utc,
-                process_id=str(os.getpid()),
-                host=socket.gethostname(),
-                scheduled_runs_total=_scheduled_invocations_total,
-            )
-            stmt = stmt.on_conflict_do_update(
-                index_elements=[SchedulerHeartbeat.kind],
-                set_={
-                    "last_seen_at": now_utc,
-                    "process_id": str(os.getpid()),
-                    "host": socket.gethostname(),
-                    "scheduled_runs_total": _scheduled_invocations_total,
-                    "updated_at": now_utc,
-                },
-            )
-            await session.execute(stmt)
-            await session.commit()
-    except Exception as e:
-        logger.debug("[Scheduler] heartbeat write failed: %s", e)
 
 
 def get_scheduled_invocations_total() -> int:
@@ -433,8 +406,11 @@ async def start_pipeline_scheduler() -> AsyncIOScheduler:
     if not groq_ok and not anthropic_ok:
         logger.warning(
             "Neither GROQ_API_KEY nor ANTHROPIC_API_KEY configured — "
-            "pipeline scheduler disabled"
+            "pipeline scheduler will not register org jobs (heartbeat still runs)"
         )
+        # Start an empty APScheduler so callers that expect a running scheduler
+        # (e.g. schedule_org) don't crash. Heartbeat lives at the process level
+        # in app.services.schedulers.run — so the UI still shows "healthy".
         _scheduler = AsyncIOScheduler()
         _scheduler.start()
         return _scheduler
@@ -456,16 +432,6 @@ async def start_pipeline_scheduler() -> AsyncIOScheduler:
         id="pipeline_discover_orgs",
         args=[_scheduler],
         replace_existing=True,
-    )
-
-    _scheduler.add_job(
-        _write_heartbeat,
-        trigger=IntervalTrigger(seconds=HEARTBEAT_INTERVAL_SECONDS),
-        id="pipeline_heartbeat",
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-        next_run_time=datetime.now(timezone.utc),
     )
 
     _reload_listener_task = asyncio.create_task(_listen_schedule_reload(_scheduler))
