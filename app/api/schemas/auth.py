@@ -97,9 +97,14 @@ class OrgOut(BaseModel):
     name: str
     slug: str | None = None
     industry: str | None
+    business_context: str | None = None
+    entity_label: str | None = None
+    goal_label: str | None = None
     plan: str | None = None
+    timezone: str | None = None
     onboarding_done: bool
     created_at: str | None = None
+    updated_at: str | None = None
     logo_url: str | None = None
     tour_guide: dict[str, Any] = Field(default_factory=dict)
     require_2fa: bool = False
