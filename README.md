@@ -5,7 +5,7 @@
 
 [Entivia](https://entivia.online) links directly to your existing database — Postgres, MySQL, MSSQL, SQLite, and more — and runs an autonomous multi‑agent AI pipeline against it to turn relational tables into ranked recommendation queues, risk‑scored entity profiles, and live conversational workflows. **Your data never leaves your infrastructure**: Entivia introspects the schema and queries live, read‑only.
 
-This repository is the backend (FastAPI + autonomous agent pipeline + license server). The web dashboard lives at [`PulseAgentZero/dashboard`](https://github.com/PulseAgentZero/dashboard). The published self‑hosted Docker image is at [`chideraozigbo488/entivia`](https://hub.docker.com/r/chideraozigbo488/entivia). Built for the **DSN × Bluechip Technologies Challenge 3.0**.
+This repository is the backend (FastAPI + autonomous agent pipeline + license server). The web dashboard lives at [`PulseAgentZero/dashboard`](https://github.com/PulseAgentZero/dashboard). The published self‑hosted Docker image is at [`chideraozigbo488/entivia`](https://hub.docker.com/r/chideraozigbo488/entivia).
 
 | | |
 |---|---|
@@ -25,18 +25,19 @@ This repository is the backend (FastAPI + autonomous agent pipeline + license se
 1. [What Entivia does](#what-entivia-does)
 2. [Architecture overview](#architecture-overview)
 3. [User modeling & recommendation engine](#user-modeling--recommendation-engine)
-4. [Project structure](#project-structure)
-5. [Prerequisites](#prerequisites)
-6. [Local development](#local-development)
-7. [Docker — self‑hosted](#docker--self-hosted)
-8. [Docker — cloud / internal dev](#docker--cloud--internal-dev)
-9. [Environment variables](#environment-variables)
-10. [Database migrations](#database-migrations)
-11. [API documentation](#api-documentation)
-12. [Make targets](#make-targets)
-13. [Testing](#testing)
-14. [Reference docs](#reference-docs)
-15. [Troubleshooting](#troubleshooting)
+4. [Supported data sources](#supported-data-sources)
+5. [Project structure](#project-structure)
+6. [Prerequisites](#prerequisites)
+7. [Local development](#local-development)
+8. [Docker — self‑hosted](#docker--self-hosted)
+9. [Docker — cloud / internal dev](#docker--cloud--internal-dev)
+10. [Environment variables](#environment-variables)
+11. [Database migrations](#database-migrations)
+12. [API documentation](#api-documentation)
+13. [Make targets](#make-targets)
+14. [Testing](#testing)
+15. [Reference docs](#reference-docs)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -121,8 +122,6 @@ Every recommendation row carries `type`, `urgency`, `title`, `reasoning`, `sugge
 
 ![Entivia agent pipeline flow](docker/images/pulse/pipeline-flow.png)
 
-> The diagram is generated from [`scripts/diagrams/generate_pipeline_flow.py`](scripts/diagrams/generate_pipeline_flow.py) using matplotlib. Re‑run that script whenever a stage or backing store changes.
-
 Pipeline metrics — duration, LLM calls, tool calls, tokens, provider fallbacks, RAG latency, and RAG‑eval regression scores — are persisted to `pipeline_runs` and mirrored to `logs/pipeline_runs/*.json` for every run, so quality regressions are visible the moment they happen.
 
 Configuration entry points for the engine live on the schema mapping:
@@ -131,6 +130,25 @@ Configuration entry points for the engine live on the schema mapping:
 - `risk_config` — per‑signal weights and thresholds used by the deterministic scorer.
 - `target_column` — optional explicit target for the ML model; auto‑discovered otherwise.
 - `rag_config` — per‑org retrieval knobs (top‑K, similarity floor, TTL).
+
+---
+
+## Supported data sources
+
+Entivia connects to your existing systems through **connections** — credentials are encrypted at rest with Fernet, sessions run **read‑only** wherever the source supports it, and the pipeline queries live (no copy is taken). A condensed list of what's wired up today:
+
+| Category | Connectors |
+|---|---|
+| **SQL databases** | PostgreSQL, MySQL / MariaDB, Microsoft SQL Server, Amazon Redshift, SQLite |
+| **Cloud warehouses** | Snowflake, Google BigQuery, Databricks, ClickHouse |
+| **NoSQL** | MongoDB |
+| **Spreadsheets & SaaS** | Google Sheets, Airtable |
+| **Object storage** | Amazon S3, Google Cloud Storage |
+| **File upload** | CSV / TSV, Excel (`.xlsx`, `.xls`) |
+
+Not every connector plays the same role: SQL databases and warehouses power the **full pipeline** (entity profiling, ML/rule scoring, recommendations) **and** Studio live SQL; CSV / Sheets / S3 (CSV objects) power **Studio in‑memory SQL** and pipeline ingestion; Airtable and MongoDB are document/API workflows and aren't usable as the live SQL entity source.
+
+For the full per‑connector matrix — required fields, supported authentication methods, Studio vs pipeline support, and security recommendations — see the docs: <https://docs.entivia.online/docs/data-sources>.
 
 ---
 

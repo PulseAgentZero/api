@@ -3,8 +3,10 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -29,6 +31,60 @@ from app.services.pipeline_trigger import claim_and_trigger_pipeline, serialize_
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
+
+_WINDOWS_TIMEZONE_ALIASES = {
+    "utc": "UTC",
+    "gmt": "UTC",
+    "z": "UTC",
+    "coordinated universal time": "UTC",
+    "w. central africa standard time": "Africa/Lagos",
+    "west central africa standard time": "Africa/Lagos",
+    "west africa standard time": "Africa/Lagos",
+}
+
+
+def _resolve_schedule_timezone(value: str | None) -> tuple[str, ZoneInfo]:
+    """Return a canonical IANA timezone name and ZoneInfo object.
+
+    The API stores IANA names, but dashboard widgets and browsers can send
+    friendlier labels such as "UTC+1" or "West Africa Standard Time".
+    """
+    raw = (value or "UTC").strip()
+    if not raw:
+        raw = "UTC"
+
+    try:
+        return raw, ZoneInfo(raw)
+    except Exception:
+        pass
+
+    normalized = re.sub(r"\s+", " ", raw).strip().lower()
+    alias = _WINDOWS_TIMEZONE_ALIASES.get(normalized)
+    if alias:
+        return alias, ZoneInfo(alias)
+
+    # Common UI labels sometimes include the IANA value in prose.
+    iana_match = re.search(r"\b[A-Za-z_]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?\b", raw)
+    if iana_match:
+        candidate = iana_match.group(0)
+        try:
+            return candidate, ZoneInfo(candidate)
+        except Exception:
+            pass
+
+    # Accept fixed whole-hour offsets like UTC+1, UTC+01:00, GMT-5.
+    # POSIX "Etc/GMT" signs are intentionally reversed by the tz database.
+    offset_match = re.search(r"\b(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\b", raw, re.I)
+    if offset_match:
+        sign, hours_raw, minutes_raw = offset_match.groups()
+        hours = int(hours_raw)
+        minutes = int(minutes_raw or "0")
+        if 0 <= hours <= 14 and minutes == 0:
+            etc_sign = "-" if sign == "+" else "+"
+            candidate = f"Etc/GMT{etc_sign}{hours}" if hours else "UTC"
+            return candidate, ZoneInfo(candidate)
+
+    raise ValueError("Invalid timezone")
 
 
 class TriggerBody(BaseModel):
@@ -307,13 +363,13 @@ async def preview_schedule_next(
             fields={"cron_expression": "Unparseable cron expression"},
         )
     try:
-        from zoneinfo import ZoneInfo
-
-        tz = ZoneInfo(body.timezone or "UTC")
-    except Exception:
+        timezone_name, tz = _resolve_schedule_timezone(body.timezone)
+    except ValueError:
         raise validation_error(
             "Invalid timezone",
-            fields={"timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos"},
+            fields={
+                "timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos, or a UTC/GMT offset like UTC+1"
+            },
         )
 
     now_utc = datetime.now(timezone.utc)
@@ -330,7 +386,7 @@ async def preview_schedule_next(
 
     return {
         "cron_expression": body.cron_expression,
-        "timezone": body.timezone,
+        "timezone": timezone_name,
         "next_runs": next_runs,
     }
 
@@ -407,13 +463,13 @@ async def put_schedule(
             fields={"cron_expression": "Unparseable cron expression"},
         )
     try:
-        from zoneinfo import ZoneInfo
-
-        schedule_tz = ZoneInfo(body.timezone or "UTC")
-    except Exception:
+        timezone_name, schedule_tz = _resolve_schedule_timezone(body.timezone)
+    except ValueError:
         raise validation_error(
             "Invalid timezone",
-            fields={"timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos"},
+            fields={
+                "timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos, or a UTC/GMT offset like UTC+1"
+            },
         )
     r = await db.execute(
         select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
@@ -426,7 +482,7 @@ async def put_schedule(
         next_at = croniter(body.cron_expression, base).get_next(datetime)
     if row:
         row.cron_expression = body.cron_expression
-        row.timezone = body.timezone
+        row.timezone = timezone_name
         row.is_active = body.is_active
         row.mapping_id = body.mapping_id
         row.next_run_at = next_at
@@ -434,7 +490,7 @@ async def put_schedule(
         row = PipelineSchedule(
             org_id=current_user.org_id,
             cron_expression=body.cron_expression,
-            timezone=body.timezone,
+            timezone=timezone_name,
             is_active=body.is_active,
             mapping_id=body.mapping_id,
             next_run_at=next_at,
