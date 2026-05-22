@@ -34,6 +34,9 @@
 #     --build-arg PULSE_LICENSE_PUBLIC_KEY="$(cat license_public.pem)" \
 #     -t chideraozigbo488/entivia:$VERSION \
 #     -t chideraozigbo488/entivia:latest \
+#     --provenance=false \
+#     --sbom=false \
+#     --progress=plain \
 #     --push \
 #     .
 #

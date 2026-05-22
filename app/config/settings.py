@@ -376,6 +376,7 @@ class Settings:
         "K_k8N_IyoXaDyql8ijHUmO9KA6FyuAqP7guglrC0Pns=",
     )
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    CORS_ALLOWED_ORIGINS: str = os.getenv("CORS_ALLOWED_ORIGINS", "")
     OAUTH_REDIRECT_ALLOWLIST: str = os.getenv("OAUTH_REDIRECT_ALLOWLIST", "")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
     PASSWORD_HASH_ITERATIONS: int = int(

@@ -50,6 +50,49 @@ from app.infrastructure.redis.client import close_redis
 
 configure_logging()
 
+
+def _origin(value: str) -> str | None:
+    from urllib.parse import urlparse
+
+    raw = (value or "").strip().rstrip("/")
+    if not raw:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _cors_origins() -> list[str]:
+    """Origins allowed to call the API from a browser.
+
+    The dashboard and marketing site are different production origins:
+    app.entivia.online hosts authenticated app pages, while entivia.online hosts
+    public checkout pages such as /pricing/self-hosted. Both need browser access
+    to /api/v1/billing/self-hosted/*.
+    """
+    origins: set[str] = set()
+    for value in (
+        settings.FRONTEND_URL,
+        settings.MARKETING_URL,
+        *settings.CORS_ALLOWED_ORIGINS.split(","),
+    ):
+        origin = _origin(value)
+        if origin:
+            origins.add(origin)
+
+    if not _is_prod:
+        origins.update(
+            {
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3001",
+            }
+        )
+    return sorted(origins)
+
+
 # Mount local file storage if LOCAL backend is active
 def _mount_local_storage(app: "FastAPI") -> None:
     try:
@@ -143,7 +186,7 @@ app.add_middleware(LoggingMiddleware)
 app.add_middleware(OrgContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
