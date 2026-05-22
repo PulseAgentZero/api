@@ -14,7 +14,11 @@ from sqlalchemy.orm import selectinload
 from app.infrastructure.database.models.license_activation import LicenseActivation
 from app.infrastructure.database.models.license_issuance import LicenseIssuance
 from app.license_server.crypto import decode_license_jwt, issue_license_jwt
-from app.license_server.settings import DEFAULT_PLAN, DEFAULT_SELF_HOSTED_FEATURES
+from app.license_server.settings import (
+    DEFAULT_PLAN,
+    DEFAULT_SELF_HOSTED_FEATURES,
+    LICENSE_VALIDITY_DAYS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,21 @@ async def purchase_license(
     )
     row = existing.scalar_one_or_none()
     if row is not None:
+        if LICENSE_VALIDITY_DAYS <= 0 and row.expires_at is not None:
+            # Existing rows created before lifetime licenses were enabled had a
+            # one-year exp claim. Reissue the same purchase as a lifetime token
+            # while preserving the jti / activation binding.
+            license_key, expires_at, _jti = issue_license_jwt(
+                jti=row.jti,
+                plan=row.plan,
+                features=list(row.features or []),
+                seat_limit=row.seat_limit,
+                expires_at=None,
+            )
+            row.license_key = license_key
+            row.expires_at = expires_at
+            await db.commit()
+            await db.refresh(row)
         return {
             "license_key": row.license_key,
             "expires_at": _iso(row.expires_at),
@@ -117,6 +136,12 @@ async def validate_license(
     issuance = result.scalar_one_or_none()
     if issuance is None:
         return {"valid": False, "reason": "Unknown license key", "code": "UNKNOWN_LICENSE"}
+
+    if LICENSE_VALIDITY_DAYS <= 0 and issuance.expires_at is not None:
+        # Treat previously issued one-year purchases as lifetime going forward.
+        # A portal resend / purchase verification will reissue the JWT without an
+        # exp claim; validation should still stop surfacing an expiry immediately.
+        issuance.expires_at = None
 
     if issuance.revoked_at is not None:
         return {"valid": False, "reason": "License revoked", "code": "LICENSE_REVOKED"}

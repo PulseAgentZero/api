@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from app.services.license_remote import post_validate_license
 from app.services.self_hosted_license import resolve_self_hosted_entitlements
 
 router = APIRouter(prefix="/license", tags=["License"])
+logger = logging.getLogger(__name__)
 
 
 async def _active_seat_count(db: AsyncSession, org_id: UUID) -> int:
@@ -42,6 +44,11 @@ def _cloud_404() -> None:
         raise not_found("Not found")
 
 
+def _normalize_license_key_input(raw: str) -> str:
+    """Trim accidental whitespace introduced by copy/paste or email wrapping."""
+    return "".join((raw or "").split())
+
+
 async def _maybe_bootstrap_env_license(
     db: AsyncSession,
     *,
@@ -55,7 +62,7 @@ async def _maybe_bootstrap_env_license(
     validation (logged, surfaced to UI as ``env_provision_error``) but does
     not raise — the dashboard still loads.
     """
-    env_key = (settings.ENTIVIA_LICENSE_KEY or "").strip()
+    env_key = _normalize_license_key_input(settings.ENTIVIA_LICENSE_KEY or "")
     if not env_key:
         return None, None
 
@@ -67,16 +74,15 @@ async def _maybe_bootstrap_env_license(
         try:
             decode_license_jwt_payload(env_key)
         except (jwt.PyJWTError, ValueError) as exc:
-            msg = f"ENTIVIA_LICENSE_KEY signature invalid: {exc}"
-            import logging as _log
-            _log.getLogger(__name__).warning(msg)
-            return None, "ENTIVIA_LICENSE_KEY signature could not be verified"
+            logger.warning(
+                "ENTIVIA_LICENSE_KEY offline signature check failed; trying license server: %s",
+                exc,
+            )
 
     code, data, err = await post_validate_license(env_key, org_id)
     if code == 0 or code >= 400 or not isinstance(data, dict) or data.get("valid") is False:
         reason = (data or {}).get("reason") if isinstance(data, dict) else err
-        import logging as _log
-        _log.getLogger(__name__).warning(
+        logger.warning(
             "ENTIVIA_LICENSE_KEY env auto-activation failed for org %s: %s", org_id, reason
         )
         return None, f"ENTIVIA_LICENSE_KEY could not be activated: {reason or 'unreachable'}"
@@ -240,11 +246,16 @@ async def activate_license(
     _cloud_404()
     if settings.PULSE_LICENSE_PUBLIC_KEY:
         try:
-            decode_license_jwt_payload(body.license_key)
-        except (jwt.PyJWTError, ValueError):
-            raise bad_request("INVALID_LICENSE_SIGNATURE", "License key signature could not be verified")
+            decode_license_jwt_payload(_normalize_license_key_input(body.license_key))
+        except (jwt.PyJWTError, ValueError) as exc:
+            logger.warning(
+                "Offline license signature check failed for org %s; trying license server: %s",
+                current_user.org_id,
+                exc,
+            )
 
-    code, data, err = await post_validate_license(body.license_key, current_user.org_id)
+    license_key = _normalize_license_key_input(body.license_key)
+    code, data, err = await post_validate_license(license_key, current_user.org_id)
     if code == 0:
         raise bad_request("LICENSE_SERVER_UNREACHABLE", err or "Cannot reach Entivia license server")
     if code >= 400 or not data:
@@ -271,7 +282,7 @@ async def activate_license(
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
     if row:
-        _apply_server_payload(row, body.license_key, data, now=now)
+        _apply_server_payload(row, license_key, data, now=now)
     else:
         exp_dt = None
         if expires_at:
@@ -281,7 +292,7 @@ async def activate_license(
                 exp_dt = None
         row = LicenseKey(
             org_id=current_user.org_id,
-            license_key=body.license_key,
+            license_key=license_key,
             plan=str(plan or "pro"),
             features=list(features or []),
             limits=limits,

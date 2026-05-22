@@ -33,6 +33,8 @@ def _apply_success_to_row(row: LicenseKey, data: dict, now: datetime) -> None:
             row.expires_at = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
         except ValueError:
             pass
+    else:
+        row.expires_at = None
     row.last_validated_at = now
     row.validation_cached_until = now + timedelta(days=settings.LICENSE_OFFLINE_GRACE_DAYS)
     row.is_active = bool(data.get("valid", True))

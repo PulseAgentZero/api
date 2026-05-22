@@ -17,6 +17,10 @@
 <p style="font-size:14px;color:#4b5563;">
   This license is valid until <strong>{{ expires_at }}</strong>.
 </p>
+{% else %}
+<p style="font-size:14px;color:#4b5563;">
+  This license is valid for life.
+</p>
 {% endif %}
 
 <a href="{{ activate_docs_url }}" class="btn">How to Activate</a>

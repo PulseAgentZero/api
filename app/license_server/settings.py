@@ -22,7 +22,8 @@ DEFAULT_SELF_HOSTED_FEATURES = (
 DEFAULT_PLAN = "pro"
 DEFAULT_SEAT_LIMIT: int | None = None
 DEFAULT_LICENSE_LIMITS: dict[str, int] = {"concurrent_pipeline_runs": 5}
-LICENSE_VALIDITY_DAYS = int(os.getenv("LICENSE_VALIDITY_DAYS", "365"))
+# 0 or a negative value means lifetime / no expiry.
+LICENSE_VALIDITY_DAYS = int(os.getenv("LICENSE_VALIDITY_DAYS", "0"))
 
 
 def get_database_url() -> str:

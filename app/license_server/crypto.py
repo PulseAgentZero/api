@@ -15,9 +15,9 @@ from app.license_server.settings import (
     DEFAULT_PLAN,
     DEFAULT_SEAT_LIMIT,
     DEFAULT_SELF_HOSTED_FEATURES,
-    LICENSE_VALIDITY_DAYS,
     get_jwt_issuer,
     get_signing_private_key,
+    LICENSE_VALIDITY_DAYS,
 )
 
 
@@ -51,10 +51,14 @@ def issue_license_jwt(
     seat_limit: int | None = DEFAULT_SEAT_LIMIT,
     limits: dict[str, int] | None = None,
     expires_at: datetime | None = None,
-) -> tuple[str, datetime, str]:
-    """Return (full plc_* key, expires_at, jti)."""
+) -> tuple[str, datetime | None, str]:
+    """Return (full plc_* key, expires_at, jti).
+
+    ``LICENSE_VALIDITY_DAYS <= 0`` means lifetime. In that case the JWT has no
+    ``exp`` claim and the DB row stores ``expires_at = NULL``.
+    """
     now = datetime.now(timezone.utc)
-    if expires_at is None:
+    if expires_at is None and LICENSE_VALIDITY_DAYS > 0:
         expires_at = now + timedelta(days=LICENSE_VALIDITY_DAYS)
     jti_val = jti or str(uuid.uuid4())
     feat = list(features if features is not None else DEFAULT_SELF_HOSTED_FEATURES)
@@ -64,8 +68,9 @@ def issue_license_jwt(
         "features": feat,
         "sub": "self_hosted",
         "iat": int(now.timestamp()),
-        "exp": int(expires_at.timestamp()),
     }
+    if expires_at is not None:
+        payload["exp"] = int(expires_at.timestamp())
     if seat_limit is not None:
         payload["seat_limit"] = seat_limit
     lim = dict(limits if limits is not None else DEFAULT_LICENSE_LIMITS)

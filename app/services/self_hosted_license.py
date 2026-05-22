@@ -78,6 +78,20 @@ async def resolve_self_hosted_entitlements(
             payload = decode_license_jwt_payload(row.license_key)
         except jwt.PyJWTError as exc:
             logger.warning("License JWT verification failed for org %s: %s", org_id, exc)
+            # If the license server has already validated this key recently,
+            # trust the cached server payload until the normal offline grace
+            # window expires. This keeps legitimate customers online even when
+            # a self-hosted image was accidentally built with a stale public key.
+            deadline = _validation_deadline(row)
+            if deadline is not None and now <= deadline:
+                return SelfHostedEntitlements(
+                    plan=plan,
+                    features=features,
+                    limits=limits,
+                    locked=False,
+                    lock_reason=None,
+                    validation_cached_until=row.validation_cached_until,
+                )
             return SelfHostedEntitlements(
                 plan="free",
                 features=[],

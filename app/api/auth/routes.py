@@ -89,15 +89,33 @@ async def _issue_tokens(user: User, org_id: UUID) -> tuple[str, str]:
 @router.get("/instance")
 async def auth_instance_status(db: AsyncSession = Depends(get_db)) -> dict:
     """Public instance metadata (registration gates, deployment mode)."""
+    from app.api.dependencies.plan_gate import LICENSE_FEATURE_SSO
     from app.infrastructure.database.models.sso_configuration import SsoConfiguration
+    from app.services.self_hosted_license import resolve_self_hosted_entitlements
 
     open_ = await instance_registration_open(db)
     sso_enabled = False
     try:
-        sso_check = await db.execute(
-            select(SsoConfiguration.id).where(SsoConfiguration.is_active.is_(True)).limit(1)
-        )
-        sso_enabled = sso_check.first() is not None
+        if settings.DEPLOYMENT_MODE == "self_hosted":
+            # On self-hosted, SSO is a Pro-licensed feature. Showing the SSO
+            # input on the login page when no org has a license that includes
+            # SSO is misleading — the sign-in flow would fail at the entitlement
+            # gate. Require both an active SSO config AND a valid license.
+            rows = await db.execute(
+                select(SsoConfiguration.org_id).where(SsoConfiguration.is_active.is_(True))
+            )
+            for (org_id,) in rows.all():
+                ent = await resolve_self_hosted_entitlements(db, org_id)
+                if ent.locked:
+                    continue
+                if ent.plan in ("pro", "enterprise") or LICENSE_FEATURE_SSO in ent.features:
+                    sso_enabled = True
+                    break
+        else:
+            sso_check = await db.execute(
+                select(SsoConfiguration.id).where(SsoConfiguration.is_active.is_(True)).limit(1)
+            )
+            sso_enabled = sso_check.first() is not None
     except Exception:
         sso_enabled = False
     return {

@@ -1373,10 +1373,21 @@ async def portal_resend_license(
     if issuance.revoked_at is not None:
         raise bad_request("LICENSE_REVOKED", "This license has been revoked and cannot be resent")
 
+    license_key = issuance.license_key
+    expires_at = issuance.expires_at.isoformat() if issuance.expires_at else None
+    refreshed_key, refreshed_expires_at = await _issue_license_key(
+        payment_reference=issuance.payment_reference,
+        email=email,
+        org_id=issuance.purchaser_org_id,
+    )
+    if refreshed_key:
+        license_key = refreshed_key
+        expires_at = refreshed_expires_at
+
     await resend_license_key_email(
         to=email,
-        license_key=issuance.license_key,
-        expires_at=issuance.expires_at.isoformat() if issuance.expires_at else None,
+        license_key=license_key,
+        expires_at=expires_at,
     )
 
     return {
