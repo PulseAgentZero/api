@@ -55,10 +55,10 @@ Industry packs are configurable rather than hard‑coded — telecom, healthcare
 
 ## Architecture overview
 
-The same code ships in two topologies:
+We recognise that many organisations — banks, telcos, hospitals, regulated SaaS — simply will **not** allow customer data to leave their environment, no matter how strong the vendor's guarantees are. So Entivia ships the *same* codebase in two topologies, and the choice is yours:
 
-- **Cloud (microservices).** Six independently scaled services — `api`, `worker` (pipeline), `agent` (conversational + SSE), `scheduler`, `license`, plus the dashboard — share Postgres / Redis / Qdrant.
-- **Self‑hosted (all‑in‑one).** Every Entivia service is bundled into one container behind nginx on port 80. Customers bring their own Postgres + Qdrant.
+- **Cloud (microservices) — Entivia‑managed.** For teams that want zero ops. Six independently scaled services — `api`, `worker` (pipeline), `agent` (conversational + SSE), `scheduler`, `license`, plus the dashboard — share Postgres / Redis / Qdrant. We operate it, we scale it, you sign in.
+- **Self‑hosted (all‑in‑one) — runs in your VPC / on‑prem.** For teams with data‑residency, sovereignty, or compliance constraints (HIPAA, PCI, NDPR, GDPR, internal policy). Every Entivia service is bundled into one container behind nginx on port 80, deployed alongside your own Postgres + Qdrant. Your customer data never traverses our infrastructure — Entivia connects read‑only to your databases inside your network, and you control the LLM provider (including local Ollama for fully air‑gapped operation). Full setup guide: <https://docs.entivia.online/docs/hosting/self-hosted>.
 
 ![Entivia architecture](docker/images/pulse/architecture.jpeg)
 
