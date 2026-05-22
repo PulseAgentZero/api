@@ -131,7 +131,7 @@ async def activate_license(
 ) -> dict:
     """**Self-hosted only.** Returns 404 on cloud deployments.
 
-    Activate or replace the license key for this self-hosted instance. Contacts the Pulse
+    Activate or replace the license key for this self-hosted instance. Contacts the Entivia
     license server to validate the key, then stores plan, features, seat limit, and expiry
     locally. Sets a validation cache window (default 7 days) so the instance stays functional
     if the license server is temporarily unreachable. Returns 422 on invalid or expired keys.
@@ -145,7 +145,7 @@ async def activate_license(
 
     code, data, err = await post_validate_license(body.license_key, current_user.org_id)
     if code == 0:
-        raise bad_request("LICENSE_SERVER_UNREACHABLE", err or "Cannot reach Pulse license server")
+        raise bad_request("LICENSE_SERVER_UNREACHABLE", err or "Cannot reach Entivia license server")
     if code >= 400 or not data:
         msg = "Invalid license key"
         if isinstance(data, dict):
@@ -227,7 +227,7 @@ async def refresh_license(
 ) -> dict:
     """**Self-hosted only.** Returns 404 on cloud deployments.
 
-    Re-validate the stored license key against the Pulse license server and refresh the
+    Re-validate the stored license key against the Entivia license server and refresh the
     local cache. Call this manually if the instance was offline during the normal validation
     window and is now showing as locked.
     """

@@ -90,7 +90,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
 
 # ── Internal API ──────────────────────────────────────────────────────────────
-# Used by the Pulse dashboard (frontend).
+# Used by the Entivia dashboard (frontend).
 # Auth: JWT Bearer token only.
 
 _is_prod = settings.is_production()
@@ -123,14 +123,14 @@ _internal_tags = [
 ]
 
 app = FastAPI(
-    title="Pulse — Internal API",
+    title="Entivia — Internal API",
     description=(
-        "Internal API used by the Pulse dashboard.\n\n"
+        "Internal API used by the Entivia dashboard.\n\n"
         "**Auth:** `Authorization: Bearer <jwt_token>`\n\n"
         "**Errors:** `{ \"error\": { \"code\": \"string\", \"message\": \"string\" } }`"
     ),
     version="1.0.0",
-    contact={"name": "Pulse Support", "email": "support@pulseai.io"},
+    contact={"name": "Entivia Support", "email": "support@entivia.online"},
     license_info={"name": "Proprietary"},
     openapi_tags=_internal_tags,
     lifespan=lifespan,

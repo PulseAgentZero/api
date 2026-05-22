@@ -1,4 +1,4 @@
-"""Pulse Studio — SQL editor, visualizations, custom dashboards, and AI tools.
+"""Entivia Studio — SQL editor, visualizations, custom dashboards, and AI tools.
 
 All endpoints require JWT auth (`Authorization: Bearer <token>`).
 Roles: admin > manager > analyst > viewer. Most write operations require analyst+.

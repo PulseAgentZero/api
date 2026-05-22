@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Pulse — Self-Hosted
+# Entivia — Self-Hosted
 #
 # Pull and run (like n8n): one application image plus Postgres and Qdrant.
 #
 #   db      Postgres
 #   qdrant  Vector search
-#   pulse   All-in-one — UI, API, worker, agent, scheduler, Redis, nginx (port 80)
+#   entivia All-in-one — UI, API, worker, agent, scheduler, Redis, nginx (port 80)
 #
 #   1. cp .env.example .env
 #   2. Fill in required values in .env
@@ -20,14 +20,14 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: pulse
+      POSTGRES_USER: entivia
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing — set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: pulse
+      POSTGRES_DB: entivia
     volumes:
       - db_data:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pulse -d pulse"]
+      test: ["CMD-SHELL", "pg_isready -U entivia -d entivia"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -46,24 +46,24 @@ services:
       start_period: 10s
 
   entivia:
-    image: entivia/entivia:${PULSE_VERSION:-latest}
+    image: chideraozigbo488/entivia:${ENTIVIA_VERSION:-latest}
     env_file:
       - path: .env
         required: false
     ports:
       - "${PORT:-80}:80"
     environment:
-      DATABASE_URL: postgresql+asyncpg://pulse:${POSTGRES_PASSWORD}@db:5432/pulse
+      DATABASE_URL: postgresql+asyncpg://entivia:${POSTGRES_PASSWORD}@db:5432/entivia
       DATABASE_SSLMODE: disable
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://127.0.0.1:6379/0
       LOCAL_STORAGE_PATH: /app/uploads
-      HOME: /home/pulse
+      HOME: /home/entivia
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
     volumes:
-      - pulse_data:/data
+      - entivia_data:/data
       - uploads_data:/app/uploads
-      - pulse_logs:/var/log/pulse/streams
+      - entivia_logs:/var/log/entivia/streams
     depends_on:
       db:
         condition: service_healthy
@@ -80,6 +80,6 @@ services:
 volumes:
   db_data:
   qdrant_data:
-  pulse_data:
-  pulse_logs:
+  entivia_data:
+  entivia_logs:
   uploads_data:

@@ -51,7 +51,7 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
 
 app = FastAPI(
-    title="Pulse — Conversational service",
+    title="Entivia — Conversational service",
     description=(
         "Dedicated process for dashboard chat.\n\n"
         "**Auth:** `Authorization: Bearer <jwt_token>` (same tokens as the main internal API)\n\n"

@@ -1,10 +1,10 @@
-# Pulse — Self-Hosted
+# Entivia — Self-Hosted
 
-Pull and run Pulse: one application container plus Postgres and Qdrant.
+Pull and run Entivia: one application container plus Postgres and Qdrant.
 
 | Service | What it runs |
 |---------|----------------|
-| **pulse** | UI (Next.js), API, worker, agent, scheduler, Redis, nginx — single port **80** |
+| **entivia** | UI (Next.js), API, worker, agent, scheduler, Redis, nginx — single port **80** |
 | **db** | Postgres 16 |
 | **qdrant** | Vector database (entity search / RAG) |
 
@@ -42,9 +42,9 @@ Compose sets these for you — do not put them in `.env` unless you know why:
 
 - `DATABASE_URL` → `db` service
 - `QDRANT_URL` → `http://qdrant:6333`
-- `REDIS_URL` → bundled Redis inside `pulse`
+- `REDIS_URL` → bundled Redis inside `entivia`
 
-Deployment mode, license server URL, and license verification public key are baked into the `pulseai/pulse` image at build time. Activate Pro with your `plc_…` key in the dashboard after install.
+Deployment mode, license server URL, and license verification public key are baked into the `chideraozigbo488/entivia` image at build time. Activate Pro with your `plc_…` key in the dashboard after install.
 
 ## Custom port
 
@@ -59,7 +59,7 @@ Maps host `3000` → nginx `80` inside the container.
 ## Logs and stop
 
 ```bash
-docker compose logs -f pulse
+docker compose logs -f entivia
 docker compose down
 ```
 

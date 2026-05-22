@@ -1,4 +1,4 @@
-"""Pulse Studio — SQL execution service.
+"""Entivia Studio — SQL execution service.
 
 Security:
 - _is_select_only: keyword blocklist rejects non-SELECT statements fast
@@ -259,7 +259,7 @@ async def execute_studio_query(
     if not _is_select_only(sql_text):
         raise bad_request(
             "INVALID_SQL",
-            "Only SELECT statements are permitted in Pulse Studio. "
+            "Only SELECT statements are permitted in Entivia Studio. "
             "INSERT, UPDATE, DELETE, DROP and similar operations are blocked.",
         )
 

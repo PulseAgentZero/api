@@ -46,7 +46,7 @@ async def deliver_http_batch(
     secret = config.get("hmac_secret")
     if secret:
         sig = hmac.new(str(secret).encode(), body, hashlib.sha256).hexdigest()
-        headers["X-Pulse-Signature"] = f"sha256={sig}"
+        headers["X-Entivia-Signature"] = f"sha256={sig}"
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             resp = await client.request(method, url, content=body, headers=headers)
@@ -126,7 +126,7 @@ def _file_logger(path: Path, max_bytes: int, backup_count: int) -> logging.Logge
 
 
 def deliver_file_batch(config: dict[str, Any], records: list[dict[str, Any]]) -> tuple[bool, str | None]:
-    path = Path(str(config.get("path") or "/var/log/pulse/stream.log"))
+    path = Path(str(config.get("path") or "/var/log/entivia/stream.log"))
     max_bytes = int(config.get("max_bytes") or 10_485_760)
     backup_count = int(config.get("backup_count") or 3)
     try:

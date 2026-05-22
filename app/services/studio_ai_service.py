@@ -1,4 +1,4 @@
-"""Pulse Studio — AI-powered query generation and visualization recommendation."""
+"""Entivia Studio — AI-powered query generation and visualization recommendation."""
 
 from __future__ import annotations
 

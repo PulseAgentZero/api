@@ -1,7 +1,7 @@
 """License customer portal — magic-link sign-in for self-hosted buyers.
 
 Lets people who purchased a self-hosted license retrieve their key(s) without
-ever creating a Pulse Cloud workspace. The flow:
+ever creating an Entivia Cloud workspace. The flow:
 
 1. Buyer enters their email on ``/pricing/self-hosted/portal``.
 2. We email a one-time magic link (15 min TTL, single use) keyed by Redis.

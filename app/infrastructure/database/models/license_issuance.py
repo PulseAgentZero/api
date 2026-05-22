@@ -1,4 +1,4 @@
-"""License keys issued by the Pulse license server (cloud)."""
+"""License keys issued by the Entivia license server (cloud)."""
 
 from __future__ import annotations
 

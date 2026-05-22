@@ -11,7 +11,7 @@
 # Scale independently:  docker compose up --scale worker=4
 #
 # Build (from repo root):
-#   docker build -f docker/images/pulse-cloud/Dockerfile -t pulseai/pulse-cloud:latest .
+#   docker build -f docker/images/pulse-cloud/Dockerfile -t chideraozigbo488/entivia-cloud:latest .
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: install Python dependencies ─────────────────────────────────────
@@ -50,16 +50,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gosu \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1001 -s /bin/sh pulse \
-    && chown -R pulse:pulse /app \
+    && useradd -m -u 1001 -s /bin/sh entivia \
+    && chown -R entivia:entivia /app \
     && mkdir -p /app/uploads \
-    && chown pulse:pulse /app/uploads
+    && chown entivia:entivia /app/uploads
 
 COPY --from=builder /install /usr/local
 
-COPY --chown=pulse:pulse app/        ./app/
-COPY --chown=pulse:pulse alembic.ini .
-COPY --chown=pulse:pulse scripts/    ./scripts/
+COPY --chown=entivia:entivia app/        ./app/
+COPY --chown=entivia:entivia alembic.ini .
+COPY --chown=entivia:entivia scripts/    ./scripts/
 
 COPY docker/images/pulse-cloud/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh

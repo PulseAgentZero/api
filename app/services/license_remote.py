@@ -1,4 +1,4 @@
-"""HTTP calls to the Pulse license server."""
+"""HTTP calls to the Entivia license server."""
 
 from __future__ import annotations
 

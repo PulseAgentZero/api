@@ -434,7 +434,7 @@ class Settings:
     # Email (Resend)
     # ------------------------------------------------------------------
     RESEND_API_KEY: Optional[str] = os.getenv("RESEND_API_KEY")
-    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@pulse.club")
+    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@entivia.online")
     ACCEPT_INVITE_PATH: str = os.getenv("ACCEPT_INVITE_PATH", "/accept-invite")
 
     @classmethod
@@ -471,7 +471,7 @@ class Settings:
     # AWS_SECRET_ACCESS_KEY or the instance IAM role (see .env.example).
     # ------------------------------------------------------------------
     ASSETS_S3_BUCKET: Optional[str] = os.getenv("ASSETS_S3_BUCKET")
-    ASSETS_S3_PREFIX: str = os.getenv("ASSETS_S3_PREFIX", "pulse/assets")
+    ASSETS_S3_PREFIX: str = os.getenv("ASSETS_S3_PREFIX", "entivia/assets")
     ASSETS_PUBLIC_BASE_URL: Optional[str] = os.getenv("ASSETS_PUBLIC_BASE_URL")
     AWS_REGION: Optional[str] = os.getenv("AWS_REGION")
 

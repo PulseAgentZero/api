@@ -2,7 +2,7 @@
 
 ## Cloud subscriptions  (deployment_mode = "cloud")
 
-Manages recurring Pro plan subscriptions for cloud-hosted Pulse workspaces.
+Manages recurring Pro plan subscriptions for cloud-hosted Entivia workspaces.
 
   1. POST /billing/initialize
        Start a Paystack checkout. Returns an `authorization_url` to redirect the
@@ -40,13 +40,13 @@ Manages recurring Pro plan subscriptions for cloud-hosted Pulse workspaces.
 ## Self-hosted license purchase  (any deployment_mode)
 
 One-time payment that delivers a signed license key by email. The buyer then
-activates the key on their self-hosted Pulse instance via POST /license/activate.
+activates the key on their self-hosted Entivia instance via POST /license/activate.
 
   7. POST /billing/self-hosted/initialize
        Starts a one-time Paystack charge. Returns `authorization_url`.
 
   8. GET  /billing/self-hosted/verify/{reference}
-       Verifies the payment, requests a signed license key from the Pulse license
+       Verifies the payment, requests a signed license key from the Entivia license
        server, and emails it to the purchaser. Falls back gracefully if the
        license server is temporarily unreachable.
 """
@@ -332,7 +332,7 @@ class SelfHostedVerifyResponse(BaseModel):
     response_model=InitializePaymentResponse,
     summary="Start a Pro plan checkout",
     description=(
-        "**Cloud only.** Initialises a Paystack transaction for the Pulse Pro plan. "
+        "**Cloud only.** Initialises a Paystack transaction for the Entivia Pro plan. "
         "Redirect the user to `authorization_url` to complete payment. "
         "After Paystack redirects back to `callback_url`, call "
         "`GET /billing/verify/{reference}` to activate the subscription.\n\n"
@@ -799,7 +799,7 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
     response_model=InitializePaymentResponse,
     summary="Start a self-hosted license purchase",
     description=(
-        "Initialises a **one-time** Paystack charge for a Pulse self-hosted license. "
+        "Initialises a **one-time** Paystack charge for an Entivia self-hosted license. "
         "Available on all deployment modes.\n\n"
         "The purchase price is configured server-side (`PAYSTACK_SELFHOSTED_LICENSE_PRICE` in kobo). "
         "After Paystack redirects to `callback_url`, call "
@@ -887,7 +887,7 @@ async def initialize_selfhosted_purchase(
         "Call this after Paystack redirects back from the self-hosted license checkout.\n\n"
         "On success:\n"
         "1. Payment is verified with Paystack\n"
-        "2. A signed license key is requested from the Pulse license server\n"
+        "2. A signed license key is requested from the Entivia license server\n"
         "3. The key is emailed to the address provided during checkout\n\n"
         "The `license_key` field is also returned in the response body for "
         "immediate display to the user. If the license server is temporarily "
@@ -978,7 +978,7 @@ async def _issue_license_key(
     email: str,
     org_id: str | None,
 ) -> tuple[str | None, str | None]:
-    """Request a signed license key from the Pulse license server.
+    """Request a signed license key from the Entivia license server.
 
     Returns (license_key, expires_at) on success, (None, None) on failure.
     The license server endpoint: POST {LICENSE_SERVER_URL}/api/v1/keys/purchase

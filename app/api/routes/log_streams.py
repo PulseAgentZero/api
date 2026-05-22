@@ -184,7 +184,7 @@ async def test_log_stream(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "level": "INFO",
         "logger": "pulse.log_stream_test",
-        "message": "Pulse log stream test event",
+        "message": "Entivia log stream test event",
         "event_category": "system",
         "org_id": str(current_user.org_id),
         "stream_id": str(row.id),

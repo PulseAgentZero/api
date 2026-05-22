@@ -5,7 +5,7 @@
 # Not exposed publicly — only reachable inside the pulse network.
 #
 # Build (from repo root):
-#   docker build -f docker/images/pulse-license/Dockerfile -t pulseai/pulse-license:latest .
+#   docker build -f docker/images/pulse-license/Dockerfile -t chideraozigbo488/entivia-license:latest .
 # ─────────────────────────────────────────────────────────────────────────────
 
 FROM python:3.12-slim AS builder
@@ -35,15 +35,15 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 curl && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1001 -s /bin/sh pulse \
-    && chown -R pulse:pulse /app
+    && useradd -m -u 1001 -s /bin/sh entivia \
+    && chown -R entivia:entivia /app
 
 COPY --from=builder /install /usr/local
 
-COPY --chown=pulse:pulse app/ ./app/
-COPY --chown=pulse:pulse alembic.ini .
+COPY --chown=entivia:entivia app/ ./app/
+COPY --chown=entivia:entivia alembic.ini .
 
-USER pulse
+USER entivia
 
 EXPOSE 8002
 

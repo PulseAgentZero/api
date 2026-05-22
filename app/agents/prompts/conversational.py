@@ -62,7 +62,7 @@ def _industry_currency_block(industry: str, business_context: str) -> str:
 
 
 DASHBOARD_BUILDER_RULES = """\
-## Dashboard and chart building (Pulse Studio)
+## Dashboard and chart building (Entivia Studio)
 When the user asks to build, create, or generate a dashboard, charts, visualizations, or a report:
 1. Call **start_dashboard_intake** first. Never call **build_dashboard_from_plan** from a vague request.
 2. Ask the clarifying questions returned by intake. ALWAYS ask the user what to name the dashboard (the intake form returns a dashboard_name question). If multiple connections exist, ask which to use; never guess.

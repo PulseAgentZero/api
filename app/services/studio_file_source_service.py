@@ -1,4 +1,4 @@
-"""Pulse Studio — query CSV uploads, Google Sheets, and S3 CSV objects via DuckDB."""
+"""Entivia Studio — query CSV uploads, Google Sheets, and S3 CSV objects via DuckDB."""
 
 from __future__ import annotations
 
@@ -408,7 +408,7 @@ async def execute_file_source_query(
     if not _is_select_only(sql_text):
         raise bad_request(
             "INVALID_SQL",
-            "Only SELECT statements are permitted in Pulse Studio.",
+            "Only SELECT statements are permitted in Entivia Studio.",
         )
 
     from app.services.studio_query_service import _inject_limit, _PARAM_PATTERN

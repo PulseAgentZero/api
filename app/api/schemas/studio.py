@@ -1,4 +1,4 @@
-"""Pulse Studio — Pydantic request/response schemas."""
+"""Entivia Studio — Pydantic request/response schemas."""
 
 from __future__ import annotations
 

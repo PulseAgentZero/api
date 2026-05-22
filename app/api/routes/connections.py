@@ -156,7 +156,7 @@ _CONNECTOR_CATALOG = [
              "type": "textarea", "required": False,
              "placeholder": '{"type": "service_account", "project_id": "...", ...}',
              "help": "Paste the full JSON key from GCP (IAM → Service Accounts → Keys). "
-                      "Required unless Application Default Credentials are configured on the Pulse host."},
+                      "Required unless Application Default Credentials are configured on the Entivia host."},
         ],
     },
     {

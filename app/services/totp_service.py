@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 RECOVERY_CODE_COUNT = 8
 RECOVERY_CODE_LENGTH = 10
-ISSUER_NAME = "Pulse"
+ISSUER_NAME = "Entivia"
 
 
 def user_totp_enabled(user: User) -> bool:

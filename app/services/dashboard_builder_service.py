@@ -234,7 +234,7 @@ async def draft_dashboard_plan(
         context_lines.append(f"Comparison period: {compare_period}")
 
     system_prompt = (
-        "You are a senior data analyst designing a Pulse Studio dashboard. "
+        "You are a senior data analyst designing an Entivia Studio dashboard. "
         "Given schema and requirements, return a JSON object with:\n"
         '  "dashboard_name": string,\n'
         '  "description": string,\n'
@@ -593,7 +593,7 @@ async def propose_dashboard_changes(
             logger.warning("[propose_dashboard_changes] schema fetch failed: %s", exc)
 
     system_prompt = (
-        "You are a senior data analyst iterating on a Pulse Studio dashboard. "
+        "You are a senior data analyst iterating on an Entivia Studio dashboard. "
         "Given the current dashboard JSON and user feedback, return a JSON object with:\n"
         '  "summary": short plain-English description of the proposed changes,\n'
         '  "changes": array. Each change object is one of:\n'

@@ -76,7 +76,7 @@ def plan_locked(feature: str, message: str, upgrade_url: str | None = None) -> P
         code="FEATURE_LOCKED",
         message=message,
         feature=feature,
-        upgrade_url=upgrade_url or "https://pulseai.io/pricing",
+        upgrade_url=upgrade_url or "https://entivia.online/pricing",
     )
 
 

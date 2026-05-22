@@ -2,31 +2,38 @@
 # Entivia — Self-Hosted All-in-One Image
 #
 # All-in-one self-hosted image (n8n-style): Frontend · API · Worker · Agent · Scheduler · Redis · nginx
-# End users pull entivia/entivia and run docker/compose/self-hosted (Postgres + Qdrant only).
+# End users pull chideraozigbo488/entivia and run docker/compose/self-hosted (Postgres + Qdrant only).
 # Requires Postgres + Qdrant alongside this container; Redis and all app processes are bundled here.
+#
+# Set VERSION when releasing — both `:VERSION` and `:latest` are tagged.
 #
 # Local single-arch build (fastest — your Mac arch only, ~5–10 min cold, ~1 min warm):
 #
+#   export VERSION=1.0.0
 #   docker buildx build \
 #     -f docker/images/pulse/Dockerfile \
 #     --build-context frontend=/Users/ozigbochidera/Desktop/dashboard \
 #     --build-arg PULSE_LICENSE_SERVER_URL=https://license.entivia.online \
 #     --build-arg PULSE_LICENSE_JWT_ISSUER=https://license.entivia.online \
 #     --build-arg PULSE_LICENSE_PUBLIC_KEY="$(cat license_public.pem)" \
-#     -t entivia/entivia:latest \
+#     -t chideraozigbo488/entivia:$VERSION \
+#     -t chideraozigbo488/entivia:latest \
 #     --load \
 #     .
 #
 # Multi-arch publish (~2x slower — only for releases pushed to Docker Hub):
 #
-#   docker login && docker buildx build \
+#   export VERSION=1.0.0
+#   docker login
+#   docker buildx build \
 #     -f docker/images/pulse/Dockerfile \
 #     --build-context frontend=/Users/ozigbochidera/Desktop/dashboard \
 #     --platform linux/amd64,linux/arm64 \
 #     --build-arg PULSE_LICENSE_SERVER_URL=https://license.entivia.online \
 #     --build-arg PULSE_LICENSE_JWT_ISSUER=https://license.entivia.online \
 #     --build-arg PULSE_LICENSE_PUBLIC_KEY="$(cat license_public.pem)" \
-#     -t entivia/entivia:latest \
+#     -t chideraozigbo488/entivia:$VERSION \
+#     -t chideraozigbo488/entivia:latest \
 #     --push \
 #     .
 #
@@ -130,7 +137,7 @@ LABEL org.opencontainers.image.description="All-in-one self-hosted Entivia image
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    HOME=/home/pulse \
+    HOME=/home/entivia \
     FRONTEND_URL=http://localhost
 
 ENV PULSE_LICENSE_SERVER_URL=${PULSE_LICENSE_SERVER_URL} \
@@ -178,10 +185,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /usr/lib/node_modules/npm \
     && rm -f /usr/bin/npm /usr/bin/npx /usr/bin/corepack \
-    && useradd -m -u 1001 -s /bin/sh pulse \
-    && mkdir -p /data/redis /var/log/pulse /var/log/pulse/streams /app/uploads \
-    && chown -R pulse:pulse /data/redis /var/log/pulse /app/uploads \
-    && chmod 775 /data/redis /var/log/pulse /var/log/pulse/streams
+    && useradd -m -u 1001 -s /bin/sh entivia \
+    && mkdir -p /data/redis /var/log/entivia /var/log/entivia/streams /app/uploads \
+    && chown -R entivia:entivia /data/redis /var/log/entivia /app/uploads \
+    && chmod 775 /data/redis /var/log/entivia /var/log/entivia/streams
 
 # Python packages from builder
 COPY --from=py-builder /install /usr/local
@@ -190,7 +197,7 @@ COPY --from=py-builder /install /usr/local
 COPY app/        ./app/
 COPY alembic.ini .
 COPY scripts/    ./scripts/
-RUN chown -R pulse:pulse /app
+RUN chown -R entivia:entivia /app
 
 # Next.js standalone output
 #   .next/standalone/ → the minimal Node.js server (server.js + compiled app)
@@ -199,7 +206,7 @@ RUN chown -R pulse:pulse /app
 COPY --from=frontend-builder /frontend/.next/standalone/   /frontend/
 COPY --from=frontend-builder /frontend/.next/static/       /frontend/.next/static/
 COPY --from=frontend-builder /frontend/public/             /frontend/public/
-RUN chown -R pulse:pulse /frontend
+RUN chown -R entivia:entivia /frontend
 
 # nginx config — replace the default site with ours
 RUN rm -f /etc/nginx/sites-enabled/default

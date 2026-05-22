@@ -28,7 +28,7 @@ CONNECTOR_REGISTRY: dict[str, ConnectorSpec] = {
         "sqlite",
         "File path",
         "aiosqlite",
-        "database_name = path on Pulse host; use read-only file permissions where possible.",
+        "database_name = path on Entivia host; use read-only file permissions where possible.",
     ),
     "redshift": ConnectorSpec(
         "redshift",

@@ -498,7 +498,7 @@ TOOLS = [
 _LEGACY_DASHBOARD_TOOL = {
     "name": "build_custom_dashboard",
     "description": (
-        "Build a complete Pulse Studio dashboard from a natural language goal (legacy one-shot)."
+        "Build a complete Entivia Studio dashboard from a natural language goal (legacy one-shot)."
     ),
     "input_schema": {
         "type": "object",
@@ -1140,7 +1140,7 @@ async def _build_custom_dashboard(
     is_public: bool,
     max_charts: int,
 ) -> dict:
-    """Build a Pulse Studio dashboard from a natural language goal.
+    """Build an Entivia Studio dashboard from a natural language goal.
 
     Steps:
     1. Introspect the client database schema

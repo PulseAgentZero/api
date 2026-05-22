@@ -86,7 +86,7 @@ an entity_id. Examples: "show me 628's trend over time", "how has 914 changed?",
 Examples: "what changed since last run?", "compare the last two runs", \
 "any changes from the previous pipeline?", "run delta", "what's different now?".
 
-**build_dashboard** — Build a Pulse Studio dashboard or charts from natural language. \
+**build_dashboard** — Build an Entivia Studio dashboard or charts from natural language. \
 Examples: "build a dashboard showing revenue by month", "create charts for churn", \
 "visualize subscriber growth", "make a report on support tickets".
 

@@ -14,7 +14,7 @@ Pulse lets any organization connect their data sources (databases, spreadsheets,
 - Backend knows it's cloud via `DEPLOYMENT_MODE=cloud` env var.
 
 ### Self-Hosted
-- User runs the Docker image from Docker Hub (`pulseai/pulse:latest`).
+- User runs the Docker image from Docker Hub (`chideraozigbo488/entivia:latest`).
 - Their `docker-compose.yml` points to their own Postgres instance via env var (`DATABASE_URL`).
 - First screen after install is **Login** (no landing page).
 - In **Settings → License**, user enters:
@@ -447,8 +447,8 @@ connections.last_tested_at: timestamp
 - Add `docker-compose.self-hosted.yml` in repo root:
   ```yaml
   services:
-    api:    image: pulseai/pulse-api:latest
-    worker: image: pulseai/pulse-worker:latest
+    api:    image: chideraozigbo488/entivia-api:latest
+    worker: image: chideraozigbo488/entivia-worker:latest
     db:     image: postgres:16-alpine
   ```
 - CI pipeline (GitHub Actions) builds and pushes images to Docker Hub on each release tag.
