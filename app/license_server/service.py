@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import jwt
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -132,7 +133,36 @@ async def validate_license(
             last_validated_at=now,
         )
         db.add(activation)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            # Another concurrent /validate request won the race and bound the
+            # license. Re-load to determine whether it bound to our org_id or
+            # a different one.
+            await db.rollback()
+            result = await db.execute(
+                select(LicenseActivation).where(LicenseActivation.issuance_id == issuance.id)
+            )
+            activation = result.scalar_one_or_none()
+            if activation is None:
+                # Shouldn't happen — log and refuse the request so the caller
+                # can retry safely.
+                logger.error(
+                    "License activation race for jti=%s left no row; rejecting", jti
+                )
+                return {
+                    "valid": False,
+                    "reason": "Could not activate license, please retry",
+                    "code": "ACTIVATION_RACE",
+                }
+            if activation.bound_org_id != org_id:
+                return {
+                    "valid": False,
+                    "reason": "This license is already activated on another organization",
+                    "code": "LICENSE_ALREADY_ACTIVATED",
+                }
+            activation.last_validated_at = now
+            await db.commit()
     elif activation.bound_org_id != org_id:
         return {
             "valid": False,

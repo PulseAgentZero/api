@@ -649,15 +649,20 @@ async def _dispatch(db: AsyncSession, event: str, data: dict) -> None:
 
 
 async def _on_charge_success(db: AsyncSession, data: dict) -> None:
-    """Payment succeeded. For first-time subscriptions the org_id is in metadata."""
+    """Payment succeeded. For first-time subscriptions the org_id is in metadata.
+
+    For self-hosted license purchases this is the authoritative trigger for issuing
+    and emailing the license key — the customer's browser tab may close before
+    the redirect-driven ``/verify`` endpoint runs, so we cannot rely on it.
+    """
     meta = data.get("metadata") or {}
     customer = data.get("customer") or {}
     authorization = data.get("authorization") or {}
     customer_code = customer.get("customer_code")
 
-    # Only process cloud subscription charges here
     if isinstance(meta, dict) and meta.get("purchase_type") == "self_hosted_license":
-        return  # handled by self-hosted verify endpoint, not by webhook
+        await _handle_selfhost_charge_success(data)
+        return
 
     org_id_str = meta.get("org_id") if isinstance(meta, dict) else None
     if org_id_str:
@@ -938,19 +943,13 @@ async def verify_selfhosted_purchase(
     # binds the license to their own self-hosted org_id on first activation.
     purchaser_org_id = meta.get("org_id")
 
-    license_key, expires_at = await _issue_license_key(
+    license_key, _expires_at = await _issue_and_deliver_self_hosted_license(
         payment_reference=reference,
-        email=delivery_email,
-        org_id=str(purchaser_org_id) if purchaser_org_id else None,
+        delivery_email=delivery_email,
+        purchaser_org_id=str(purchaser_org_id) if purchaser_org_id else None,
     )
 
     if license_key:
-        await queue_email(
-            "license_key",
-            to=delivery_email,
-            license_key=license_key,
-            expires_at=expires_at,
-        )
         return {
             "status": "success",
             "message": f"License key delivered to {delivery_email}",
@@ -966,7 +965,8 @@ async def verify_selfhosted_purchase(
         "status": "success",
         "message": (
             f"Payment confirmed. Your license key will be emailed to {delivery_email} "
-            "within a few minutes. If it doesn't arrive, contact support with your "
+            "within a few minutes. If it doesn't arrive, use the customer portal at "
+            f"/pricing/self-hosted/portal to re-email it, or contact support with your "
             f"payment reference: {reference}"
         ),
         "license_key": None,
@@ -1012,6 +1012,110 @@ async def _issue_license_key(
         logger.warning("License server key issuance failed for ref %s: %s", payment_reference, exc)
 
     return None, None
+
+
+SELFHOST_DELIVERY_TTL_SEC = 30 * 24 * 3600  # 30 days
+
+
+async def _claim_selfhost_email_delivery(payment_reference: str) -> bool:
+    """Atomically claim the right to email the license key for this payment.
+
+    Returns ``True`` on the first call for a given ``payment_reference`` and
+    ``False`` for subsequent calls within the dedup window. Used so the
+    Paystack webhook and the browser-triggered ``/verify`` endpoint never
+    both email the same key.
+
+    Falls back to allowing every send when Redis is unavailable — we'd rather
+    deliver twice than miss the email entirely.
+    """
+    r = await get_redis()
+    if r is None:
+        return True
+    key = f"selfhost_license_emailed:{payment_reference.strip()}"
+    try:
+        result = await r.set(key, "1", nx=True, ex=SELFHOST_DELIVERY_TTL_SEC)
+    except Exception:
+        logger.warning("Redis SET NX failed for license dedup; allowing send", exc_info=True)
+        return True
+    return bool(result)
+
+
+async def _issue_and_deliver_self_hosted_license(
+    *,
+    payment_reference: str,
+    delivery_email: str,
+    purchaser_org_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Issue a license key (idempotent) and email it exactly once.
+
+    Returns ``(license_key, expires_at)``. The license key is always returned
+    when the license server is reachable, even if the email was already sent
+    on a previous call — so the caller can show it in the UI.
+    """
+    license_key, expires_at = await _issue_license_key(
+        payment_reference=payment_reference,
+        email=delivery_email,
+        org_id=purchaser_org_id,
+    )
+    if not license_key:
+        return None, None
+
+    if await _claim_selfhost_email_delivery(payment_reference):
+        await queue_email(
+            "license_key",
+            to=delivery_email,
+            license_key=license_key,
+            expires_at=expires_at,
+        )
+        logger.info("License key emailed for payment %s to %s", payment_reference, delivery_email)
+    else:
+        logger.info(
+            "License key already emailed for payment %s — skipping resend", payment_reference
+        )
+
+    return license_key, expires_at
+
+
+async def _handle_selfhost_charge_success(data: dict) -> None:
+    """Webhook-driven license issuance for self-hosted license purchases.
+
+    Runs as soon as Paystack confirms payment, independent of whether the
+    customer's browser ever lands back on ``/pricing/self-hosted``. Idempotent.
+    """
+    meta = data.get("metadata") or {}
+    customer = data.get("customer") or {}
+    reference = (data.get("reference") or "").strip()
+    if not reference:
+        logger.warning("Self-hosted charge.success missing reference; skipping")
+        return
+
+    delivery_email = ""
+    if isinstance(meta, dict):
+        delivery_email = (meta.get("delivery_email") or "").strip().lower()
+    if not delivery_email:
+        delivery_email = (customer.get("email") or "").strip().lower()
+    if not delivery_email:
+        logger.warning(
+            "Self-hosted charge.success has no delivery email (ref=%s)", reference
+        )
+        return
+
+    purchaser_org_id: str | None = None
+    if isinstance(meta, dict):
+        raw_org = meta.get("org_id")
+        if raw_org:
+            purchaser_org_id = str(raw_org)
+
+    license_key, _expires = await _issue_and_deliver_self_hosted_license(
+        payment_reference=reference,
+        delivery_email=delivery_email,
+        purchaser_org_id=purchaser_org_id,
+    )
+    if not license_key:
+        logger.error(
+            "License server unreachable from webhook for payment %s — verify endpoint will retry",
+            reference,
+        )
 
 
 # ── Self-hosted license customer portal (magic-link auth) ─────────────────────

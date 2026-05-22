@@ -227,6 +227,10 @@ class Settings:
     LICENSE_JWT_ISSUER: Optional[str] = _resolve_license_jwt_issuer()
     LICENSE_OFFLINE_GRACE_DAYS: int = int(os.getenv("LICENSE_OFFLINE_GRACE_DAYS", "7"))
     LICENSE_REVALIDATION_INTERVAL_HOURS: int = int(os.getenv("LICENSE_REVALIDATION_INTERVAL_HOURS", "24"))
+    # Self-hosted only: when set, the instance auto-activates this plc_… key on
+    # first GET /license call by the admin. Lets ops teams ship a pre-activated
+    # instance from a Docker .env without ever opening the dashboard manually.
+    PULSE_LICENSE_KEY: Optional[str] = (os.getenv("PULSE_LICENSE_KEY") or "").strip() or None
 
     # ------------------------------------------------------------------
     # Qdrant (vector search for entity retrieval)

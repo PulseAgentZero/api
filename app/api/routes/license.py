@@ -42,6 +42,87 @@ def _cloud_404() -> None:
         raise not_found("Not found")
 
 
+async def _maybe_bootstrap_env_license(
+    db: AsyncSession,
+    *,
+    org_id: UUID,
+    user_id: UUID,
+) -> tuple[LicenseKey | None, str | None]:
+    """Activate ``PULSE_LICENSE_KEY`` from env on first read if no license is stored.
+
+    Returns ``(license_row, error_message)``. Both ``None`` means no env key
+    was configured. A non-``None`` ``error_message`` means the env key failed
+    validation (logged, surfaced to UI as ``env_provision_error``) but does
+    not raise — the dashboard still loads.
+    """
+    env_key = (settings.PULSE_LICENSE_KEY or "").strip()
+    if not env_key:
+        return None, None
+
+    existing = await db.execute(select(LicenseKey).where(LicenseKey.org_id == org_id))
+    if existing.scalar_one_or_none() is not None:
+        return None, None
+
+    if settings.PULSE_LICENSE_PUBLIC_KEY:
+        try:
+            decode_license_jwt_payload(env_key)
+        except (jwt.PyJWTError, ValueError) as exc:
+            msg = f"PULSE_LICENSE_KEY signature invalid: {exc}"
+            import logging as _log
+            _log.getLogger(__name__).warning(msg)
+            return None, "PULSE_LICENSE_KEY signature could not be verified"
+
+    code, data, err = await post_validate_license(env_key, org_id)
+    if code == 0 or code >= 400 or not isinstance(data, dict) or data.get("valid") is False:
+        reason = (data or {}).get("reason") if isinstance(data, dict) else err
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "PULSE_LICENSE_KEY env auto-activation failed for org %s: %s", org_id, reason
+        )
+        return None, f"PULSE_LICENSE_KEY could not be activated: {reason or 'unreachable'}"
+
+    now = datetime.now(timezone.utc)
+    expires_at = data.get("expires_at")
+    exp_dt: datetime | None = None
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            exp_dt = None
+    row = LicenseKey(
+        org_id=org_id,
+        license_key=env_key,
+        plan=str(data.get("plan") or "pro"),
+        features=list(data.get("features") or []),
+        limits=data.get("limits") if isinstance(data.get("limits"), dict) else {},
+        seat_limit=data.get("seat_limit"),
+        expires_at=exp_dt,
+        last_validated_at=now,
+        validation_cached_until=now + timedelta(days=settings.LICENSE_OFFLINE_GRACE_DAYS),
+        is_active=True,
+    )
+    db.add(row)
+
+    org = await db.get(Organization, org_id)
+    if org:
+        org.plan = str(data.get("plan") or "pro")
+
+    from app.infrastructure.audit import log_audit
+
+    await log_audit(
+        db,
+        org_id=org_id,
+        user_id=user_id,
+        action="license.activated",
+        resource="license_key",
+        resource_id=row.id,
+        metadata={"plan": str(data.get("plan") or "pro"), "source": "env"},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row, None
+
+
 @router.get("")
 async def get_license(
     current_user: User = Depends(require_role("admin")),
@@ -51,10 +132,26 @@ async def get_license(
 
     Return the current license status for this org: plan, active features, seat usage,
     expiry date, and whether the instance is locked. No license → `plan: "free"`, `is_valid: false`.
+
+    When ``PULSE_LICENSE_KEY`` is set in the instance environment and no license
+    is stored locally, the key is auto-activated on this call so admins do not
+    need to paste it into the dashboard manually.
     """
     _cloud_404()
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
+    env_error: str | None = None
+    if row is None:
+        row, env_error = await _maybe_bootstrap_env_license(
+            db, org_id=current_user.org_id, user_id=current_user.id
+        )
+
+    env_provisioned = bool(
+        settings.PULSE_LICENSE_KEY
+        and row is not None
+        and row.license_key == settings.PULSE_LICENSE_KEY
+    )
+
     ent = await resolve_self_hosted_entitlements(db, current_user.org_id)
     seat_used = await _active_seat_count(db, current_user.org_id)
     if row is None:
@@ -68,6 +165,8 @@ async def get_license(
             "lock_reason": None,
             "validation_cached_until": None,
             "seat_used": seat_used,
+            "env_provisioned": False,
+            "env_provision_error": env_error,
         }
     return {
         "plan": row.plan,
@@ -87,6 +186,8 @@ async def get_license(
         "is_valid": row.is_active and not ent.locked,
         "locked": ent.locked,
         "lock_reason": ent.lock_reason,
+        "env_provisioned": env_provisioned,
+        "env_provision_error": None,
     }
 
 
@@ -152,13 +253,13 @@ async def activate_license(
             msg = (data.get("message") or data.get("reason") or data.get("detail") or msg)
         elif err:
             msg = err
-        raise bad_request("BAD_REQUEST", "Invalid license key")
+        raise bad_request("INVALID_LICENSE", msg)
     if data.get("valid") is False:
         reason = str(data.get("reason") or "License is not valid")
-        code = str(data.get("code") or "INVALID_LICENSE")
-        if code == "LICENSE_ALREADY_ACTIVATED":
-            raise bad_request("LICENSE_ALREADY_ACTIVATED", reason)
-        raise bad_request(code if code != "INVALID_LICENSE" else "INVALID_LICENSE", reason)
+        err_code = str(data.get("code") or "INVALID_LICENSE")
+        # Forward the precise upstream code so the frontend can render a tailored
+        # message (e.g. "already activated", "revoked", "expired").
+        raise bad_request(err_code, reason)
 
     plan = data.get("plan", "pro")
     features = data.get("features", [])

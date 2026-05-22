@@ -32,29 +32,59 @@ class LlmKeysUpdate(BaseModel):
     groq: str | None = None
 
 
+def _key_state(*, db_value: object, env_present: bool) -> dict[str, object]:
+    """Return ``{configured, source}`` describing where a provider key comes from.
+
+    ``source`` is ``"db"`` when the admin stored a key via PUT, ``"env"`` when
+    only the process-level env var is set, and ``None`` when neither is
+    configured. ``configured`` is true whenever the agent stack can call the
+    provider at runtime.
+    """
+    has_db = bool(db_value)
+    if has_db:
+        return {"configured": True, "source": "db"}
+    if env_present:
+        return {"configured": True, "source": "env"}
+    return {"configured": False, "source": None}
+
+
 @router.get("/llm-keys")
 async def get_llm_keys(
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> dict[str, bool]:
+) -> dict[str, dict[str, object]]:
     """**Self-hosted only.** Returns 404 on cloud deployments.
 
-    Return whether each LLM provider key is configured. Returns `{ "anthropic": bool, "groq": bool }`.
-    Keys themselves are never returned — only presence is indicated. Falls back to env-var detection
-    if no org-level key has been stored via `PUT /settings/llm-keys`.
+    Report each provider's runtime status. For every provider the response
+    has ``{"configured": bool, "source": "env" | "db" | null}`` so the UI can:
+
+    - Show "Configured via environment variable" and disable the input when
+      ``source == "env"`` — the operator already provisioned the key in
+      ``.env`` and it should not be overwritten from the dashboard.
+    - Show "Saved" when ``source == "db"`` — overrides the env var for this org.
+    - Allow the admin to paste a new key when ``configured == false``.
+
+    Keys themselves are never returned — only presence and source.
     """
     _require_self_hosted()
     r = await db.execute(select(LlmKeyStore).where(LlmKeyStore.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
-    if row is None:
-        return {"anthropic": bool(settings.get_anthropic_api_key()), "groq": bool(settings.is_groq_configured())}
-    try:
-        data = json.loads(decrypt_dsn(row.keys))
-    except Exception:
-        return {"anthropic": False, "groq": False}
+    db_anthropic: object = None
+    db_groq: object = None
+    if row is not None:
+        try:
+            data = json.loads(decrypt_dsn(row.keys))
+            db_anthropic = data.get("anthropic")
+            db_groq = data.get("groq")
+        except Exception:
+            db_anthropic = None
+            db_groq = None
+
+    anthropic_env = bool(settings.get_anthropic_api_key())
+    groq_env = bool(settings.is_groq_configured())
     return {
-        "anthropic": bool(data.get("anthropic")),
-        "groq": bool(data.get("groq")),
+        "anthropic": _key_state(db_value=db_anthropic, env_present=anthropic_env),
+        "groq": _key_state(db_value=db_groq, env_present=groq_env),
     }
 
 
@@ -63,13 +93,13 @@ async def put_llm_keys(
     body: LlmKeysUpdate,
     current_user: User = Depends(require_role("admin")),
     db: AsyncSession = Depends(get_db),
-) -> dict[str, bool]:
+) -> dict[str, dict[str, object]]:
     """**Self-hosted only.** Returns 404 on cloud deployments.
 
     Store or update LLM API keys for this org. Keys are encrypted at rest with Fernet.
     Pass `null` or an empty string for a provider to remove its stored key (the instance
-    will fall back to the `ANTHROPIC_API_KEY` / `GROQ_API_KEY` environment variables).
-    Returns the updated presence flags — never the raw keys.
+    will fall back to the ``ANTHROPIC_API_KEY`` / ``GROQ_API_KEY`` environment variables).
+    Returns the updated presence + source descriptors — never the raw keys.
     """
     _require_self_hosted()
     r = await db.execute(select(LlmKeyStore).where(LlmKeyStore.org_id == current_user.org_id))
@@ -97,6 +127,12 @@ async def put_llm_keys(
         db.add(LlmKeyStore(org_id=current_user.org_id, keys=enc))
     await db.commit()
     return {
-        "anthropic": bool(payload.get("anthropic")),
-        "groq": bool(payload.get("groq")),
+        "anthropic": _key_state(
+            db_value=payload.get("anthropic"),
+            env_present=bool(settings.get_anthropic_api_key()),
+        ),
+        "groq": _key_state(
+            db_value=payload.get("groq"),
+            env_present=bool(settings.is_groq_configured()),
+        ),
     }
