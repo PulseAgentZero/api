@@ -12,6 +12,7 @@ from app.agents.orchestrators.pipeline import PipelineOrchestrator
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
+from app.infrastructure.logging.streams import start_log_stream_runtime, stop_log_stream_runtime
 from app.infrastructure.redis.client import close_redis, get_redis
 from app.services.email_queue import EMAIL_QUEUE_KEY, dispatch_email_job
 from app.services.pipeline_queue import (
@@ -187,10 +188,12 @@ async def _loop() -> None:
 
 
 async def _main() -> None:
-    logger.info("Worker listening on queues: %s", _ALL_QUEUES)
+    await start_log_stream_runtime()
+    logger.info("Worker listening on queues: %s", _ALL_QUEUES, extra={"event_category": "system"})
     try:
         await _loop()
     finally:
+        await stop_log_stream_runtime()
         await close_redis()
 
 

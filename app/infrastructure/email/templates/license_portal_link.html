@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Sign in to your Entivia license portal</h1>
+<p>Hi there,</p>
+<p>
+  You (or someone using <strong>{{ to }}</strong>) requested access to the
+  Entivia self-hosted license portal. Click the button below to sign in. The
+  link is single-use and expires in <strong>15 minutes</strong>.
+</p>
+
+<p style="text-align:left;">
+  <a href="{{ link }}" class="btn">Open license portal</a>
+</p>
+
+<hr class="divider" />
+<p class="fallback">
+  If the button doesn't work, copy and paste this URL into your browser:<br/>
+  <a href="{{ link }}">{{ link }}</a>
+</p>
+
+{% if ip %}
+<p style="font-size:13px;color:#9ca3af;">
+  This request came from IP <strong>{{ ip }}</strong>. If that wasn't you,
+  you can safely ignore this email — no action is taken until the link is opened.
+</p>
+{% endif %}
+{% endblock %}

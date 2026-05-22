@@ -94,6 +94,7 @@ async def auth_instance_status(db: AsyncSession = Depends(get_db)) -> dict:
         "deployment_mode": settings.DEPLOYMENT_MODE,
         "registration_open": open_,
         "can_create_organization": open_,
+        "google_oauth_enabled": settings.is_google_oauth_configured(),
     }
 
 

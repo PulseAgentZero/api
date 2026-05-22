@@ -24,22 +24,33 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         except Exception:
             duration_ms = int((time.perf_counter() - started) * 1000)
             logger.exception(
-                "%s %s failed after %sms request_id=%s",
+                "%s %s failed",
                 request.method,
                 request.url.path,
-                duration_ms,
-                request_id,
+                extra={
+                    "event_category": "api_request",
+                    "request_id": request_id,
+                    "http_method": request.method,
+                    "http_path": request.url.path,
+                    "duration_ms": duration_ms,
+                },
             )
             raise
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         response.headers["X-Request-ID"] = request_id
         logger.info(
-            "%s %s -> %s in %sms request_id=%s",
+            "%s %s -> %s",
             request.method,
             request.url.path,
             response.status_code,
-            duration_ms,
-            request_id,
+            extra={
+                "event_category": "api_request",
+                "request_id": request_id,
+                "http_method": request.method,
+                "http_path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
         )
         return response

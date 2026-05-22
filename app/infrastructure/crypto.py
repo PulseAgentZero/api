@@ -18,3 +18,11 @@ def encrypt_dsn(dsn: str) -> str:
 
 def decrypt_dsn(encrypted: str) -> str:
     return _get_fernet().decrypt(encrypted.encode()).decode()
+
+
+def encrypt_secret(value: str) -> str:
+    return encrypt_dsn(value)
+
+
+def decrypt_secret(encrypted: str) -> str:
+    return decrypt_dsn(encrypted)

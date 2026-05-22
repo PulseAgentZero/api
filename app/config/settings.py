@@ -27,7 +27,8 @@ GROQ_MODEL_FAST = "llama-3.1-8b-instant"  # low-latency/simple tasks
 # Written at Docker image build time (docker/images/pulse/Dockerfile). When present,
 # deployment_mode and license URLs are taken from this file only — not .env or compose.
 PULSE_BUILD_CONFIG_PATH = Path("/etc/pulse/build-config.json")
-_DEFAULT_LICENSE_SERVER_URL = "https://license.pulseai.io"
+_DEFAULT_LICENSE_SERVER_URL = "https://license.entivia.online"
+_DEFAULT_MARKETING_URL = "https://entivia.online"
 
 
 @lru_cache(maxsize=1)
@@ -76,6 +77,13 @@ def _resolve_license_public_key() -> Optional[str]:
         return raw or None
     raw = os.getenv("PULSE_LICENSE_PUBLIC_KEY", "").strip()
     return raw or None
+
+
+def _resolve_marketing_url() -> str:
+    baked = _pulse_build_config().get("marketing_url")
+    if baked:
+        return str(baked).rstrip("/")
+    return os.getenv("MARKETING_URL", _DEFAULT_MARKETING_URL).rstrip("/")
 
 VOYAGE_EMBEDDING_MODEL = "voyage-4-large"
 VOYAGE_EMBEDDING_DIMENSION = 1024
@@ -213,6 +221,7 @@ class Settings:
     AGENT_SERVICE_URL: Optional[str] = os.getenv("AGENT_SERVICE_URL", "").strip() or None
     LICENSE_SERVER_URL: str = _resolve_license_server_url()
     LICENSE_SERVER_API_KEY: Optional[str] = os.getenv("LICENSE_SERVER_API_KEY", "").strip() or None
+    MARKETING_URL: str = _resolve_marketing_url()
     # RSA PEM for offline plc_* JWT verification — baked into self-hosted image or .env override
     PULSE_LICENSE_PUBLIC_KEY: Optional[str] = _resolve_license_public_key()
     LICENSE_JWT_ISSUER: Optional[str] = _resolve_license_jwt_issuer()

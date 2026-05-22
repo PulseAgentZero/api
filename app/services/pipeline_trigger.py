@@ -8,8 +8,10 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config.settings import settings
 from app.infrastructure.database.repositories.pipeline_run_repository import PipelineRunRepository
 from app.services.schedulers.pipeline_scheduler import trigger_pipeline_now
+from app.services.self_hosted_license import get_concurrent_pipeline_limit
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +56,24 @@ async def claim_and_trigger_pipeline(
     Raises HTTPException 409 if a run is already queued/running.
     """
     repo = PipelineRunRepository(db)
-    active = await repo.get_active_for_org(org_id)
-    if active is not None:
+    max_concurrent = 1
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        max_concurrent = await get_concurrent_pipeline_limit(db, org_id)
+    active_count = await repo.count_active_for_org(org_id)
+    if active_count >= max_concurrent:
+        active = await repo.get_active_for_org(org_id)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "code": "PIPELINE_ALREADY_RUNNING",
-                "message": "Pipeline run already in progress",
-                "run_id": str(active.id),
-                "status": active.status,
-                "current_step": active.current_step,
+                "message": (
+                    f"Pipeline concurrency limit reached ({active_count}/{max_concurrent} in flight)"
+                ),
+                "run_id": str(active.id) if active else None,
+                "status": active.status if active else "unknown",
+                "current_step": active.current_step if active else None,
+                "max_concurrent": max_concurrent,
+                "active_count": active_count,
             },
         )
 

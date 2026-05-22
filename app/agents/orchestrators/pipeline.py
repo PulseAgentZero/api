@@ -194,8 +194,15 @@ class PipelineOrchestrator:
         ]
 
         logger.info(
-            "═══ Pipeline %s started for org '%s' (%s) ═══",
-            run.id, state.get("org_name", "unknown"), org_id,
+            "Pipeline %s started for org %s",
+            run.id,
+            org_id,
+            extra={
+                "event_category": "pipeline",
+                "org_id": str(org_id),
+                "run_id": str(run.id),
+                "org_name": state.get("org_name"),
+            },
         )
         _write_run_artifacts(
             run,

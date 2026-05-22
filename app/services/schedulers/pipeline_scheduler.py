@@ -34,6 +34,7 @@ from app.infrastructure.database.repositories.pipeline_run_repository import (
 )
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.redis.client import get_redis
+from app.services.self_hosted_license import get_concurrent_pipeline_limit
 
 logger = logging.getLogger(__name__)
 
@@ -174,14 +175,18 @@ async def _claim_run_slot(
     mapping_id: UUID | None = None,
     triggered_by: UUID | None = None,
 ) -> UUID | None:
-    """Create a queued PipelineRun if no run is already active for the org."""
+    """Create a queued PipelineRun if the org has an available concurrency slot."""
     async with async_session_factory() as session:
         repo = PipelineRunRepository(session)
-        active = await repo.get_active_for_org(org_id)
-        if active is not None:
+        max_concurrent = 1
+        if settings.DEPLOYMENT_MODE == "self_hosted":
+            max_concurrent = await get_concurrent_pipeline_limit(session, org_id)
+        active_count = await repo.count_active_for_org(org_id)
+        if active_count >= max_concurrent:
+            active = await repo.get_active_for_org(org_id)
             logger.info(
-                "Pipeline run skipped for org %s — active run %s in state '%s'",
-                org_id, active.id, active.status,
+                "Pipeline run skipped for org %s — concurrency limit reached (%s/%s), latest active=%s",
+                org_id, active_count, max_concurrent, active.id if active else None,
             )
             return None
         run = await repo.create_queued(

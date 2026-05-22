@@ -147,10 +147,17 @@ async def validate_license(
     features = payload.get("features") or issuance.features or list(DEFAULT_SELF_HOSTED_FEATURES)
     seat_limit = payload.get("seat_limit", issuance.seat_limit)
 
+    limits = payload.get("limits")
+    if not isinstance(limits, dict):
+        from app.license_server.settings import DEFAULT_LICENSE_LIMITS
+
+        limits = dict(DEFAULT_LICENSE_LIMITS)
+
     return {
         "valid": True,
         "plan": plan,
         "features": list(features),
+        "limits": limits,
         "seat_limit": seat_limit,
         "expires_at": _iso(issuance.expires_at),
     }

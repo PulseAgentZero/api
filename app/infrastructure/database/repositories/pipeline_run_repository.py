@@ -19,6 +19,19 @@ class PipelineRunRepository:
     async def get_by_id(self, run_id: UUID) -> PipelineRun | None:
         return await self.db.get(PipelineRun, run_id)
 
+    async def count_active_for_org(self, org_id: UUID) -> int:
+        from sqlalchemy import func
+
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(PipelineRun)
+                .where(PipelineRun.org_id == org_id)
+                .where(PipelineRun.status.in_(ACTIVE_STATUSES))
+            )
+            or 0
+        )
+
     async def get_active_for_org(self, org_id: UUID) -> PipelineRun | None:
         stmt = (
             select(PipelineRun)

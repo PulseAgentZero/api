@@ -19,6 +19,7 @@ echo "[pulse] QDRANT_URL=${QDRANT_URL:-<not set>}"
 storage="${LOCAL_STORAGE_PATH:-/app/uploads}"
 mkdir -p "$storage"
 chown -R pulse:pulse "$storage"
+chown -R pulse:pulse /data/redis
 chown -R pulse:pulse /var/log/pulse
 
 # ── 1. Remove the nginx default site so ours is the only one ─────────────────
@@ -26,7 +27,7 @@ rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
 # ── 2. Start bundled Redis ────────────────────────────────────────────────────
 echo "[pulse] starting bundled Redis..."
-redis-server \
+gosu pulse redis-server \
   --daemonize yes \
   --dir /data/redis \
   --maxmemory "${REDIS_MAX_MEMORY:-256mb}" \

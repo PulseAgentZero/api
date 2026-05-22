@@ -98,6 +98,14 @@ def org_delete_code(org_id: str, owner_id: str) -> str:
     return f"org_delete_code:{org_id}:{owner_id}"
 
 
+def log_streams_changed() -> str:
+    return "pulse:log_streams:changed"
+
+
+def sso_oidc_state(state: str) -> str:
+    return f"sso_oidc_state:{state}"
+
+
 def user_sessions_pattern(user_id) -> str:
     """Glob pattern to match all refresh tokens for a user.
     NOTE: refresh tokens are stored as refresh:{sha256(raw)} — we can't

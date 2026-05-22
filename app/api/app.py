@@ -6,8 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.auth import auth_router
+from app.api.auth.sso_routes import router as sso_auth_router
 from app.api.exception_handlers import attach_exception_handlers
 from app.api.middleware import LoggingMiddleware
+from app.api.middleware.org_context_middleware import OrgContextMiddleware
 from app.api.routes import (
     agent_router,
     alerts_router,
@@ -18,13 +20,16 @@ from app.api.routes import (
     connections_router,
     dashboard_router,
     entities_router,
+    ldap_router,
     license_router,
+    log_streams_router,
     notifications_router,
     org_router,
     pipeline_router,
     recommendations_router,
     schema_mappings_router,
     settings_router,
+    sso_config_router,
     studio_router,
     users_router,
     webhooks_router,
@@ -40,6 +45,7 @@ from app.api.public.openapi import configure_public_openapi
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
+from app.infrastructure.logging.streams import start_log_stream_runtime, stop_log_stream_runtime
 from app.infrastructure.redis.client import close_redis
 
 configure_logging()
@@ -75,9 +81,11 @@ def _mount_local_storage(app: "FastAPI") -> None:
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     # All APScheduler crons run in the dedicated scheduler process only
     # (docker compose `scheduler`, self-hosted supervisord, or `python -m app.services.schedulers.run`).
+    await start_log_stream_runtime()
     try:
         yield
     finally:
+        await stop_log_stream_runtime()
         await close_redis()
 
 
@@ -104,6 +112,9 @@ _internal_tags = [
     {"name": "Webhooks",        "description": "Outbound webhook delivery log"},
     {"name": "API Keys",        "description": "Programmatic API access"},
     {"name": "License",         "description": "Self-hosted license activation (self-hosted only)"},
+    {"name": "Log Streams",     "description": "Stream logs to HTTP, syslog, or file (self-hosted license)"},
+    {"name": "SSO",             "description": "OIDC / SAML SSO configuration (self-hosted license)"},
+    {"name": "LDAP",            "description": "LDAP / AD directory sync (self-hosted license)"},
     {"name": "Settings",        "description": "LLM key management (self-hosted only)"},
     {"name": "Audit Logs",      "description": "Immutable audit trail (Pro only)"},
     {"name": "Billing",         "description": "Paystack subscription management and webhooks"},
@@ -129,6 +140,7 @@ app = FastAPI(
 )
 
 app.add_middleware(LoggingMiddleware)
+app.add_middleware(OrgContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL],
@@ -140,6 +152,7 @@ app.add_middleware(
 attach_exception_handlers(app)
 
 app.include_router(auth_router,            prefix="/api/v1")
+app.include_router(sso_auth_router,      prefix="/api/v1")
 app.include_router(org_router,             prefix="/api/v1")
 app.include_router(connections_router,     prefix="/api/v1")
 app.include_router(schema_mappings_router, prefix="/api/v1")
@@ -152,6 +165,9 @@ app.include_router(notifications_router,   prefix="/api/v1")
 app.include_router(webhooks_router,        prefix="/api/v1")
 app.include_router(api_keys_router,        prefix="/api/v1")
 app.include_router(license_router,         prefix="/api/v1")
+app.include_router(log_streams_router,     prefix="/api/v1")
+app.include_router(sso_config_router,      prefix="/api/v1")
+app.include_router(ldap_router,            prefix="/api/v1")
 app.include_router(settings_router,        prefix="/api/v1")
 app.include_router(audit_logs_router,      prefix="/api/v1")
 app.include_router(agent_router,           prefix="/api/v1")

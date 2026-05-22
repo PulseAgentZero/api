@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, func
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.infrastructure.database.base import Base, TimestampMixin, UUIDMixin, utcnow
@@ -23,6 +23,7 @@ class LicenseKey(Base, UUIDMixin, TimestampMixin):
     license_key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
     plan: Mapped[str] = mapped_column(Text, default="free", server_default="free")
     features: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list, server_default="{}")
+    limits: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     seat_limit: Mapped[int | None] = mapped_column(Integer)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

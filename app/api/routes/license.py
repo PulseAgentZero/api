@@ -61,6 +61,8 @@ async def get_license(
         return {
             "plan": "free",
             "features": [],
+            "limits": {},
+            "effective_limits": {},
             "is_valid": False,
             "locked": False,
             "lock_reason": None,
@@ -70,8 +72,10 @@ async def get_license(
     return {
         "plan": row.plan,
         "features": list(row.features or []),
+        "limits": ent.limits,
         "effective_plan": ent.plan,
         "effective_features": ent.features,
+        "effective_limits": ent.limits,
         "seat_limit": row.seat_limit,
         "seat_used": seat_used,
         "expires_at": row.expires_at.isoformat() if row.expires_at else None,
@@ -99,11 +103,13 @@ def _apply_server_payload(
 ) -> None:
     plan = data.get("plan", "pro")
     features = data.get("features", [])
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
     seat_limit = data.get("seat_limit")
     expires_at = data.get("expires_at")
     row.license_key = license_key
     row.plan = str(plan or "pro")
     row.features = list(features or [])
+    row.limits = limits
     row.seat_limit = seat_limit
     if expires_at:
         try:
@@ -156,6 +162,7 @@ async def activate_license(
 
     plan = data.get("plan", "pro")
     features = data.get("features", [])
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
     seat_limit = data.get("seat_limit")
     expires_at = data.get("expires_at")
     now = datetime.now(timezone.utc)
@@ -176,6 +183,7 @@ async def activate_license(
             license_key=body.license_key,
             plan=str(plan or "pro"),
             features=list(features or []),
+            limits=limits,
             seat_limit=seat_limit,
             expires_at=exp_dt,
             last_validated_at=now,
@@ -202,6 +210,7 @@ async def activate_license(
     return {
         "plan": plan,
         "features": list(features or []),
+        "limits": limits,
         "seat_limit": seat_limit,
         "expires_at": expires_at,
         "validation_cached_until": row.validation_cached_until.isoformat()

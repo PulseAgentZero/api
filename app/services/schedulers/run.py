@@ -12,9 +12,14 @@ import logging
 import signal
 
 from app.infrastructure.logging import configure_logging
+from app.infrastructure.logging.streams import start_log_stream_runtime, stop_log_stream_runtime
 from app.services.schedulers.billing_scheduler import (
     shutdown_billing_scheduler,
     start_billing_scheduler,
+)
+from app.services.schedulers.ldap_scheduler import (
+    shutdown_ldap_sync_scheduler,
+    start_ldap_sync_scheduler,
 )
 from app.services.schedulers.license_scheduler import (
     shutdown_license_scheduler,
@@ -47,9 +52,11 @@ async def start_all_schedulers() -> None:
     await start_billing_scheduler()
     await start_usage_reset_scheduler()
     await start_license_scheduler()
+    start_ldap_sync_scheduler()
 
 
 def shutdown_all_schedulers() -> None:
+    shutdown_ldap_sync_scheduler()
     shutdown_license_scheduler()
     shutdown_usage_reset_scheduler()
     shutdown_billing_scheduler()
@@ -65,16 +72,25 @@ async def _run_until_stopped() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    await start_log_stream_runtime()
     await start_all_schedulers()
-    logger.info("All schedulers running — waiting for stop signal")
+    logger.info(
+        "All schedulers running — waiting for stop signal",
+        extra={"event_category": "system"},
+    )
     await stop.wait()
     shutdown_all_schedulers()
-    logger.info("All schedulers stopped")
+    await stop_log_stream_runtime()
+    logger.info("All schedulers stopped", extra={"event_category": "system"})
+
+
+async def _run_with_logging() -> None:
+    configure_logging()
+    await _run_until_stopped()
 
 
 def main() -> None:
-    configure_logging()
-    asyncio.run(_run_until_stopped())
+    asyncio.run(_run_with_logging())
 
 
 if __name__ == "__main__":
