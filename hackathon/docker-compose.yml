@@ -40,7 +40,7 @@ services:
       POSTGRES_PASSWORD: hackathon
       POSTGRES_DB: hackathon
     ports:
-      - "5433:5432"
+      - "5436:5432"
     volumes:
       - hackathon_pg:/var/lib/postgresql/data
     healthcheck:

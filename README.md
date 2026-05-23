@@ -42,7 +42,7 @@ Both task containers expose Swagger UI at `/docs` and a health probe at `/health
 git clone <this-repo>
 cd api
 
-cp hackathon/.env.example hackathon/.env
+cp .env.example .env
 # Add ANTHROPIC_API_KEY (and optionally GROQ_API_KEY for automatic fallback)
 
 make hackathon-up                                                # postgres + qdrant + 3 api containers
