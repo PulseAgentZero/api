@@ -5,9 +5,18 @@
 #   open http://localhost:8012/docs   # Task B only
 # Swagger/OpenAPI uses HACKATHON_PUBLIC_API_URL below so judges see the
 # production endpoint to query instead of the internal Docker service URL.
+#
+# Networks:
+#   hackathon (internal)              — postgres / qdrant / app services
+#   reverse-proxy_nginx-network (ext) — only the API services join, with aliases
+#                                       (pulse-hackathon-a, pulse-hackathon-b,
+#                                        pulse-hackathon) so the dockerised
+#                                       nginx-proxy can reach them via Docker DNS.
+#                                       Create once with:
+#                                         docker network create reverse-proxy_nginx-network
 
 x-hackathon-env: &hackathon-env
-  HACKATHON_DATABASE_URL: postgresql+asyncpg://hackathon:hackathon@postgres:5432/hackathon
+  HACKATHON_DATABASE_URL: postgresql+asyncpg://hackathon:${HACKATHON_DATABASE_PASSWORD}@postgres:5432/hackathon
   QDRANT_URL: http://qdrant:6333
   HACKATHON_EMBEDDING_BACKEND: fastembed
   HACKATHON_FASTEMBED_MODEL: BAAI/bge-small-en-v1.5
@@ -20,7 +29,7 @@ x-hackathon-env: &hackathon-env
 x-hackathon-service: &hackathon-service
   image: entivia-hackathon:latest
   env_file:
-    - ../.env
+    - .env
   environment:
     <<: *hackathon-env
   depends_on:
@@ -31,18 +40,22 @@ x-hackathon-service: &hackathon-service
   volumes:
     - hackathon_models:/models
     - ./eval/data:/app/hackathon/eval/data
+  networks:
+    - hackathon
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: hackathon
-      POSTGRES_PASSWORD: hackathon
+      POSTGRES_PASSWORD: ${HACKATHON_DATABASE_PASSWORD}
       POSTGRES_DB: hackathon
     ports:
       - "5436:5432"
     volumes:
       - hackathon_pg:/var/lib/postgresql/data
+    networks:
+      - hackathon
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U hackathon"]
       interval: 5s
@@ -55,6 +68,8 @@ services:
       - "6334:6333"
     volumes:
       - hackathon_qdrant:/qdrant/storage
+    networks:
+      - hackathon
 
   # Task A — Review Simulation Agent (hackathon requirement: one container per task)
   task-a-api:
@@ -67,6 +82,11 @@ services:
       dockerfile: hackathon/Dockerfile
     ports:
       - "8011:8000"
+    networks:
+      hackathon: {}
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-hackathon-a
     command: ["uvicorn", "hackathon.app.task_a:app", "--host", "0.0.0.0", "--port", "8000"]
 
   # Task B — Recommendation Agent
@@ -77,6 +97,11 @@ services:
       HACKATHON_PUBLIC_API_URL: https://hackathon-b.entivia.online
     ports:
       - "8012:8000"
+    networks:
+      hackathon: {}
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-hackathon-b
     command: ["uvicorn", "hackathon.app.task_b:app", "--host", "0.0.0.0", "--port", "8000"]
 
   # Combined gateway (both tasks on one port — optional for local demos)
@@ -87,6 +112,11 @@ services:
       HACKATHON_PUBLIC_API_URL: https://hackathon.entivia.online
     ports:
       - "8010:8000"
+    networks:
+      hackathon: {}
+      reverse-proxy_nginx-network:
+        aliases:
+          - pulse-hackathon
     command: ["uvicorn", "hackathon.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   loader:
@@ -98,3 +128,9 @@ volumes:
   hackathon_pg:
   hackathon_qdrant:
   hackathon_models:
+
+networks:
+  hackathon:
+    driver: bridge
+  reverse-proxy_nginx-network:
+    external: true

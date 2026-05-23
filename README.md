@@ -42,8 +42,9 @@ Both task containers expose Swagger UI at `/docs` and a health probe at `/health
 git clone <this-repo>
 cd api
 
-cp .env.example .env
-# Add ANTHROPIC_API_KEY (and optionally GROQ_API_KEY for automatic fallback)
+cp hackathon/.env.example hackathon/.env
+# Set HACKATHON_DATABASE_PASSWORD and ANTHROPIC_API_KEY
+# (GROQ_API_KEY is an optional automatic fallback)
 
 make hackathon-up                                                # postgres + qdrant + 3 api containers
 HACKATHON_YELP_HOST_DIR=~/datasets/yelp make hackathon-load      # ingest Yelp + Goodreads + embeddings
