@@ -43,6 +43,26 @@ async def _introspect_schema(
         schema_columns_sql,
     )
     from app.infrastructure.database.client_queries import ClientDBError
+
+    def _columns_with_types_sql(dbt: str | None) -> str:
+        """SQL returning (column_name, data_type) so the LLM can cast correctly."""
+        d = (dbt or "").lower()
+        if d == "mysql":
+            return (
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = DATABASE() AND table_name = :tname ORDER BY ordinal_position"
+            )
+        if d == "sqlite":
+            return "SELECT name AS column_name, type AS data_type FROM pragma_table_info(:tname) ORDER BY cid"
+        if d == "mssql":
+            return (
+                "SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = SCHEMA_NAME() AND TABLE_NAME = :tname ORDER BY ORDINAL_POSITION"
+            )
+        return (
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = :tname ORDER BY ordinal_position"
+        )
     from app.services.studio_file_source_service import (
         fetch_file_source_schema,
         get_connection_for_studio,
@@ -56,8 +76,11 @@ async def _introspect_schema(
             tables = await fetch_file_source_schema(conn_row)
             lines = []
             for t in tables[:20]:
-                cols = ", ".join(c["name"] for c in t.get("columns", [])[:20])
-                lines.append(f"table: {t['name']} | columns: {cols}")
+                parts = []
+                for c in t.get("columns", [])[:20]:
+                    ctype = c.get("type") or c.get("data_type")
+                    parts.append(f"{c['name']} ({ctype})" if ctype else c["name"])
+                lines.append(f"table: {t['name']} | columns: {', '.join(parts)}")
             return "\n".join(lines)
 
         engine, conn = await _get_specific_engine(db, org_id, conn_row.id)
@@ -74,7 +97,8 @@ async def _introspect_schema(
                     "SELECT table_name FROM information_schema.tables "
                     "WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' LIMIT 20"
                 )
-            cols_sql = schema_columns_sql(db_type)
+            cols_sql = _columns_with_types_sql(db_type)
+            fallback_cols_sql = schema_columns_sql(db_type)
             async with safe_client_connection(engine, conn) as client_conn:
                 table_rows = (await client_conn.execute(_text(tables_sql))).all()
                 table_names = [r[0] for r in table_rows]
@@ -84,10 +108,21 @@ async def _introspect_schema(
                         col_rows = (
                             await client_conn.execute(_text(cols_sql), {"tname": tname})
                         ).all()
-                        cols = [r[0] for r in col_rows[:20]]
+                        cols = [
+                            f"{r[0]} ({r[1]})" if len(r) > 1 and r[1] else str(r[0])
+                            for r in col_rows[:20]
+                        ]
                         lines.append(f"table: {tname} | columns: {', '.join(cols)}")
                     except Exception:
-                        lines.append(f"table: {tname}")
+                        try:  # types query failed — fall back to names only
+                            col_rows = (
+                                await client_conn.execute(_text(fallback_cols_sql), {"tname": tname})
+                            ).all()
+                            lines.append(
+                                f"table: {tname} | columns: {', '.join(str(r[0]) for r in col_rows[:20])}"
+                            )
+                        except Exception:
+                            lines.append(f"table: {tname}")
             return "\n".join(lines)
         finally:
             await engine.dispose()

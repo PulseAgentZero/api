@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import secrets
+from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -81,6 +82,136 @@ def _extract_json_object(raw_text: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Expected JSON object")
     return data
+
+
+def _resolve_date_default(expr: Any) -> str | None:
+    """Best-effort: turn a SQL-ish date default into a literal YYYY-MM-DD, else None.
+
+    Studio binds params as values (not SQL), so defaults like CURRENT_DATE or
+    date_trunc('year', CURRENT_DATE) never execute — they must be date literals.
+    """
+    if expr is None:
+        return None
+    s = str(expr).strip().strip(";")
+    if not s:
+        return None
+    try:  # already a literal date / ISO datetime
+        datetime.strptime(s[:10], "%Y-%m-%d")
+        return s[:10]
+    except ValueError:
+        pass
+    low = s.lower()
+    today = date.today()
+    if "date_trunc('year'" in low or 'date_trunc("year"' in low:
+        return today.replace(month=1, day=1).isoformat()
+    if "date_trunc('month'" in low or 'date_trunc("month"' in low:
+        return today.replace(day=1).isoformat()
+    m = re.search(r"interval\s+'?\s*(\d+)\s*(day|week|month|year)s?", low)
+    if m and any(k in low for k in ("current_date", "now()", "current_timestamp")):
+        n, unit = int(m.group(1)), m.group(2)
+        if unit == "day":
+            return (today - timedelta(days=n)).isoformat()
+        if unit == "week":
+            return (today - timedelta(weeks=n)).isoformat()
+        if unit == "month":
+            return (today - timedelta(days=30 * n)).isoformat()
+        if unit == "year":
+            return today.replace(year=today.year - n).isoformat()
+    if low in ("current_date", "now()", "current_timestamp", "current_timestamp()", "today"):
+        return today.isoformat()
+    return None
+
+
+def _normalize_param(p: dict) -> dict:
+    """Make a param's type/default safe for the Studio executor (mutates in place).
+
+    __time_from/__time_to are injected by the dashboard time range at runtime as ISO
+    datetimes, so they must be datetime-typed with no literal default. Other date
+    params get SQL-expression defaults resolved to YYYY-MM-DD literals (or dropped).
+    """
+    if not isinstance(p, dict):
+        return p
+    name = p.get("name")
+    ptype = (p.get("type") or "text").lower()
+    if name in ("__time_from", "__time_to"):
+        # text (not datetime): the dashboard injects an ISO string at runtime and
+        # asyncpg only accepts native datetime objects for date/timestamp params, so
+        # we bind these as text and parse them in SQL (see _normalize_time_param_sql).
+        p["type"] = "text"
+        p["default"] = None
+        p["default_value"] = None
+        return p
+    if ptype in ("date", "datetime"):
+        dv = p.get("default_value", p.get("default"))
+        resolved = _resolve_date_default(dv)
+        p["default"] = resolved
+        p["default_value"] = resolved
+        return p
+    # Filter params (text/string) must have a value or the chart can't render with
+    # defaults. The generated SQL guards with "{{p}} = 'ALL' OR col = {{p}}", so the
+    # 'ALL' sentinel means "no filter".
+    dv = p.get("default_value", p.get("default"))
+    if (dv is None or str(dv).strip() == "") and ptype in ("text", "string", ""):
+        p["default"] = "ALL"
+        p["default_value"] = "ALL"
+    return p
+
+
+def _normalize_params(params: list[dict]) -> list[dict]:
+    return [_normalize_param(p) for p in (params or []) if isinstance(p, dict)]
+
+
+# Postgres `expr::type` casts collide with SQLAlchemy's :name bind parsing
+# (`:param::type` makes the bind unrecognized → a literal ':' reaches the DB).
+# Rewrite simple casts to CAST(expr AS type), which binds cleanly.
+_DOUBLE_COLON_CAST_RE = re.compile(
+    r'(\{\{[A-Za-z_]\w*\}\}|"[^"]+"|[A-Za-z_][\w.]*)\s*::\s*([A-Za-z_]\w*)'
+)
+
+
+def _rewrite_double_colon_casts(sql: str) -> str:
+    if not sql or "::" not in sql:
+        return sql
+    prev = None
+    out = sql
+    while prev != out:  # resolve chained casts (a::int::text)
+        prev = out
+        out = _DOUBLE_COLON_CAST_RE.sub(r"CAST(\1 AS \2)", out)
+    return out
+
+
+_TIME_PARAM_NAMES = ("__time_from", "__time_to")
+
+
+def _normalize_time_param_sql(sql: str) -> str:
+    """Force {{__time_from/to}} into a text-bound, date-parsed form.
+
+    The dashboard injects these as ISO strings; asyncpg rejects strings for
+    date/timestamp params. Binding them inside LEFT(...) keeps them text so the
+    string is accepted, then CAST(... AS DATE) parses the YYYY-MM-DD prefix.
+    Idempotent: an already-wrapped token is left alone.
+    """
+    if not sql:
+        return sql
+    out = sql
+    for name in _TIME_PARAM_NAMES:
+        tok = "{{%s}}" % name
+        if tok not in out:
+            continue
+        wrapped = "CAST(LEFT(%s, 10) AS DATE)" % tok
+        if wrapped in out:
+            continue  # already normalized
+        # Drop any LLM-applied cast around the bare token first.
+        out = re.sub(r"CAST\(\s*" + re.escape(tok) + r"\s+AS\s+\w+\s*\)", tok, out, flags=re.I)
+        # str.replace does not re-scan its replacement, so the inner token survives
+        # for apply_params to bind — no infinite expansion.
+        out = out.replace(tok, wrapped)
+    return out
+
+
+def _clean_chart_sql(sql: str) -> str:
+    """All deterministic SQL fixes applied to generated chart SQL before it runs."""
+    return _normalize_time_param_sql(_rewrite_double_colon_casts(str(sql or "").strip()))
 
 
 def _salvage_plan(raw_text: str) -> dict | None:
@@ -197,11 +328,16 @@ def _aggregate_dashboard_params(charts: list[dict]) -> list[dict[str, Any]]:
                     "default_value": default,
                     "label": p.get("label", name.replace("_", " ").title()),
                 }
-    params = list(seen.values())
+    params = [_normalize_param(p) for p in seen.values()]
+    # These are dashboard-level (UI) filters: render time bounds as date pickers,
+    # even though the chart query params bind them as text (execution concern).
+    for p in params:
+        if p.get("name") in ("__time_from", "__time_to"):
+            p["type"] = "datetime"
     if params and not any(p["name"] in ("__time_from", "__time_to") for p in params):
         params.extend([
-            {"name": "__time_from", "type": "date", "label": "From", "default": None, "default_value": None},
-            {"name": "__time_to", "type": "date", "label": "To", "default": None, "default_value": None},
+            {"name": "__time_from", "type": "datetime", "label": "From", "default": None, "default_value": None},
+            {"name": "__time_to", "type": "datetime", "label": "To", "default": None, "default_value": None},
         ])
     return params
 
@@ -325,7 +461,24 @@ async def draft_dashboard_plan(
         '    "config" (x_axis, y_axis, title, etc.).\n'
         "Rules:\n"
         "- Use {{param_name}} for filterable values (dates, regions, statuses).\n"
-        "- Include __time_from and __time_to in params when time filtering applies.\n"
+        "- For time filtering use {{__time_from}} and {{__time_to}}; declare them with "
+        'type "datetime" and default_value null (the dashboard supplies them at runtime).\n'
+        "- Param default_value must be a literal (e.g. a YYYY-MM-DD date, a number, a string), "
+        "never a SQL expression like CURRENT_DATE or date_trunc(...).\n"
+        "- For categorical filters (account_type, status, region, etc.) declare type \"string\", "
+        "default_value \"ALL\", and guard the SQL so ALL means no filter: "
+        "({{account_type}} = 'ALL' OR account_type = {{account_type}}). Every non-time param needs "
+        "a literal default so charts render without user input.\n"
+        "- You do NOT know the exact casing of stored text values. For any equality on a text "
+        "column (status, type, category, region, etc.) match case-insensitively with LOWER(): e.g. "
+        "WHERE LOWER(status) = 'active', and for filters "
+        "({{status}} = 'ALL' OR LOWER(status) = LOWER({{status}})).\n"
+        "- The schema lists each column's data type in parentheses. A date/time column stored as "
+        "text/varchar/char MUST be cast before date functions or comparisons. Use CAST(...) syntax, "
+        "NEVER the :: operator (it breaks parameter binding). Example: "
+        "DATE_TRUNC('month', CAST(open_date AS TIMESTAMP)) and "
+        "CAST(open_date AS TIMESTAMP) >= CAST({{__time_from}} AS TIMESTAMP). "
+        "Only cast columns whose type is textual.\n"
         "- Only SELECT statements. No markdown.\n"
         f"- At most {max_charts} charts.\n"
         "Output ONLY valid JSON."
@@ -364,9 +517,9 @@ async def draft_dashboard_plan(
             "query_name": title,
             "description": str(spec.get("description") or ""),
             "chart_type": str(spec.get("chart_type") or "table"),
-            "sql": str(spec["sql"]).strip(),
+            "sql": _clean_chart_sql(spec["sql"]),
             "config": spec.get("config") or {},
-            "params": spec.get("params") or [],
+            "params": _normalize_params(spec.get("params") or []),
         })
     if not safe_charts:
         return {"error": "Generated SQL was not safe — only SELECT statements are allowed"}
@@ -442,7 +595,7 @@ async def build_dashboard_from_plan(
 
     created_vizs = []
     for spec in charts:
-        sql = str(spec.get("sql", "")).strip()
+        sql = _clean_chart_sql(spec.get("sql", ""))
         if not _is_select_only(sql):
             continue
         safe_sql = _inject_limit(sql, 5000)
@@ -847,7 +1000,7 @@ async def apply_dashboard_changes(
                     skipped.append({"change": change, "reason": "no_connection_on_dashboard"})
                     continue
                 spec = change.get("spec") or {}
-                sql = str(spec.get("sql", "")).strip()
+                sql = _clean_chart_sql(spec.get("sql", ""))
                 if not _is_select_only(sql):
                     skipped.append({"change": change, "reason": "unsafe_sql"})
                     continue
@@ -858,7 +1011,7 @@ async def apply_dashboard_changes(
                     description=str(spec.get("description", "")),
                     sql_text=_inject_limit(sql, 5000),
                     connection_id=UUID(connection_id_str),
-                    params=spec.get("params") or [],
+                    params=_normalize_params(spec.get("params") or []),
                 )
                 viz = await viz_repo.create(
                     org_id, q.id, current_user.id,
@@ -875,7 +1028,7 @@ async def apply_dashboard_changes(
                     skipped.append({"change": change, "reason": "unknown_item_id"})
                     continue
                 spec = change.get("spec") or {}
-                sql = str(spec.get("sql", "")).strip()
+                sql = _clean_chart_sql(spec.get("sql", ""))
                 if not _is_select_only(sql):
                     skipped.append({"change": change, "reason": "unsafe_sql"})
                     continue
@@ -891,7 +1044,7 @@ async def apply_dashboard_changes(
                 if spec.get("query_name"):
                     q.name = str(spec["query_name"])[:255]
                 if isinstance(spec.get("params"), list):
-                    q.params = spec["params"]
+                    q.params = _normalize_params(spec["params"])
                 await viz_repo.update(
                     viz,
                     chart_type=str(spec.get("chart_type") or viz.chart_type),
