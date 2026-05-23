@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 from uuid import UUID
@@ -45,6 +45,7 @@ from app.config.settings import settings
 from app.infrastructure.database.client_queries import (
     ClientDBError,
     compute_risk,
+    explain_entity_risk,
     fetch_entities,
     fetch_entity_by_id,
     fetch_entity_trend,
@@ -60,6 +61,7 @@ from app.infrastructure.database.repositories.organization_repository import (
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+from app.infrastructure.database.session import async_session_factory
 from app.services.conversational_agents import run_split, synthesis_agent_run
 from app.services.conversational_memory import (
     format_handoff_for_prompt,
@@ -67,10 +69,12 @@ from app.services.conversational_memory import (
     recall as recall_memories,
     reflect_and_commit,
 )
+from app.services.recommendation_service import set_recommendation_status
 from groq import AsyncGroq
 
 from sqlalchemy import func as sa_func, select as sa_select
 from app.infrastructure.database.models.entity_profile import EntityProfile
+from app.infrastructure.database.models.recommendation import Recommendation
 
 from app.agents.prompts.conversational import (
     CLARIFICATION_REPLY_PROMPT,
@@ -89,6 +93,7 @@ from app.services.intent_router import (
     apply_dashboard_intent_override,
     apply_data_access_intent_override,
     apply_pipeline_intent_override,
+    apply_recommendation_action_override,
     build_fastpath_args,
     classify_intent,
     filter_tools_by_intent,
@@ -377,6 +382,80 @@ TOOLS = [
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["entity_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "explain_entity_risk",
+        "description": (
+            "Explain WHY an entity has its risk score: the exact per-signal breakdown, ranked by "
+            "contribution (each signal's value, how risky that value is, its weight, and its share "
+            "of the final score). Use when the user asks why an entity is high/critical risk."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "action_recommendation",
+        "description": (
+            "Mark a recommendation as actioned (the user has taken or will take the suggested "
+            "action). Pass the recommendation_id from get_recommendations or get_entity_detail. "
+            "Confirm with the user before calling. Optionally record an outcome note."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recommendation_id": {"type": "string", "description": "Recommendation UUID."},
+                "entity_id": {
+                    "type": "string",
+                    "description": "Entity ID — used only when recommendation_id is unknown; resolves the entity's single open recommendation.",
+                },
+                "outcome_notes": {"type": "string", "description": "Optional note on what was done."},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dismiss_recommendation",
+        "description": (
+            "Dismiss a recommendation so it leaves the open queue. Pass the recommendation_id from "
+            "get_recommendations or get_entity_detail. Confirm with the user before calling."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recommendation_id": {"type": "string", "description": "Recommendation UUID."},
+                "entity_id": {
+                    "type": "string",
+                    "description": "Entity ID — used only when recommendation_id is unknown; resolves the entity's single open recommendation.",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "snooze_recommendation",
+        "description": (
+            "Snooze a recommendation for N days; it drops out of the open queue until then. Pass the "
+            "recommendation_id from get_recommendations or get_entity_detail. Confirm before calling."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recommendation_id": {"type": "string", "description": "Recommendation UUID."},
+                "entity_id": {
+                    "type": "string",
+                    "description": "Entity ID — used only when recommendation_id is unknown; resolves the entity's single open recommendation.",
+                },
+                "days": {"type": "integer", "minimum": 1, "maximum": 365, "description": "Days to snooze. Default 7."},
+            },
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -694,30 +773,141 @@ async def _entities(
 
 async def _entity_detail(db: AsyncSession, org_id: UUID, entity_id: str) -> dict:
     mapping = await get_schema_mapping(db, org_id)
-    entity = await fetch_entity_by_id(db, org_id, entity_id, mapping)
-    if entity is None:
-        return {"error": "Entity not found"}
-    entity = compute_risk([entity], mapping.signal_columns, mapping.risk_config)[0]
     recs = await RecommendationRepository(db).list_by_org(org_id, status="open")
+    active = [
+        {
+            "id": rec.id,
+            "urgency": rec.urgency,
+            "title": rec.title,
+            "reasoning": rec.reasoning,
+            "suggested_action": rec.suggested_action,
+        }
+        for rec in recs
+        if rec.entity_id == entity_id
+    ]
+    try:
+        raw = await fetch_entity_by_id(db, org_id, entity_id, mapping)
+    except Exception:  # e.g. non-numeric id against an integer key column
+        raw = None
+
+    # Prefer the ML profile (same source as overview/entities). It carries risk + signals
+    # and avoids recomputing from raw rows, which fails on categorical signals (e.g. region).
+    profiles = await _fetch_active_mapping_profiles(db, org_id)
+    profile = next((p for p in profiles if str(p.entity_id) == str(entity_id)), None)
+    if profile is None and raw is None:
+        return {"error": "Entity not found"}
+
+    if profile is not None:
+        risk_score = float(profile.risk_score or 0)
+        risk_tier = _profile_internal_tier(profile.risk_tier)
+        signals = (profile.profile_data or {}).get("signal_values", {}) or {}
+        label = profile.entity_name
+        eid = str(profile.entity_id)
+    else:
+        try:
+            scored = compute_risk([raw], mapping.signal_columns, mapping.risk_config)[0]
+            risk_score, risk_tier, signals = scored["risk_score"], scored["risk_tier"], scored.get("signals", {})
+        except Exception:  # non-numeric signals without a profile: skip scoring, keep fields
+            risk_score, risk_tier, signals = None, None, {}
+        label = raw.get(mapping.entity_name_col) if mapping.entity_name_col else None
+        eid = raw[mapping.entity_id_col]
+
+    fields = {k: v for k, v in (raw or {}).items() if k not in ("risk_score", "risk_tier", "signals")}
     return {
-        "entity_id": entity[mapping.entity_id_col],
-        "entity_label": entity.get(mapping.entity_name_col) if mapping.entity_name_col else None,
-        "risk_score": entity["risk_score"],
-        "risk_tier": entity["risk_tier"],
-        "signals": entity.get("signals", {}),
-        "fields": {k: v for k, v in entity.items() if k not in ("risk_score", "risk_tier", "signals")},
-        "active_recommendations": [
-            {
-                "id": rec.id,
-                "urgency": rec.urgency,
-                "title": rec.title,
-                "reasoning": rec.reasoning,
-                "suggested_action": rec.suggested_action,
-            }
-            for rec in recs
-            if rec.entity_id == entity_id
-        ],
+        "entity_id": eid,
+        "entity_label": label,
+        "risk_score": risk_score,
+        "risk_tier": risk_tier,
+        "signals": signals,
+        "fields": fields,
+        "active_recommendations": active,
     }
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx == 0 or vy == 0:
+        return 0.0
+    return cov / (vx ** 0.5 * vy ** 0.5)
+
+
+def _explain_from_profiles(profiles: list[EntityProfile], entity_id: str) -> dict:
+    """Cohort-association drivers for an ML-scored entity (the score is a model prediction,
+    so we surface where this entity is unusual on signals correlated with higher risk)."""
+    target = next((p for p in profiles if str(p.entity_id) == str(entity_id)), None)
+    if target is None:
+        return {"error": "Entity not found"}
+    base = {
+        "entity_id": str(target.entity_id),
+        "risk_score": float(target.risk_score or 0),
+        "risk_tier": _profile_internal_tier(target.risk_tier),
+    }
+    target_signals = (target.profile_data or {}).get("signal_values") or {}
+    scores = [float(p.risk_score or 0) for p in profiles]
+
+    drivers = []
+    for sig, raw_tv in target_signals.items():
+        try:
+            tval = float(raw_tv)  # numeric signals only; skip categoricals like region
+        except (TypeError, ValueError):
+            continue
+        xs, ys = [], []
+        for p, sc in zip(profiles, scores):
+            v = (p.profile_data or {}).get("signal_values", {}).get(sig)
+            try:
+                xs.append(float(v))
+                ys.append(sc)
+            except (TypeError, ValueError):
+                continue
+        if len(xs) < 5:
+            continue
+        mean = sum(xs) / len(xs)
+        std = (sum((x - mean) ** 2 for x in xs) / len(xs)) ** 0.5
+        corr = _pearson(xs, ys)
+        if std == 0 or corr == 0:
+            continue
+        z = (tval - mean) / std
+        drivers.append({
+            "signal": sig,
+            "value": round(tval, 3),
+            "cohort_avg": round(mean, 3),
+            "direction": "higher raises risk" if corr > 0 else "lower raises risk",
+            "association": round(corr, 3),  # corr of this signal with risk across the cohort
+            "push": round(z * corr, 3),     # >0: this entity's value pushes its risk up
+        })
+
+    drivers.sort(key=lambda d: d["push"], reverse=True)
+    top = [d for d in drivers if d["push"] > 0][:3] or drivers[:3]
+    return {
+        **base,
+        "drivers": top,
+        "method": "cohort_association",
+        "note": "Risk score is an ML prediction; drivers show where this entity is most unusual on signals associated with higher risk.",
+    }
+
+
+async def _explain_entity_risk(db: AsyncSession, org_id: UUID, entity_id: str) -> dict:
+    """Explain one entity's risk: ML profiles (primary) or deterministic decomposition (fallback)."""
+    profiles = await _fetch_active_mapping_profiles(db, org_id)
+    if profiles:
+        return _explain_from_profiles(profiles, entity_id)
+    # Fallback: deterministic weighted-average path. Guard so non-numeric signals or a
+    # missing mapping degrade to a clean error instead of throwing into the chat fallback.
+    try:
+        mapping = await get_schema_mapping(db, org_id)
+        entities = await fetch_entities(db, org_id, mapping)
+        return explain_entity_risk(
+            entities, mapping.signal_columns, mapping.risk_config, mapping.entity_id_col, entity_id
+        )
+    except Exception as exc:
+        logger.debug("[agent_service] explain_entity_risk fallback failed: %s", exc)
+        return {"error": "Could not compute a risk breakdown for this entity."}
 
 
 async def _recommendations(
@@ -965,6 +1155,9 @@ async def _compare_runs(db: AsyncSession, org_id: UUID) -> dict:
     try:
         recent = await repo.list_by_org(org_id, limit=10)
     except Exception:
+        # A failed query aborts the transaction; roll back so the caller's
+        # session stays usable for the rest of the request.
+        await db.rollback()
         return {"error": "Could not load pipeline runs"}
 
     completed = [r for r in recent if r.status in ("succeeded", "failed")]
@@ -997,6 +1190,58 @@ async def _compare_runs(db: AsyncSession, org_id: UUID) -> dict:
             "duration_ms": (current.duration_ms or 0) - (previous.duration_ms or 0),
         },
     }
+
+
+def _signed(n: int) -> str:
+    return f"+{n}" if n > 0 else str(n)
+
+
+async def _proactive_digest(org_id: UUID) -> str:
+    """First-turn 'since last run' one-liner: risk-tier shifts + open-rec load. '' if nothing notable."""
+    # Best-effort telemetry: runs in its own session so a read failure can never
+    # poison the chat request's transaction.
+    try:
+        async with async_session_factory() as session:
+            repo = RecommendationRepository(session)
+            open_count = await repo.count_by_org(org_id, status="open")
+            crit_open = await repo.count_by_org(org_id, status="open", urgency="critical")
+            comparison = await _compare_runs(session, org_id)
+    except Exception:
+        return ""
+
+    parts: list[str] = []
+    if "error" not in comparison:
+        d = comparison["deltas"]
+        if d.get("critical_count"):
+            parts.append(f"critical risk {_signed(d['critical_count'])}")
+        if d.get("high_count"):
+            parts.append(f"high risk {_signed(d['high_count'])}")
+        new_recs = d.get("recommendations_generated") or 0
+        if new_recs > 0:
+            parts.append(f"{new_recs} new recommendation{'s' if new_recs != 1 else ''}")
+
+    change = ", ".join(parts)
+    queue = ""
+    if open_count:
+        crit = f", {crit_open} critical" if crit_open else ""
+        queue = f"{open_count} open recommendation{'s' if open_count != 1 else ''}{crit} awaiting action"
+
+    if change and queue:
+        return f"Since the last run, {change}. {queue}."
+    if change:
+        return f"Since the last run, {change}."
+    if queue:
+        return queue[0].upper() + queue[1:] + "."
+    return ""
+
+
+def _proactive_prompt_block(digest: str) -> str:
+    if not digest:
+        return ""
+    return (
+        "## Since the user's last session\n"
+        f"Open your reply with this status update, then address their message: {digest}\n\n"
+    )
 
 
 async def _find_similar(
@@ -1134,6 +1379,36 @@ async def _action_draft(
         return _action_draft_fallback(detail, entity_id, action_type)
 
 
+async def _resolve_recommendation(
+    db: AsyncSession, org_id: UUID, tool_input: dict
+) -> tuple[Recommendation | None, dict | None]:
+    """Resolve a recommendation by id, else the entity's single open one. Returns (rec, error)."""
+    repo = RecommendationRepository(db)
+    rec_id = tool_input.get("recommendation_id")
+    if rec_id:
+        try:
+            rec = await repo.get_by_id(UUID(str(rec_id)))
+        except ValueError:
+            return None, {"error": f"Invalid recommendation_id: {rec_id}"}
+        if not rec or rec.org_id != org_id:
+            return None, {"error": "Recommendation not found"}
+        return rec, None
+    entity_id = tool_input.get("entity_id")
+    if not entity_id:
+        return None, {"error": "Provide recommendation_id or entity_id."}
+    open_recs = await repo.list_by_org(org_id, status="open", entity_id=str(entity_id))
+    if not open_recs:
+        return None, {"error": f"No open recommendation for entity {entity_id}."}
+    if len(open_recs) > 1:
+        return None, {
+            "error": f"{len(open_recs)} open recommendations for {entity_id}; ask which one.",
+            "candidates": [
+                {"id": str(r.id), "title": r.title, "urgency": r.urgency} for r in open_recs
+            ],
+        }
+    return open_recs[0], None
+
+
 async def _run_tool(
     name: str,
     tool_input: dict,
@@ -1175,6 +1450,8 @@ async def _run_tool(
             )
         if name == "get_entity_detail":
             return await _entity_detail(db, org_id, str(tool_input["entity_id"]))
+        if name == "explain_entity_risk":
+            return await _explain_entity_risk(db, org_id, str(tool_input["entity_id"]))
         if name == "get_recommendations":
             return await _recommendations(
                 db,
@@ -1196,6 +1473,28 @@ async def _run_tool(
                 str(tool_input["entity_id"]),
                 limit=int(tool_input.get("limit") or 10),
             )
+        if name in ("action_recommendation", "dismiss_recommendation", "snooze_recommendation"):
+            rec, err = await _resolve_recommendation(db, org_id, tool_input)
+            if err:
+                return err
+            actor = current_user.id if current_user else None
+            if name == "action_recommendation":
+                await set_recommendation_status(
+                    db, rec, "actioned",
+                    actioned_by=actor,
+                    outcome_notes=tool_input.get("outcome_notes"),
+                )
+                return {"ok": True, "recommendation_id": str(rec.id), "entity_id": rec.entity_id, "status": "actioned"}
+            if name == "dismiss_recommendation":
+                await set_recommendation_status(db, rec, "dismissed", actioned_by=actor)
+                return {"ok": True, "recommendation_id": str(rec.id), "entity_id": rec.entity_id, "status": "dismissed"}
+            days = int(tool_input.get("days") or 7)
+            until = datetime.now(timezone.utc) + timedelta(days=days)
+            await set_recommendation_status(db, rec, "snoozed", actioned_by=actor, expires_at=until)
+            return {
+                "ok": True, "recommendation_id": str(rec.id), "entity_id": rec.entity_id,
+                "status": "snoozed", "snoozed_until": until.isoformat(),
+            }
         if name == "start_dashboard_intake":
             if current_user is None:
                 return {"error": "start_dashboard_intake requires an authenticated user"}
@@ -1770,6 +2069,7 @@ async def _conversational_reply(
     user_message: str,
     *,
     conversation_messages: list[dict] | None = None,
+    proactive: str = "",
 ) -> str:
     """Tool-free reply for greeting / help / off_topic / unknown.
 
@@ -1801,13 +2101,12 @@ async def _conversational_reply(
         "recent_turns": recent_turns,
     }
 
-    # Try LLM-crafted reply first (warmer + tone-matched).
+    # Try LLM-crafted reply first (warmer + tone-matched); fall back to static templates.
     crafted = await _craft_conversational_reply(intent_name, state)
-    if crafted:
-        return sanitize_pulse_reply(crafted)
-
-    # Fallback: static templates when Groq is unavailable or returns junk.
-    return _conversational_reply_template(intent_name, state)
+    reply = sanitize_pulse_reply(crafted) if crafted else _conversational_reply_template(intent_name, state)
+    if proactive:
+        reply = f"{proactive}\n\n{reply}"
+    return reply
 
 
 def _conversational_reply_template(intent_name: str, state: dict) -> str:
@@ -1951,6 +2250,7 @@ async def run(
     # First-turn handoff: surface prior-session summaries only on conversation entry,
     # so reopened threads aren't polluted by mid-thread handoff text.
     handoff_block = ""
+    proactive_digest = ""
     is_first_turn = len([m for m in conversation_messages if m.get("role") == "user"]) <= 1
     if is_first_turn and latest_user:
         handoffs = await recall_memories(
@@ -1960,6 +2260,8 @@ async def run(
             min_score=0.0,  # any prior summary is worth surfacing on first turn
         )
         handoff_block = format_handoff_for_prompt(handoffs)
+        proactive_digest = await _proactive_digest(current_user.org_id)
+        handoff_block += _proactive_prompt_block(proactive_digest)
 
     # Context window management: prevent LLM context overflow on long conversations.
     overflow_msgs, windowed_messages = _build_context_window(conversation_messages)
@@ -1998,6 +2300,7 @@ async def run(
             intent = apply_pipeline_intent_override(intent, effective_user)
             intent = apply_data_access_intent_override(intent, effective_user)
             intent = apply_dashboard_intent_override(intent, effective_user)
+            intent = apply_recommendation_action_override(intent, effective_user)
         # Mid dashboard intake/preview/edit flow: force the dashboard ReAct path so
         # card replies ("...draft the plan", "...build", "apply these changes") don't
         # get short-circuited to a conversational reply or the wrong intent. Also catch
@@ -2025,6 +2328,7 @@ async def run(
             reply = await _conversational_reply(
                 db, current_user, intent.intent, latest_user,
                 conversation_messages=conversation_messages,
+                proactive=proactive_digest,
             )
             # Tag the discovery reply so the user's next (goal) message bridges into
             # the dashboard intake flow even if the classifier doesn't catch it.
@@ -2250,6 +2554,7 @@ async def run_stream(
             min_score=0.0,
         )
         handoff_block = format_handoff_for_prompt(handoffs)
+        handoff_block += _proactive_prompt_block(await _proactive_digest(current_user.org_id))
 
     # Context window management (same as run()).
     overflow_msgs, windowed_messages = _build_context_window(conversation_messages)

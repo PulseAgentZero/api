@@ -273,6 +273,56 @@ def apply_dashboard_intent_override(intent: IntentResult, message: str) -> Inten
     return intent
 
 
+# Acting on a recommendation is a deterministic command, not a judgement call — detect it
+# in code and route to the action tools rather than hoping the LLM picks the right tool.
+_REC_CONTEXT_RE = re.compile(
+    r"\b(recommendation|recommendations|\brec\b|\brecs\b|action item|suggested action|first one|first rec)\b",
+    re.I,
+)
+_SNOOZE_RE = re.compile(r"\b(snooze|postpone|defer|remind me|come back to|later)\b", re.I)
+_ACTIONED_RE = re.compile(
+    r"\b(actioned|action it|resolve[d]?|complete[d]?|handled|took care of|"
+    r"did (this|it)|mark|done)\b",
+    re.I,
+)
+_DISMISS_RE = re.compile(r"\b(dismiss|ignore|discard|drop|remove|delete|clear)\b", re.I)
+_DAYS_RE = re.compile(r"(\d+)\s*(day|days|week|weeks)", re.I)
+
+
+def detect_recommendation_action(message: str) -> tuple[Optional[str], Optional[int]]:
+    """Map a recommendation command to (tool_name, snooze_days). (None, None) if not a command."""
+    if not _REC_CONTEXT_RE.search(message):
+        return None, None
+    if _SNOOZE_RE.search(message):
+        m = _DAYS_RE.search(message)
+        days = 7
+        if m:
+            n = int(m.group(1))
+            days = n * 7 if m.group(2).lower().startswith("week") else n
+        return "snooze_recommendation", days
+    if _ACTIONED_RE.search(message):
+        return "action_recommendation", None
+    if _DISMISS_RE.search(message):
+        return "dismiss_recommendation", None
+    return None, None
+
+
+def apply_recommendation_action_override(intent: IntentResult, message: str) -> IntentResult:
+    """Route 'dismiss/snooze/mark-done this recommendation' to the action path."""
+    tool, _ = detect_recommendation_action(message)
+    if not tool:
+        return intent
+    ids = intent.entity_ids or _ENTITY_ID_RE.findall(message)
+    return IntentResult(
+        intent="act_recommendation",
+        confidence=max(intent.confidence, 0.95),
+        entity_ids=ids,
+        tier_filter=intent.tier_filter,
+        urgency_filter=intent.urgency_filter,
+        raw=intent.raw,
+    )
+
+
 def _critical_count_negated(text: str) -> bool:
     """True when assistant said there are zero/no critical entities."""
     return bool(
@@ -421,7 +471,7 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "lookup_pipeline": ("get_pipeline_status",),
     "lookup_pipeline_detail": ("get_pipeline_detail", "get_pipeline_status"),
     "lookup_overview": ("get_overview",),
-    "lookup_entity": ("get_entity_detail", "find_similar_entities"),
+    "lookup_entity": ("get_entity_detail", "find_similar_entities", "explain_entity_risk"),
     "lookup_entities": ("get_entities", "get_overview"),
     "lookup_recommendations": ("get_recommendations", "get_entity_detail"),
     "lookup_outcome": ("get_outcome_analysis", "get_overview"),
@@ -429,6 +479,13 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "compare_runs": ("compare_pipeline_runs", "get_pipeline_status"),
     "find_similar": ("find_similar_entities", "get_entity_detail"),
     "generate_draft": ("generate_action_draft", "get_entity_detail"),
+    "act_recommendation": (
+        "dismiss_recommendation",
+        "snooze_recommendation",
+        "action_recommendation",
+        "get_recommendations",
+        "get_entity_detail",
+    ),
     "build_dashboard": (
         "start_dashboard_intake",
         "draft_dashboard_plan",
@@ -466,6 +523,15 @@ def build_fastpath_args(
     Returns None when fast-path isn't applicable (intent doesn't map, or required
     extracted params are missing). Caller should fall back to the prefilter path.
     """
+    if intent.intent == "act_recommendation":
+        action_tool, days = detect_recommendation_action(user_message or intent.raw or "")
+        if not action_tool or not intent.entity_ids:
+            return None  # ambiguous target (e.g. "the first one") -> ReAct resolves it
+        args: dict = {"entity_id": str(intent.entity_ids[0])}
+        if action_tool == "snooze_recommendation":
+            args["days"] = days or 7
+        return action_tool, args
+
     tool = _FASTPATH_TOOL.get(intent.intent)
     if not tool:
         return None

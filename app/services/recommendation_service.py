@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,9 +9,34 @@ from app.infrastructure.database.client_queries import (
     fetch_entities,
     get_schema_mapping,
 )
+from app.infrastructure.database.models.recommendation import Recommendation
 from app.infrastructure.database.repositories.recommendation_repository import (
     RecommendationRepository,
 )
+
+
+async def set_recommendation_status(
+    db: AsyncSession,
+    rec: Recommendation,
+    status: str,
+    *,
+    actioned_by: UUID | None = None,
+    outcome_notes: str | None = None,
+    expires_at: datetime | None = None,
+) -> Recommendation:
+    """Apply a workflow status transition (actioned/dismissed/snoozed) and persist it."""
+    rec.status = status
+    if actioned_by is not None:
+        rec.actioned_by = actioned_by  # records who performed the transition
+    if status == "actioned":
+        rec.actioned_at = datetime.now(timezone.utc)
+    if outcome_notes is not None:
+        rec.outcome_notes = outcome_notes
+    if expires_at is not None:
+        rec.expires_at = expires_at
+    await db.commit()
+    await db.refresh(rec)
+    return rec
 
 
 def _urgency_from_tier(tier: str) -> str:
@@ -86,4 +112,8 @@ async def generate_recommendations_for_org(
     return created
 
 
-__all__ = ["ClientDBError", "generate_recommendations_for_org"]
+__all__ = [
+    "ClientDBError",
+    "generate_recommendations_for_org",
+    "set_recommendation_status",
+]
