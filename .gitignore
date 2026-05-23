@@ -91,7 +91,9 @@ AGENTS.md
 CLAUDE.md
 
 # data
-data/
+# data/
+hackathon/eval/data/*.jsonl
+!hackathon/eval/data/EVAL.md
 
 # others
 *.log
