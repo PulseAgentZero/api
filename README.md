@@ -7,6 +7,19 @@
 
 This repository is the backend (FastAPI + autonomous agent pipeline + license server). The web dashboard lives at [`PulseAgentZero/dashboard`](https://github.com/PulseAgentZero/dashboard). The published self‑hosted Docker image is at [`chideraozigbo488/entivia`](https://hub.docker.com/r/chideraozigbo488/entivia).
 
+### Hackathon submission — DSN × Bluechip LLM Agent Challenge
+
+**Built during the challenge (early May → 24 May 2026).** This entire repository — the Entivia platform in [`app/`](app/) *and* the formal competition entry in [`hackathon/`](hackathon/) — was written **from scratch within the official hackathon timeline**. That includes the agent runtime (`BaseAgent`, tool registry, JSON validation, provider fallback), the four-stage autonomous pipeline, the FastAPI API and auth/billing/license layers, the self-hosted and cloud Docker images, and then the Task A + Task B agents, Yelp/Goodreads loaders, eval harness, per-task containers, and solution papers. We did not port in a pre-existing product; we built Entivia as the engine for the challenge and shaped the submission on top of it.
+
+**Why we structured it this way.** The brief asks for two containerized agents on review/persona data. Rather than a throwaway demo, we built a full agent platform first — connect to structured data, profile behaviour, score risk, recommend actions — and used the hackathon domain (Yelp + Goodreads) as the **public proof** that the runtime works: Task A is behavioural simulation, Task B is next-best-action recommendations, both on the same [`app/agents/base.py`](app/agents/base.py) stack as the enterprise pipeline described below.
+
+| Layer | Path | Role in the submission |
+|-------|------|-------------------------|
+| Agent runtime + product API | [`app/`](app/) | ReAct agents, live-SQL tools, pipeline, deployment |
+| Task A + Task B APIs | [`hackathon/`](hackathon/) | `POST /simulate-review`, `POST /recommend`, eval, papers |
+
+See [`hackathon/README.md`](hackathon/README.md) for `docker compose` quickstart, API examples, evaluation, and the two task papers.
+
 | | |
 |---|---|
 | **Framework** | FastAPI · Python 3.12 · Pydantic v2 |
@@ -36,8 +49,7 @@ This repository is the backend (FastAPI + autonomous agent pipeline + license se
 12. [API documentation](#api-documentation)
 13. [Make targets](#make-targets)
 14. [Testing](#testing)
-15. [Reference docs](#reference-docs)
-16. [Troubleshooting](#troubleshooting)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -391,21 +403,6 @@ pytest tests/test_smoke.py -q
 ```
 
 Smoke tests cover health, auth envelope, and public‑route validation. They don't require a database for the default paths.
-
----
-
-## Reference docs
-
-| File | What |
-|---|---|
-| [`docs/PAYSTACK_BILLING_SETUP.md`](docs/PAYSTACK_BILLING_SETUP.md) | Paystack billing — cloud subscriptions + self‑hosted license, step‑by‑step |
-| [`docker/compose/self-hosted/README.md`](docker/compose/self-hosted/README.md) | Self‑hosted install — `docker-compose.yml`, `.env.example`, quick start |
-| [`docker/images/pulse/DOCKERHUB.md`](docker/images/pulse/DOCKERHUB.md) | Docker Hub overview rendered on the public image page |
-| [`BACKEND_ROUTES.md`](BACKEND_ROUTES.md) | Full endpoint reference |
-| [`SCHEMA.md`](SCHEMA.md) | Database schema (all tables) |
-| [`MILESTONES.md`](MILESTONES.md) | Feature roadmap |
-| [`LICENSE_SYSTEM.md`](LICENSE_SYSTEM.md) | License key flow (issuance, activation, validation, grace) |
-| [`STUDIO_README.md`](STUDIO_README.md) | Studio (SQL editor + dashboards) implementation notes |
 
 ---
 

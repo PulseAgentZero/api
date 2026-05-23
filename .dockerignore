@@ -29,3 +29,12 @@ license_private.pem
 skills-lock.json
 .postman
 postman
+
+# Hackathon image — paper assets, dev-only files, and any locally-mounted
+# raw datasets must not be baked into entivia-hackathon:latest.
+hackathon/paper/
+hackathon/SUBMISSION.md
+hackathon/data/yelp/
+hackathon/data/goodreads/
+hackathon/*.tar.gz
+hackathon/*.tgz

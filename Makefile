@@ -100,8 +100,58 @@ seed:
 reset-db:
 	python scripts/db/reset_db.py
 
+# ── Hackathon (DSN x Bluechip) ────────────────────────────────────────────────
+
+HACKATHON_YELP_HOST_DIR ?= $(HOME)/datasets/yelp
+export HACKATHON_YELP_HOST_DIR
+
+hackathon-build:
+	docker compose -f hackathon/docker-compose.yml build task-a-api
+
+hackathon-up:
+	docker compose -f hackathon/docker-compose.yml up -d --build
+
+hackathon-down:
+	docker compose -f hackathon/docker-compose.yml down
+
+hackathon-logs:
+	docker compose -f hackathon/docker-compose.yml logs -f task-a-api task-b-api hackathon-api
+
+hackathon-load:
+	@if [ -d "$(HACKATHON_YELP_HOST_DIR)" ]; then \
+		echo "[info] mounting $(HACKATHON_YELP_HOST_DIR) -> /data/yelp"; \
+		docker compose -f hackathon/docker-compose.yml run --rm \
+			-v "$(HACKATHON_YELP_HOST_DIR)":/data/yelp:ro loader; \
+	else \
+		echo "[warn] HACKATHON_YELP_HOST_DIR=$(HACKATHON_YELP_HOST_DIR) not found; using synthetic data"; \
+		docker compose -f hackathon/docker-compose.yml run --rm \
+			-e HACKATHON_YELP_DIR= loader; \
+	fi
+
+hackathon-eval:
+	docker compose -f hackathon/docker-compose.yml run --rm hackathon-api \
+		python -m hackathon.eval.run --task-a-sample 30 --task-b-users 30
+
+hackathon-paper-a-pdf:
+	@command -v pandoc >/dev/null || (echo "Install pandoc to export PDF" && exit 1)
+	pandoc hackathon/paper/task_a_review_simulation.md -o hackathon/paper/task_a_review_simulation.pdf \
+		--pdf-engine=pdflatex -V geometry:margin=1in
+
+hackathon-paper-b-pdf:
+	@command -v pandoc >/dev/null || (echo "Install pandoc to export PDF" && exit 1)
+	pandoc hackathon/paper/task_b_recommendation.md -o hackathon/paper/task_b_recommendation.pdf \
+		--pdf-engine=pdflatex -V geometry:margin=1in
+
+hackathon-paper-pdf: hackathon-paper-a-pdf hackathon-paper-b-pdf
+	@command -v pandoc >/dev/null || (echo "Install pandoc to export PDF" && exit 1)
+	pandoc hackathon/paper/solution_paper.md -o hackathon/paper/solution_paper.pdf \
+		--pdf-engine=pdflatex -V geometry:margin=1in
+
 .PHONY: build-self-hosted build-cloud build-license build \
         push-self-hosted push-cloud push-license push \
         sh-up sh-down sh-logs sh-pull \
         up down logs scale-workers dev dev-scheduler \
-        migrate revision seed reset-db
+        migrate revision seed reset-db \
+        hackathon-build hackathon-up hackathon-down hackathon-logs \
+        hackathon-load hackathon-eval hackathon-paper-pdf \
+        hackathon-paper-a-pdf hackathon-paper-b-pdf

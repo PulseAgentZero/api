@@ -1,0 +1,89 @@
+# Hackathon submission stack — run from repo root:
+#   make hackathon-up          # postgres + qdrant + task-a + task-b (+ combined API on :8010)
+#   make hackathon-load        # one-shot data loader
+#   open http://localhost:8011/docs   # Task A only
+#   open http://localhost:8012/docs   # Task B only
+
+x-hackathon-env: &hackathon-env
+  HACKATHON_DATABASE_URL: postgresql+asyncpg://hackathon:hackathon@postgres:5432/hackathon
+  QDRANT_URL: http://qdrant:6333
+  HACKATHON_EMBEDDING_BACKEND: fastembed
+  HACKATHON_FASTEMBED_MODEL: BAAI/bge-small-en-v1.5
+  HACKATHON_USE_PSEUDO_EMBEDDINGS: "0"
+  HACKATHON_MAX_YELP_ITEMS: "12000"
+  HACKATHON_ALLOW_SYNTHETIC: "1"
+  HACKATHON_YELP_DIR: /data/yelp
+  FASTEMBED_CACHE_PATH: /models
+
+x-hackathon-service: &hackathon-service
+  image: entivia-hackathon:latest
+  env_file:
+    - ../.env
+  environment:
+    <<: *hackathon-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    qdrant:
+      condition: service_started
+  volumes:
+    - hackathon_models:/models
+    - ./eval/data:/app/hackathon/eval/data
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hackathon
+      POSTGRES_PASSWORD: hackathon
+      POSTGRES_DB: hackathon
+    ports:
+      - "5433:5432"
+    volumes:
+      - hackathon_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hackathon"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6334:6333"
+    volumes:
+      - hackathon_qdrant:/qdrant/storage
+
+  # Task A — Review Simulation Agent (hackathon requirement: one container per task)
+  task-a-api:
+    <<: *hackathon-service
+    build:
+      context: ..
+      dockerfile: hackathon/Dockerfile
+    ports:
+      - "8011:8000"
+    command: ["uvicorn", "hackathon.app.task_a:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # Task B — Recommendation Agent
+  task-b-api:
+    <<: *hackathon-service
+    ports:
+      - "8012:8000"
+    command: ["uvicorn", "hackathon.app.task_b:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  # Combined gateway (both tasks on one port — optional for local demos)
+  hackathon-api:
+    <<: *hackathon-service
+    ports:
+      - "8010:8000"
+    command: ["uvicorn", "hackathon.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  loader:
+    <<: *hackathon-service
+    profiles: ["tools"]
+    command: ["python", "-m", "hackathon.data.load"]
+
+volumes:
+  hackathon_pg:
+  hackathon_qdrant:
+  hackathon_models:
