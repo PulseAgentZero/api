@@ -10,8 +10,9 @@ This repository contains our submission for both tasks of the challenge:
   from a user persona built on review history.
 
 Both agents are shipped as **two Docker containers built from the same image**,
-with a Yelp Open Dataset slice and a Goodreads cross-domain demo. A Nigerian
-English voice variant is included for the localization signal.
+with a real **Yelp Open Dataset food slice** (5,000 users / 11,397 businesses /
+112,157 reviews / 9,447-row holdout) and a Goodreads cross-domain demo. A
+Nigerian English voice variant is included for the localization signal.
 
 ---
 
@@ -120,8 +121,7 @@ hackathon/
 │   ├── task_a_review_simulation.md       # Source for Task A paper
 │   ├── task_a_review_simulation.pdf      # Submitted PDF (built via `make hackathon-paper-a-pdf`)
 │   ├── task_b_recommendation.md          # Source for Task B paper
-│   ├── task_b_recommendation.pdf         # Submitted PDF (built via `make hackathon-paper-b-pdf`)
-│   └── solution_paper.md                 # Index linking both papers
+│   └── task_b_recommendation.pdf         # Submitted PDF (built via `make hackathon-paper-b-pdf`)
 ├── Dockerfile                 # Single image used by all task containers
 ├── docker-compose.yml         # postgres · qdrant · task-a · task-b · gateway · loader
 ├── requirements.txt
@@ -144,11 +144,20 @@ cp hackathon/.env.example hackathon/.env
 $EDITOR hackathon/.env              # HACKATHON_DATABASE_PASSWORD + ANTHROPIC_API_KEY (Groq optional)
 
 make hackathon-up                   # postgres · qdrant · task-a · task-b · gateway
-make hackathon-load                 # synthetic by default; real Yelp if mounted (§4)
+
+# Point HACKATHON_YELP_HOST_DIR at the unzipped Yelp Open Dataset folder
+# (the four `yelp_academic_dataset_*.json` files). The repo also accepts
+# `data/yelp_dataset/` if you check the dataset in there locally.
+HACKATHON_YELP_HOST_DIR=$PWD/data/yelp_dataset make hackathon-load
 
 open http://localhost:8011/docs     # Task A
 open http://localhost:8012/docs     # Task B
 ```
+
+If `HACKATHON_YELP_HOST_DIR` is not set or the folder is missing, the loader
+falls back to a small synthetic seed (`HACKATHON_ALLOW_SYNTHETIC=1`, default)
+so the agents still run end-to-end. The headline numbers in §5 / `paper/` are
+on the real-Yelp slice — see §4 for sizing.
 
 Stop the stack with `make hackathon-down`. Stream logs with `make hackathon-logs`.
 
@@ -224,6 +233,69 @@ Returns the most recent evaluation snapshot as JSON, parsed from
 curl -s http://localhost:8011/metrics
 ```
 
+### 3.4 End-to-end smoke test (copy-paste)
+
+After `make hackathon-up` and `make hackathon-load`, the following sequence
+exercises every mode against the loaded real-Yelp slice:
+
+```bash
+# Health
+curl -s http://localhost:8011/healthz
+curl -s http://localhost:8012/healthz
+
+# Pull a real Yelp user_id from the loaded slice
+curl -s 'http://localhost:8011/samples/users?limit=3'
+
+# Task A — direct mode (challenge brief input shape)
+curl -s http://localhost:8011/simulate-review -H 'Content-Type: application/json' -d '{
+  "persona":{"description":"Generous reviewer who loves spicy Nigerian food.",
+             "avg_stars":4.2,"top_categories":["Nigerian","Restaurants"]},
+  "product":{"name":"Tam Tam African Restaurant",
+             "categories":"African, Restaurants","city":"Philadelphia"}
+}' | python3 -m json.tool
+
+# Task A — Nigerian voice
+curl -s http://localhost:8011/simulate-review -H 'Content-Type: application/json' -d '{
+  "persona":{"description":"Generous reviewer who loves spicy Nigerian food.",
+             "avg_stars":4.2,"top_categories":["Nigerian","Restaurants"]},
+  "product":{"name":"Tam Tam African Restaurant",
+             "categories":"African, Restaurants","city":"Philadelphia"},
+  "voice":"nigerian"
+}' | python3 -m json.tool
+
+# Task A — DB mode (real user, real product from the loaded slice)
+curl -s http://localhost:8011/simulate-review -H 'Content-Type: application/json' -d '{
+  "user_id":"_BcWyKQL16ndpBdggh2kNA",
+  "item_id":"kbFwcVMsHlNNXGWRZpEYhg"
+}' | python3 -m json.tool
+
+# Task B — warm start (real user)
+curl -s http://localhost:8012/recommend -H 'Content-Type: application/json' -d '{
+  "user_id":"_BcWyKQL16ndpBdggh2kNA","k":5,"dataset":"yelp"
+}' | python3 -m json.tool
+
+# Task B — cold start (free-text persona only)
+curl -s http://localhost:8012/recommend -H 'Content-Type: application/json' -d '{
+  "persona":"loves spicy Nigerian food and cafes","k":5,"dataset":"yelp"
+}' | python3 -m json.tool
+
+# Task B — cross-domain (books)
+curl -s http://localhost:8012/recommend -H 'Content-Type: application/json' -d '{
+  "persona":"African literary fiction","k":5,"dataset":"goodreads"
+}' | python3 -m json.tool
+
+# Task B — multi-turn refinement (use conversation_id from a previous call)
+curl -s http://localhost:8012/recommend -H 'Content-Type: application/json' -d '{
+  "conversation_id":"<paste-from-previous-response>",
+  "follow_up":"make these cheaper"
+}' | python3 -m json.tool
+```
+
+Each successful response includes a `meta` block with the model used, providers
+called (so an Anthropic→Groq fallback is visible), tool calls, token counts,
+latency, and validation retries. That metadata block is the audit trail
+referenced in the solution papers.
+
 ---
 
 ## 4. Datasets
@@ -233,23 +305,30 @@ This submission uses public review datasets that fit the challenge spec.
 ### Yelp (primary)
 
 1. Download the [Yelp Open Dataset](https://www.yelp.com/dataset) and unzip
-   the `yelp_academic_dataset_*.json` files into one folder (default:
-   `~/datasets/yelp/`).
+   the four `yelp_academic_dataset_*.json` files into one folder. Either point
+   `HACKATHON_YELP_HOST_DIR` at it directly, or drop the files into the repo
+   at `data/yelp_dataset/` and use that path.
 2. Mount and load:
 
 ```bash
-export HACKATHON_YELP_HOST_DIR=~/datasets/yelp
+export HACKATHON_YELP_HOST_DIR=$PWD/data/yelp_dataset    # or ~/datasets/yelp
 make hackathon-load
 ```
 
-The Makefile mounts that folder read-only into the loader container.
+The Makefile mounts that folder read-only into the loader container. The
+loader streams the 5 GB `…_review.json` twice (count → collect) and caps
+the slice to the env values in `hackathon/config.py`. Wall-time on Apple
+Silicon is ~10 min, dominated by the bind-mount stream; the post-load eval
+runs in seconds against the resulting Postgres + Qdrant volumes.
 
 Without the dataset, `HACKATHON_ALLOW_SYNTHETIC=1` (default) generates a
 reproducible restaurant slice so the agents still run end-to-end. This is the
 expected configuration for judges who cannot download the full Yelp dump.
 
 Defaults (tunable via environment variables): 5,000 users with ≥ 10 reviews
-each, up to 12,000 businesses, 10 % per-user holdout reserved for evaluation.
+each, up to 12,000 businesses (food/restaurant categories only), 10 % per-user
+holdout reserved for evaluation. Our submitted run loaded **5,000 users /
+11,397 items / 112,157 reviews / 9,447 holdout rows** under these defaults.
 
 ### Goodreads (cross-domain demo)
 

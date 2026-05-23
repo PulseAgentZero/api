@@ -1,4 +1,4 @@
-"""Generate hackathon/paper/architecture.png — architecture diagram for the README.
+"""Generate hackathon/paper/architecture.png — diagram for the solution papers.
 
 Usage:
     python hackathon/paper/architecture.py
@@ -112,8 +112,6 @@ def arrow(ax, start, end, label=None, curve=0.0, fontsize=8, color=LINE, lw=1.4)
 
 def top(b): return (b[0] + b[2] / 2, b[1] + b[3])
 def bot(b): return (b[0] + b[2] / 2, b[1])
-def left(b): return (b[0], b[1] + b[3] / 2)
-def right(b): return (b[0] + b[2], b[1] + b[3] / 2)
 
 
 def main() -> None:
@@ -125,7 +123,7 @@ def main() -> None:
     ax.text(
         0.4,
         10.55,
-        "Entivia — DSN × Bluechip LLM Agent Challenge",
+        "Entivia Agent Architecture",
         fontsize=15,
         fontweight="bold",
         color=INK,
@@ -133,18 +131,38 @@ def main() -> None:
     ax.text(
         0.4,
         10.18,
-        "Two containerized agents · one Docker image · real Yelp data",
+        "Two containerised agents on one shared runtime, evaluated against the real Yelp Open Dataset",
         fontsize=11,
         color=MUTED,
     )
 
-    judge = box(ax, 10.6, 10.0, 3.2, 0.8, "Reviewer / Judge", "client", sub="curl · Swagger UI")
+    judge = box(ax, 10.4, 10.0, 3.4, 0.8, "Reviewer or Judge", "client", sub="HTTP, Swagger documentation")
 
-    yelp = box(ax, 1.0, 8.4, 3.6, 0.9, "Yelp Open Dataset", "data", sub="JSON loader")
-    good = box(ax, 5.2, 8.4, 3.6, 0.9, "Goodreads", "data", sub="cross-domain loader")
+    yelp = box(
+        ax, 1.0, 8.4, 3.6, 0.9,
+        "Yelp Open Dataset",
+        "data",
+        sub="businesses, users, reviews",
+    )
+    good = box(
+        ax, 5.2, 8.4, 3.6, 0.9,
+        "Goodreads slice",
+        "data",
+        sub="cross-domain demonstration",
+    )
 
-    pg = box(ax, 1.0, 6.6, 5.0, 1.0, "Postgres", "store", sub="users · items · reviews (slice)")
-    qd = box(ax, 8.0, 6.6, 5.0, 1.0, "Qdrant", "store", sub="item ANN · persona vectors (384-d)")
+    pg = box(
+        ax, 1.0, 6.6, 5.0, 1.0,
+        "Postgres database",
+        "store",
+        sub="5,000 users, 11,397 items, 112,157 reviews",
+    )
+    qd = box(
+        ax, 8.0, 6.6, 5.0, 1.0,
+        "Qdrant vector store",
+        "store",
+        sub="11,397 item vectors, 384 dimensions",
+    )
 
     fe = box(
         ax,
@@ -152,9 +170,9 @@ def main() -> None:
         5.0,
         7.0,
         0.9,
-        "fastembed · BAAI/bge-small-en-v1.5",
+        "Open-source sentence embedder",
         "compute",
-        sub="local · no embedding API · cached in Docker volume",
+        sub="runs locally, no embedding API, cached in a Docker volume",
     )
 
     task_a = box(
@@ -163,9 +181,9 @@ def main() -> None:
         3.0,
         6.0,
         1.3,
-        "Task A · task-a-api  :8011",
+        "Task A container",
         "agent",
-        sub="ReviewSimulationAgent\nPOST /simulate-review · persona + product → {stars, text}",
+        sub="Review Simulation Agent\npersona and product, returns rating and review",
         fontsize=10,
     )
     task_b = box(
@@ -174,9 +192,9 @@ def main() -> None:
         3.0,
         6.0,
         1.3,
-        "Task B · task-b-api  :8012",
+        "Task B container",
         "agent",
-        sub="RecommendationAgent\nPOST /recommend · warm · cold · multi-turn · cross-domain",
+        sub="Recommendation Agent\nwarm, cold, multi-turn, cross-domain",
         fontsize=10,
     )
 
@@ -186,7 +204,7 @@ def main() -> None:
         1.85,
         6.0,
         0.65,
-        "tools: fetch_user_profile · fetch_item",
+        "Tools: user profile lookup, item details lookup",
         "client",
         fontsize=9,
     )
@@ -196,7 +214,7 @@ def main() -> None:
         1.85,
         6.0,
         0.65,
-        "tools: fetch_user_history · fetch_item · ann_search_items",
+        "Tools: user history, item details, similarity retrieval",
         "client",
         fontsize=9,
     )
@@ -207,9 +225,9 @@ def main() -> None:
         0.5,
         9.2,
         0.95,
-        "Entivia BaseAgent — ReAct loop · JSON validation · tool calling",
+        "Entivia agent runtime",
         "llm",
-        sub="Anthropic Claude (primary)   ⟷   Groq (automatic fallback)",
+        sub="ReAct loop, JSON validation, tool calling.   Anthropic Claude primary, Groq automatic fallback.",
         fontsize=10,
     )
 
@@ -217,15 +235,35 @@ def main() -> None:
     arrow(ax, bot(good), (pg[0] + pg[2] / 2 + 0.6, pg[1] + pg[3]))
     arrow(ax, bot(good), (qd[0] + 0.8, qd[1] + qd[3]), curve=-0.15)
 
-    arrow(ax, (pg[0] + pg[2], pg[1] + pg[3] / 2 - 0.15), (fe[0], fe[1] + fe[3] / 2 + 0.15),
-          curve=-0.18, label="text")
-    arrow(ax, (fe[0] + fe[2], fe[1] + fe[3] / 2 + 0.15), (qd[0], qd[1] + qd[3] / 2 - 0.15),
-          curve=-0.18, label="vectors")
+    arrow(
+        ax,
+        (pg[0] + pg[2], pg[1] + pg[3] / 2 - 0.15),
+        (fe[0], fe[1] + fe[3] / 2 + 0.15),
+        curve=-0.18,
+        label="item text",
+    )
+    arrow(
+        ax,
+        (fe[0] + fe[2], fe[1] + fe[3] / 2 + 0.15),
+        (qd[0], qd[1] + qd[3] / 2 - 0.15),
+        curve=-0.18,
+        label="vectors",
+    )
 
-    arrow(ax, (pg[0] + 0.6, pg[1]), (task_a[0] + 1.0, task_a[1] + task_a[3]),
-          curve=-0.05, label="SQL")
-    arrow(ax, (qd[0] + qd[2] - 0.6, qd[1]), (task_b[0] + task_b[2] - 1.0, task_b[1] + task_b[3]),
-          curve=0.05, label="ANN")
+    arrow(
+        ax,
+        (pg[0] + 0.6, pg[1]),
+        (task_a[0] + 1.0, task_a[1] + task_a[3]),
+        curve=-0.05,
+        label="lookup",
+    )
+    arrow(
+        ax,
+        (qd[0] + qd[2] - 0.6, qd[1]),
+        (task_b[0] + task_b[2] - 1.0, task_b[1] + task_b[3]),
+        curve=0.05,
+        label="similarity",
+    )
 
     arrow(ax, bot(task_a), top(tools_a))
     arrow(ax, bot(task_b), top(tools_b))
@@ -266,8 +304,8 @@ def main() -> None:
         ("Storage", "store"),
         ("Embedding", "compute"),
         ("Task container", "agent"),
-        ("LLM runtime", "llm"),
-        ("Client / tool", "client"),
+        ("Agent runtime", "llm"),
+        ("Client or tool", "client"),
     ]
     lx, ly = 0.4, 9.5
     for i, (label, kind) in enumerate(legend_items):

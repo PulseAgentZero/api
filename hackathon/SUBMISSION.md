@@ -25,10 +25,19 @@
 ```bash
 cp hackathon/.env.example hackathon/.env   # HACKATHON_DATABASE_PASSWORD + ANTHROPIC_API_KEY
 make hackathon-up                   # postgres + qdrant + task-a + task-b + gateway
-HACKATHON_YELP_HOST_DIR=~/datasets/yelp make hackathon-load
+
+# Point at the Yelp Open Dataset folder containing the four
+# `yelp_academic_dataset_*.json` files. data/yelp_dataset/ also works.
+HACKATHON_YELP_HOST_DIR=$PWD/data/yelp_dataset make hackathon-load
+make hackathon-eval                 # writes hackathon/eval/data/EVAL.md
+
 open http://localhost:8011/docs     # Task A
 open http://localhost:8012/docs     # Task B
 ```
+
+Submitted run loaded a 5,000-user / 11,397-item / 112,157-review food slice
+of real Yelp (~9,447 holdout rows). Agent beats the avg-stars baseline by
+25 % on RMSE (0.913 vs 1.216); cold-start persona Hit@10 = 0.250.
 
 **Task A direct input (challenge spec):**
 

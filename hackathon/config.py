@@ -56,22 +56,29 @@ HOLDOUT_FRACTION: float = float(os.getenv("HACKATHON_HOLDOUT_FRACTION", "0.1"))
 
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
-# fastembed (Qdrant's local ONNX runner) is the default so the demo runs
-# offline and has no per-token cost. The pseudo backend is only used by
-# unit-style smoke tests.
+# Voyage is the default for parity with the Entivia production stack. The
+# fastembed backend is kept for fully offline runs; pseudo is for smoke tests.
 
-EMBEDDING_BACKEND: str = os.getenv("HACKATHON_EMBEDDING_BACKEND", "fastembed").lower()
+EMBEDDING_BACKEND: str = os.getenv("HACKATHON_EMBEDDING_BACKEND", "voyage").lower()
+VOYAGE_MODEL: str = os.getenv("HACKATHON_VOYAGE_MODEL", "voyage-4-large")
 FASTEMBED_MODEL: str = os.getenv("HACKATHON_FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
 USE_PSEUDO_EMBEDDINGS: bool = _env_bool("HACKATHON_USE_PSEUDO_EMBEDDINGS", False)
 
+_VOYAGE_DIMS: dict[str, int] = {
+    "voyage-4-large": 1024,
+    "voyage-4": 1024,
+    "voyage-3.5": 1024,
+    "voyage-3.5-lite": 1024,
+}
 _FASTEMBED_DIMS: dict[str, int] = {
     "BAAI/bge-small-en-v1.5": 384,
     "BAAI/bge-base-en-v1.5": 768,
 }
-VECTOR_SIZE: int = _env_int(
-    "HACKATHON_VECTOR_SIZE",
-    _FASTEMBED_DIMS.get(FASTEMBED_MODEL, 384),
-)
+if EMBEDDING_BACKEND == "voyage":
+    _DEFAULT_DIM = _VOYAGE_DIMS.get(VOYAGE_MODEL, 1024)
+else:
+    _DEFAULT_DIM = _FASTEMBED_DIMS.get(FASTEMBED_MODEL, 384)
+VECTOR_SIZE: int = _env_int("HACKATHON_VECTOR_SIZE", _DEFAULT_DIM)
 
 
 # ── Loader behaviour ──────────────────────────────────────────────────────────

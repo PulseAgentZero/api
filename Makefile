@@ -132,20 +132,24 @@ hackathon-eval:
 	docker compose -f hackathon/docker-compose.yml run --rm hackathon-api \
 		python -m hackathon.eval.run --task-a-sample 30 --task-b-users 30
 
+# Use xelatex + system Unicode fonts so symbols (≥, ↑, ↓, ★, ≈) and the
+# box-drawing characters in the inline ASCII diagrams render correctly.
+# Helvetica/Menlo/DejaVu Sans are present on macOS and most Linux distros.
+HACKATHON_PDF_FONTS = \
+	-V mainfont="Times New Roman" \
+	-V monofont="Menlo"
+
 hackathon-paper-a-pdf:
 	@command -v pandoc >/dev/null || (echo "Install pandoc to export PDF" && exit 1)
 	pandoc hackathon/paper/task_a_review_simulation.md -o hackathon/paper/task_a_review_simulation.pdf \
-		--pdf-engine=pdflatex -V geometry:margin=1in
+		--pdf-engine=xelatex --resource-path=hackathon/paper -V geometry:margin=1in $(HACKATHON_PDF_FONTS)
 
 hackathon-paper-b-pdf:
 	@command -v pandoc >/dev/null || (echo "Install pandoc to export PDF" && exit 1)
 	pandoc hackathon/paper/task_b_recommendation.md -o hackathon/paper/task_b_recommendation.pdf \
-		--pdf-engine=pdflatex -V geometry:margin=1in
+		--pdf-engine=xelatex --resource-path=hackathon/paper -V geometry:margin=1in $(HACKATHON_PDF_FONTS)
 
 hackathon-paper-pdf: hackathon-paper-a-pdf hackathon-paper-b-pdf
-	@command -v pandoc >/dev/null || (echo "Install pandoc to export PDF" && exit 1)
-	pandoc hackathon/paper/solution_paper.md -o hackathon/paper/solution_paper.pdf \
-		--pdf-engine=pdflatex -V geometry:margin=1in
 
 .PHONY: build-self-hosted build-cloud build-license build \
         push-self-hosted push-cloud push-license push \
