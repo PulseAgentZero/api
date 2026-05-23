@@ -11,7 +11,7 @@ from app.infrastructure.database.repositories.organization_repository import (
 )
 
 _INSTANCE_ORG_MESSAGE = (
-    "This Pulse instance already has an organization. "
+    "This Entivia instance already has an organization. "
     "Sign in with your existing account or ask an admin for an invite."
 )
 

@@ -1,4 +1,4 @@
-"""Pulse Studio — SQL execution service.
+"""Entivia Studio — SQL execution service.
 
 Security:
 - _is_select_only: keyword blocklist rejects non-SELECT statements fast
@@ -74,9 +74,26 @@ def _is_select_only(sql: str) -> bool:
     return True
 
 
-def _inject_limit(sql: str, max_rows: int) -> str:
-    """Ensure sql has a LIMIT no greater than max_rows."""
+def _inject_limit(sql: str, max_rows: int, *, dialect: str | None = None) -> str:
+    """Ensure sql caps rows at max_rows (dialect-aware)."""
     sql = sql.rstrip().rstrip(";")
+    d = (dialect or "postgresql").lower()
+
+    if d in ("mssql", "sqlserver"):
+        top_match = re.search(r"\bTOP\s*\(\s*(\d+)\s*\)", sql, re.IGNORECASE)
+        if top_match:
+            n = int(top_match.group(1))
+            if n > max_rows:
+                sql = re.sub(
+                    r"\bTOP\s*\(\s*\d+\s*\)",
+                    f"TOP ({max_rows})",
+                    sql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            return sql
+        return f"SELECT TOP ({max_rows}) * FROM ({sql}) AS _pulse_sub"
+
     existing = re.search(r"\bLIMIT\s+(\d+)", sql, re.IGNORECASE)
     if existing:
         n = int(existing.group(1))
@@ -242,12 +259,22 @@ async def execute_studio_query(
     if not _is_select_only(sql_text):
         raise bad_request(
             "INVALID_SQL",
-            "Only SELECT statements are permitted in Pulse Studio. "
+            "Only SELECT statements are permitted in Entivia Studio. "
             "INSERT, UPDATE, DELETE, DROP and similar operations are blocked.",
         )
 
+    dialect = "postgresql"
+    try:
+        from app.services.studio_file_source_service import get_connection_for_studio
+
+        conn_for_dialect = await get_connection_for_studio(db, org_id, connection_id)
+        if conn_for_dialect is not None:
+            dialect = conn_for_dialect.connector_type or dialect
+    except Exception:
+        pass
+
     # Apply LIMIT cap on the template before param substitution
-    limited_sql = _inject_limit(sql_text.strip(), _MAX_ROWS)
+    limited_sql = _inject_limit(sql_text.strip(), _MAX_ROWS, dialect=dialect)
 
     # Resolve parameters: {{name}} → :name  +  bound values dict
     bound_values: dict[str, Any] = {}

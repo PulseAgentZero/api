@@ -1774,7 +1774,7 @@ async def _conversational_reply(
     """Tool-free reply for greeting / help / off_topic / unknown.
 
     Pulls org context (name, entity_label, goal_label) so the reply is grounded
-    in the org's vocabulary instead of generic Pulse boilerplate.
+    in the org's vocabulary instead of generic Entivia boilerplate.
     """
     if intent_name == "help" and _is_data_access_question(user_message):
         intent_name = "data_access"
@@ -1853,7 +1853,7 @@ def _conversational_reply_template(intent_name: str, state: dict) -> str:
 
     if intent_name == "dashboard_discovery":
         return sanitize_pulse_reply(
-            f"Yes, I can build Pulse Studio dashboards from {org_name}'s live data. "
+            f"Yes, I can build Entivia Studio dashboards from {org_name}'s live data. "
             f"Before I create one, what decision are you trying to support, which metrics "
             f"or breakdowns matter, and any timeframe? Dashboards start private. "
             f"For example: \"build a dashboard showing churn by region for the last 90 days.\""

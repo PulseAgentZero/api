@@ -316,12 +316,26 @@ async def send_org_delete_confirm_email(
 
 
 async def send_license_key_email(to: str, license_key: str, expires_at: str | None = None) -> None:
-    activate_docs_url = f"{settings.FRONTEND_URL.rstrip('/')}/docs/license-activation"
+    base = settings.MARKETING_URL.rstrip("/")
+    activate_docs_url = f"{base}/docs/license-activation"
+    portal_url = f"{base}/pricing/self-hosted/portal"
     html = _render(
         "license_purchase_success.html",
         subject="Your Entivia license key is ready",
         license_key=license_key,
         expires_at=expires_at,
         activate_docs_url=activate_docs_url,
+        portal_url=portal_url,
     )
     await _send(to=to, subject="Your Entivia self-hosted license key", html=html)
+
+
+async def send_license_portal_link_email(to: str, link: str, ip: str | None = None) -> None:
+    html = _render(
+        "license_portal_link.html",
+        subject="Sign in to your Entivia license portal",
+        to=to,
+        link=link,
+        ip=ip,
+    )
+    await _send(to=to, subject="Sign in to your Entivia license portal", html=html)

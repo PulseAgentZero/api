@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from app.services.license_remote import post_validate_license
 from app.services.self_hosted_license import resolve_self_hosted_entitlements
 
 router = APIRouter(prefix="/license", tags=["License"])
+logger = logging.getLogger(__name__)
 
 
 async def _active_seat_count(db: AsyncSession, org_id: UUID) -> int:
@@ -42,6 +44,91 @@ def _cloud_404() -> None:
         raise not_found("Not found")
 
 
+def _normalize_license_key_input(raw: str) -> str:
+    """Trim accidental whitespace introduced by copy/paste or email wrapping."""
+    return "".join((raw or "").split())
+
+
+async def _maybe_bootstrap_env_license(
+    db: AsyncSession,
+    *,
+    org_id: UUID,
+    user_id: UUID,
+) -> tuple[LicenseKey | None, str | None]:
+    """Activate ``ENTIVIA_LICENSE_KEY`` from env on first read if no license is stored.
+
+    Returns ``(license_row, error_message)``. Both ``None`` means no env key
+    was configured. A non-``None`` ``error_message`` means the env key failed
+    validation (logged, surfaced to UI as ``env_provision_error``) but does
+    not raise — the dashboard still loads.
+    """
+    env_key = _normalize_license_key_input(settings.ENTIVIA_LICENSE_KEY or "")
+    if not env_key:
+        return None, None
+
+    existing = await db.execute(select(LicenseKey).where(LicenseKey.org_id == org_id))
+    if existing.scalar_one_or_none() is not None:
+        return None, None
+
+    if settings.PULSE_LICENSE_PUBLIC_KEY:
+        try:
+            decode_license_jwt_payload(env_key)
+        except (jwt.PyJWTError, ValueError) as exc:
+            logger.warning(
+                "ENTIVIA_LICENSE_KEY offline signature check failed; trying license server: %s",
+                exc,
+            )
+
+    code, data, err = await post_validate_license(env_key, org_id)
+    if code == 0 or code >= 400 or not isinstance(data, dict) or data.get("valid") is False:
+        reason = (data or {}).get("reason") if isinstance(data, dict) else err
+        logger.warning(
+            "ENTIVIA_LICENSE_KEY env auto-activation failed for org %s: %s", org_id, reason
+        )
+        return None, f"ENTIVIA_LICENSE_KEY could not be activated: {reason or 'unreachable'}"
+
+    now = datetime.now(timezone.utc)
+    expires_at = data.get("expires_at")
+    exp_dt: datetime | None = None
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            exp_dt = None
+    row = LicenseKey(
+        org_id=org_id,
+        license_key=env_key,
+        plan=str(data.get("plan") or "pro"),
+        features=list(data.get("features") or []),
+        limits=data.get("limits") if isinstance(data.get("limits"), dict) else {},
+        seat_limit=data.get("seat_limit"),
+        expires_at=exp_dt,
+        last_validated_at=now,
+        validation_cached_until=now + timedelta(days=settings.LICENSE_OFFLINE_GRACE_DAYS),
+        is_active=True,
+    )
+    db.add(row)
+
+    org = await db.get(Organization, org_id)
+    if org:
+        org.plan = str(data.get("plan") or "pro")
+
+    from app.infrastructure.audit import log_audit
+
+    await log_audit(
+        db,
+        org_id=org_id,
+        user_id=user_id,
+        action="license.activated",
+        resource="license_key",
+        resource_id=row.id,
+        metadata={"plan": str(data.get("plan") or "pro"), "source": "env"},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return row, None
+
+
 @router.get("")
 async def get_license(
     current_user: User = Depends(require_role("admin")),
@@ -51,27 +138,49 @@ async def get_license(
 
     Return the current license status for this org: plan, active features, seat usage,
     expiry date, and whether the instance is locked. No license → `plan: "free"`, `is_valid: false`.
+
+    When ``ENTIVIA_LICENSE_KEY`` is set in the instance environment and no license
+    is stored locally, the key is auto-activated on this call so admins do not
+    need to paste it into the dashboard manually.
     """
     _cloud_404()
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
+    env_error: str | None = None
+    if row is None:
+        row, env_error = await _maybe_bootstrap_env_license(
+            db, org_id=current_user.org_id, user_id=current_user.id
+        )
+
+    env_provisioned = bool(
+        settings.ENTIVIA_LICENSE_KEY
+        and row is not None
+        and row.license_key == settings.ENTIVIA_LICENSE_KEY
+    )
+
     ent = await resolve_self_hosted_entitlements(db, current_user.org_id)
     seat_used = await _active_seat_count(db, current_user.org_id)
     if row is None:
         return {
             "plan": "free",
             "features": [],
+            "limits": {},
+            "effective_limits": {},
             "is_valid": False,
             "locked": False,
             "lock_reason": None,
             "validation_cached_until": None,
             "seat_used": seat_used,
+            "env_provisioned": False,
+            "env_provision_error": env_error,
         }
     return {
         "plan": row.plan,
         "features": list(row.features or []),
+        "limits": ent.limits,
         "effective_plan": ent.plan,
         "effective_features": ent.features,
+        "effective_limits": ent.limits,
         "seat_limit": row.seat_limit,
         "seat_used": seat_used,
         "expires_at": row.expires_at.isoformat() if row.expires_at else None,
@@ -83,6 +192,8 @@ async def get_license(
         "is_valid": row.is_active and not ent.locked,
         "locked": ent.locked,
         "lock_reason": ent.lock_reason,
+        "env_provisioned": env_provisioned,
+        "env_provision_error": None,
     }
 
 
@@ -99,11 +210,13 @@ def _apply_server_payload(
 ) -> None:
     plan = data.get("plan", "pro")
     features = data.get("features", [])
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
     seat_limit = data.get("seat_limit")
     expires_at = data.get("expires_at")
     row.license_key = license_key
     row.plan = str(plan or "pro")
     row.features = list(features or [])
+    row.limits = limits
     row.seat_limit = seat_limit
     if expires_at:
         try:
@@ -125,7 +238,7 @@ async def activate_license(
 ) -> dict:
     """**Self-hosted only.** Returns 404 on cloud deployments.
 
-    Activate or replace the license key for this self-hosted instance. Contacts the Pulse
+    Activate or replace the license key for this self-hosted instance. Contacts the Entivia
     license server to validate the key, then stores plan, features, seat limit, and expiry
     locally. Sets a validation cache window (default 7 days) so the instance stays functional
     if the license server is temporarily unreachable. Returns 422 on invalid or expired keys.
@@ -133,29 +246,35 @@ async def activate_license(
     _cloud_404()
     if settings.PULSE_LICENSE_PUBLIC_KEY:
         try:
-            decode_license_jwt_payload(body.license_key)
-        except (jwt.PyJWTError, ValueError):
-            raise bad_request("INVALID_LICENSE_SIGNATURE", "License key signature could not be verified")
+            decode_license_jwt_payload(_normalize_license_key_input(body.license_key))
+        except (jwt.PyJWTError, ValueError) as exc:
+            logger.warning(
+                "Offline license signature check failed for org %s; trying license server: %s",
+                current_user.org_id,
+                exc,
+            )
 
-    code, data, err = await post_validate_license(body.license_key, current_user.org_id)
+    license_key = _normalize_license_key_input(body.license_key)
+    code, data, err = await post_validate_license(license_key, current_user.org_id)
     if code == 0:
-        raise bad_request("LICENSE_SERVER_UNREACHABLE", err or "Cannot reach Pulse license server")
+        raise bad_request("LICENSE_SERVER_UNREACHABLE", err or "Cannot reach Entivia license server")
     if code >= 400 or not data:
         msg = "Invalid license key"
         if isinstance(data, dict):
             msg = (data.get("message") or data.get("reason") or data.get("detail") or msg)
         elif err:
             msg = err
-        raise bad_request("BAD_REQUEST", "Invalid license key")
+        raise bad_request("INVALID_LICENSE", msg)
     if data.get("valid") is False:
         reason = str(data.get("reason") or "License is not valid")
-        code = str(data.get("code") or "INVALID_LICENSE")
-        if code == "LICENSE_ALREADY_ACTIVATED":
-            raise bad_request("LICENSE_ALREADY_ACTIVATED", reason)
-        raise bad_request(code if code != "INVALID_LICENSE" else "INVALID_LICENSE", reason)
+        err_code = str(data.get("code") or "INVALID_LICENSE")
+        # Forward the precise upstream code so the frontend can render a tailored
+        # message (e.g. "already activated", "revoked", "expired").
+        raise bad_request(err_code, reason)
 
     plan = data.get("plan", "pro")
     features = data.get("features", [])
+    limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
     seat_limit = data.get("seat_limit")
     expires_at = data.get("expires_at")
     now = datetime.now(timezone.utc)
@@ -163,7 +282,7 @@ async def activate_license(
     r = await db.execute(select(LicenseKey).where(LicenseKey.org_id == current_user.org_id))
     row = r.scalar_one_or_none()
     if row:
-        _apply_server_payload(row, body.license_key, data, now=now)
+        _apply_server_payload(row, license_key, data, now=now)
     else:
         exp_dt = None
         if expires_at:
@@ -173,9 +292,10 @@ async def activate_license(
                 exp_dt = None
         row = LicenseKey(
             org_id=current_user.org_id,
-            license_key=body.license_key,
+            license_key=license_key,
             plan=str(plan or "pro"),
             features=list(features or []),
+            limits=limits,
             seat_limit=seat_limit,
             expires_at=exp_dt,
             last_validated_at=now,
@@ -202,6 +322,7 @@ async def activate_license(
     return {
         "plan": plan,
         "features": list(features or []),
+        "limits": limits,
         "seat_limit": seat_limit,
         "expires_at": expires_at,
         "validation_cached_until": row.validation_cached_until.isoformat()
@@ -218,7 +339,7 @@ async def refresh_license(
 ) -> dict:
     """**Self-hosted only.** Returns 404 on cloud deployments.
 
-    Re-validate the stored license key against the Pulse license server and refresh the
+    Re-validate the stored license key against the Entivia license server and refresh the
     local cache. Call this manually if the instance was offline during the normal validation
     window and is now showing as locked.
     """

@@ -17,13 +17,18 @@
 <p style="font-size:14px;color:#4b5563;">
   This license is valid until <strong>{{ expires_at }}</strong>.
 </p>
+{% else %}
+<p style="font-size:14px;color:#4b5563;">
+  This license is valid for life.
+</p>
 {% endif %}
 
 <a href="{{ activate_docs_url }}" class="btn">How to Activate</a>
 
 <hr class="divider" />
 <p class="fallback">
-  Keep this key safe — it is tied to your purchase. If you lose it, contact
-  support to retrieve it. Do not share it publicly.
+  Keep this key safe — it is tied to your purchase. If you lose it, open the
+  <a href="{{ portal_url }}">license customer portal</a> and we will email you
+  a fresh copy. Do not share it publicly.
 </p>
 {% endblock %}

@@ -10,10 +10,20 @@ from dotenv import load_dotenv
 _project_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_project_root / ".env")
 
-DEFAULT_SELF_HOSTED_FEATURES = ("audit_log", "sso", "white_label", "priority_support")
+DEFAULT_SELF_HOSTED_FEATURES = (
+    "audit_log",
+    "sso",
+    "white_label",
+    "priority_support",
+    "log_streaming",
+    "ldap_sync",
+    "high_concurrency",
+)
 DEFAULT_PLAN = "pro"
 DEFAULT_SEAT_LIMIT: int | None = None
-LICENSE_VALIDITY_DAYS = int(os.getenv("LICENSE_VALIDITY_DAYS", "365"))
+DEFAULT_LICENSE_LIMITS: dict[str, int] = {"concurrent_pipeline_runs": 5}
+# 0 or a negative value means lifetime / no expiry.
+LICENSE_VALIDITY_DAYS = int(os.getenv("LICENSE_VALIDITY_DAYS", "0"))
 
 
 def get_database_url() -> str:
@@ -38,4 +48,4 @@ def get_api_key() -> str | None:
 
 
 def get_jwt_issuer() -> str:
-    return (os.getenv("LICENSE_JWT_ISSUER") or "https://license.pulseai.io").strip()
+    return (os.getenv("LICENSE_JWT_ISSUER") or "https://license.entivia.online").strip()

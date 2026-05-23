@@ -1,4 +1,4 @@
-"""Pulse Studio — Pydantic request/response schemas."""
+"""Entivia Studio — Pydantic request/response schemas."""
 
 from __future__ import annotations
 
@@ -156,6 +156,23 @@ class StudioQueryUpdateRequest(BaseModel):
 class StudioGenerateSQLRequest(BaseModel):
     goal: str = Field(..., min_length=1, max_length=2000)
     connection_id: UUID | None = None
+    time_window: str | None = Field(None, max_length=500)
+    segments: str | None = Field(None, max_length=500)
+    filters_to_parameterize: str | None = Field(None, max_length=1000)
+    extra_context: str | None = Field(None, max_length=2000)
+
+
+class StudioGenerateSQLIntakeRequest(BaseModel):
+    goal: str = Field(..., min_length=1, max_length=2000)
+    connection_id: UUID | None = None
+
+
+class StudioGenerateSQLIntakeResponse(BaseModel):
+    goal: str
+    connections: list[dict[str, Any]]
+    default_connection_id: str | None
+    schema_preview: str
+    questions: list[dict[str, Any]]
 
 
 # ── Visualization request schemas ─────────────────────────────────────────────

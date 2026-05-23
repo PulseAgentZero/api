@@ -27,7 +27,8 @@ GROQ_MODEL_FAST = "llama-3.1-8b-instant"  # low-latency/simple tasks
 # Written at Docker image build time (docker/images/pulse/Dockerfile). When present,
 # deployment_mode and license URLs are taken from this file only — not .env or compose.
 PULSE_BUILD_CONFIG_PATH = Path("/etc/pulse/build-config.json")
-_DEFAULT_LICENSE_SERVER_URL = "https://license.pulseai.io"
+_DEFAULT_LICENSE_SERVER_URL = "https://license.entivia.online"
+_DEFAULT_MARKETING_URL = "https://entivia.online"
 
 
 @lru_cache(maxsize=1)
@@ -76,6 +77,13 @@ def _resolve_license_public_key() -> Optional[str]:
         return raw or None
     raw = os.getenv("PULSE_LICENSE_PUBLIC_KEY", "").strip()
     return raw or None
+
+
+def _resolve_marketing_url() -> str:
+    baked = _pulse_build_config().get("marketing_url")
+    if baked:
+        return str(baked).rstrip("/")
+    return os.getenv("MARKETING_URL", _DEFAULT_MARKETING_URL).rstrip("/")
 
 VOYAGE_EMBEDDING_MODEL = "voyage-4-large"
 VOYAGE_EMBEDDING_DIMENSION = 1024
@@ -213,11 +221,20 @@ class Settings:
     AGENT_SERVICE_URL: Optional[str] = os.getenv("AGENT_SERVICE_URL", "").strip() or None
     LICENSE_SERVER_URL: str = _resolve_license_server_url()
     LICENSE_SERVER_API_KEY: Optional[str] = os.getenv("LICENSE_SERVER_API_KEY", "").strip() or None
+    MARKETING_URL: str = _resolve_marketing_url()
     # RSA PEM for offline plc_* JWT verification — baked into self-hosted image or .env override
     PULSE_LICENSE_PUBLIC_KEY: Optional[str] = _resolve_license_public_key()
     LICENSE_JWT_ISSUER: Optional[str] = _resolve_license_jwt_issuer()
     LICENSE_OFFLINE_GRACE_DAYS: int = int(os.getenv("LICENSE_OFFLINE_GRACE_DAYS", "7"))
     LICENSE_REVALIDATION_INTERVAL_HOURS: int = int(os.getenv("LICENSE_REVALIDATION_INTERVAL_HOURS", "24"))
+    # Self-hosted only: when set, the instance auto-activates this plc_… key on
+    # first GET /license call by the admin. Lets ops teams ship a pre-activated
+    # instance from a Docker .env without ever opening the dashboard manually.
+    # PULSE_LICENSE_KEY is accepted as a backward-compatible alias.
+    ENTIVIA_LICENSE_KEY: Optional[str] = (
+        (os.getenv("ENTIVIA_LICENSE_KEY") or os.getenv("PULSE_LICENSE_KEY") or "").strip()
+        or None
+    )
 
     # ------------------------------------------------------------------
     # Qdrant (vector search for entity retrieval)
@@ -310,9 +327,13 @@ class Settings:
     # Semantic intent detection (fast classifier ahead of ReAct loop)
     CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"
     CHAT_INTENT_FASTPATH_CONFIDENCE: float = float(os.getenv("CHAT_INTENT_FASTPATH_CONFIDENCE", "0.85"))
-
-    # Dashboard builder: allow add_chart/replace_chart.
-    DASHBOARD_ITERATION_ALLOW_NEW_SQL: bool = os.getenv("DASHBOARD_ITERATION_ALLOW_NEW_SQL", "true").lower() == "true"
+    CHAT_DASHBOARD_INTAKE_ENABLED: bool = (
+        os.getenv("CHAT_DASHBOARD_INTAKE_ENABLED", "true").lower() == "true"
+    )
+    # Dashboard builder: allow add_chart/replace_chart (new SQL) during iteration.
+    DASHBOARD_ITERATION_ALLOW_NEW_SQL: bool = (
+        os.getenv("DASHBOARD_ITERATION_ALLOW_NEW_SQL", "true").lower() == "true"
+    )
 
     # ------------------------------------------------------------------
     # Groq API (LLM)
@@ -364,6 +385,7 @@ class Settings:
         "K_k8N_IyoXaDyql8ijHUmO9KA6FyuAqP7guglrC0Pns=",
     )
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    CORS_ALLOWED_ORIGINS: str = os.getenv("CORS_ALLOWED_ORIGINS", "")
     OAUTH_REDIRECT_ALLOWLIST: str = os.getenv("OAUTH_REDIRECT_ALLOWLIST", "")
     PASSWORD_MIN_LENGTH: int = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
     PASSWORD_HASH_ITERATIONS: int = int(
@@ -422,7 +444,7 @@ class Settings:
     # Email (Resend)
     # ------------------------------------------------------------------
     RESEND_API_KEY: Optional[str] = os.getenv("RESEND_API_KEY")
-    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@flowpilot.club")
+    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@entivia.online")
     ACCEPT_INVITE_PATH: str = os.getenv("ACCEPT_INVITE_PATH", "/accept-invite")
 
     @classmethod
@@ -459,7 +481,7 @@ class Settings:
     # AWS_SECRET_ACCESS_KEY or the instance IAM role (see .env.example).
     # ------------------------------------------------------------------
     ASSETS_S3_BUCKET: Optional[str] = os.getenv("ASSETS_S3_BUCKET")
-    ASSETS_S3_PREFIX: str = os.getenv("ASSETS_S3_PREFIX", "pulse/assets")
+    ASSETS_S3_PREFIX: str = os.getenv("ASSETS_S3_PREFIX", "entivia/assets")
     ASSETS_PUBLIC_BASE_URL: Optional[str] = os.getenv("ASSETS_PUBLIC_BASE_URL")
     AWS_REGION: Optional[str] = os.getenv("AWS_REGION")
 

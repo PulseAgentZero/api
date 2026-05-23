@@ -1,4 +1,4 @@
-"""Pulse Studio — AI-powered query generation and visualization recommendation."""
+"""Entivia Studio — AI-powered query generation and visualization recommendation."""
 
 from __future__ import annotations
 
@@ -130,11 +130,115 @@ async def _introspect_schema(
         raise bad_request("CLIENT_DB_ERROR", str(exc)) from exc
 
 
+async def _schema_with_dialect(
+    db: AsyncSession, org_id: UUID, connection_id: UUID | None,
+) -> tuple[str, str]:
+    """Return (dialect, schema_context string)."""
+    from app.services.studio_file_source_service import get_connection_for_studio
+
+    conn_row = await get_connection_for_studio(db, org_id, connection_id)
+    from app.services.dashboard_builder_service import _normalize_dialect
+
+    dialect = _normalize_dialect(conn_row.connector_type if conn_row else None)
+    schema_context = await _introspect_schema(db, org_id, connection_id)
+    return dialect, schema_context
+
+
+def _sql_generate_questions(
+    connections: list[dict[str, Any]],
+    goal: str,
+) -> list[dict[str, Any]]:
+    questions: list[dict[str, Any]] = [
+        {
+            "id": "output_shape",
+            "question": "What should the result look like? (single KPI number, trend over time, ranked list, breakdown by category)",
+            "required": True,
+        },
+        {
+            "id": "time_window",
+            "question": "What time range should the query default to?",
+            "required": False,
+        },
+        {
+            "id": "filters_to_parameterize",
+            "question": "Which values should be filterable via dashboard parameters? (dates, region, status, etc.)",
+            "required": False,
+        },
+    ]
+    if len(connections) > 1:
+        questions.insert(
+            0,
+            {
+                "id": "connection_id",
+                "question": "Which data connection should this query use?",
+                "required": True,
+                "type": "choice",
+                "options": [
+                    {"value": c["id"], "label": f"{c['name']} ({c['dialect']})"}
+                    for c in connections
+                ],
+            },
+        )
+    if goal:
+        questions.append({
+            "id": "refine_goal",
+            "question": f"Your goal was: \"{goal[:200]}\". Anything to add or narrow down?",
+            "required": False,
+        })
+    return questions
+
+
+async def generate_sql_intake(
+    db: AsyncSession,
+    org_id: UUID,
+    goal: str,
+    connection_id: UUID | None = None,
+) -> dict[str, Any]:
+    """Clarifying questions and connection list before SQL generation."""
+    from app.infrastructure.database.repositories.connection_repository import ConnectionRepository
+
+    conns = await ConnectionRepository(db).list_by_org(org_id)
+    connections = [
+        {
+            "id": str(c.id),
+            "name": c.name,
+            "dialect": c.connector_type or "postgresql",
+            "status": c.status,
+        }
+        for c in conns
+        if c.deleted_at is None
+    ]
+    default_id = str(connection_id) if connection_id else (
+        connections[0]["id"] if connections else None
+    )
+    schema_preview = ""
+    if default_id:
+        try:
+            schema_preview = await _introspect_schema(
+                db, org_id, UUID(default_id),
+            )
+        except Exception as exc:
+            logger.warning("[studio_ai] intake schema preview: %s", exc)
+
+    return {
+        "goal": goal,
+        "connections": connections,
+        "default_connection_id": default_id,
+        "schema_preview": (schema_preview or "")[:4000],
+        "questions": _sql_generate_questions(connections, goal),
+    }
+
+
 async def generate_sql_from_goal(
     db: AsyncSession,
     org_id: UUID,
     goal: str,
     connection_id: UUID | None,
+    *,
+    time_window: str | None = None,
+    segments: str | None = None,
+    filters_to_parameterize: str | None = None,
+    extra_context: str | None = None,
 ) -> dict[str, Any]:
     """Generate a SELECT query from a natural language goal.
 
@@ -143,20 +247,37 @@ async def generate_sql_from_goal(
     """
     from app.services.studio_query_service import _is_select_only
 
-    schema_context = await _introspect_schema(db, org_id, connection_id)
+    dialect, schema_context = await _schema_with_dialect(db, org_id, connection_id)
     if not schema_context:
         raise bad_request("NO_SCHEMA", "No tables found in the connected database")
 
     llm = _get_llm()
+    param_rules = (
+        "Use {{param_name}} for every user-configurable filter. "
+        "Return a params entry for each placeholder."
+    )
+    if time_window or segments or filters_to_parameterize:
+        param_rules += " This is mandatory for the provided time/segment/filter context."
+
     system = (
         "You are a SQL expert. Given a database schema and a goal, return a JSON object with:\n"
-        '  "sql": a single SELECT statement. Use {{param_name}} for any user-configurable values.\n'
+        f'  "sql": a single SELECT using {dialect} syntax (not other dialects).\n'
+        f'  {param_rules}\n'
         '  "explanation": 1-2 sentences in plain English describing what the query does.\n'
         '  "params": array of {name, type, default_value, label} for each {{placeholder}}.\n'
         "   types are: text, number, date, datetime.\n"
         "Output ONLY valid JSON. No markdown."
     )
-    user_msg = f"Schema:\n{schema_context}\n\nGoal: {goal}"
+    context_parts = [f"Dialect: {dialect}", f"Schema:\n{schema_context}", f"Goal: {goal}"]
+    if time_window:
+        context_parts.append(f"Time window: {time_window}")
+    if segments:
+        context_parts.append(f"Segmentation: {segments}")
+    if filters_to_parameterize:
+        context_parts.append(f"Parameterize filters: {filters_to_parameterize}")
+    if extra_context:
+        context_parts.append(f"Additional context: {extra_context}")
+    user_msg = "\n\n".join(context_parts)
 
     raw = await llm.complete(system, user_msg, max_tokens=1500, temperature=0.1)
     try:

@@ -3,8 +3,10 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -30,6 +32,60 @@ from app.services.pipeline_trigger import claim_and_trigger_pipeline, serialize_
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
 
+_WINDOWS_TIMEZONE_ALIASES = {
+    "utc": "UTC",
+    "gmt": "UTC",
+    "z": "UTC",
+    "coordinated universal time": "UTC",
+    "w. central africa standard time": "Africa/Lagos",
+    "west central africa standard time": "Africa/Lagos",
+    "west africa standard time": "Africa/Lagos",
+}
+
+
+def _resolve_schedule_timezone(value: str | None) -> tuple[str, ZoneInfo]:
+    """Return a canonical IANA timezone name and ZoneInfo object.
+
+    The API stores IANA names, but dashboard widgets and browsers can send
+    friendlier labels such as "UTC+1" or "West Africa Standard Time".
+    """
+    raw = (value or "UTC").strip()
+    if not raw:
+        raw = "UTC"
+
+    try:
+        return raw, ZoneInfo(raw)
+    except Exception:
+        pass
+
+    normalized = re.sub(r"\s+", " ", raw).strip().lower()
+    alias = _WINDOWS_TIMEZONE_ALIASES.get(normalized)
+    if alias:
+        return alias, ZoneInfo(alias)
+
+    # Common UI labels sometimes include the IANA value in prose.
+    iana_match = re.search(r"\b[A-Za-z_]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?\b", raw)
+    if iana_match:
+        candidate = iana_match.group(0)
+        try:
+            return candidate, ZoneInfo(candidate)
+        except Exception:
+            pass
+
+    # Accept fixed whole-hour offsets like UTC+1, UTC+01:00, GMT-5.
+    # POSIX "Etc/GMT" signs are intentionally reversed by the tz database.
+    offset_match = re.search(r"\b(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?\b", raw, re.I)
+    if offset_match:
+        sign, hours_raw, minutes_raw = offset_match.groups()
+        hours = int(hours_raw)
+        minutes = int(minutes_raw or "0")
+        if 0 <= hours <= 14 and minutes == 0:
+            etc_sign = "-" if sign == "+" else "+"
+            candidate = f"Etc/GMT{etc_sign}{hours}" if hours else "UTC"
+            return candidate, ZoneInfo(candidate)
+
+    raise ValueError("Invalid timezone")
+
 
 class TriggerBody(BaseModel):
     mapping_id: UUID | None = None
@@ -40,6 +96,12 @@ class ScheduleBody(BaseModel):
     timezone: str = "UTC"
     is_active: bool = True
     mapping_id: UUID | None = None
+
+
+class SchedulePreviewBody(BaseModel):
+    cron_expression: str = Field(..., description="5-field crontab expression")
+    timezone: str = "UTC"
+    count: int = Field(5, ge=1, le=20)
 
 
 async def _trigger_common(
@@ -283,6 +345,104 @@ async def get_schedule(
     }
 
 
+@router.post("/schedule/preview-next")
+async def preview_schedule_next(
+    body: SchedulePreviewBody,
+    current_user: User = Depends(require_role("admin", "manager")),
+) -> dict:
+    """Return the next N fire times for a cron expression and timezone — without persisting.
+
+    Lets the UI preview "Next 5 runs" before the user clicks Save. Returns both UTC and
+    timezone-localized ISO timestamps so the UI can show whichever is clearer.
+    """
+    try:
+        croniter(body.cron_expression)
+    except Exception:
+        raise validation_error(
+            "Invalid cron expression",
+            fields={"cron_expression": "Unparseable cron expression"},
+        )
+    try:
+        timezone_name, tz = _resolve_schedule_timezone(body.timezone)
+    except ValueError:
+        raise validation_error(
+            "Invalid timezone",
+            fields={
+                "timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos, or a UTC/GMT offset like UTC+1"
+            },
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    base = now_utc.astimezone(tz)
+    it = croniter(body.cron_expression, base)
+    next_runs = []
+    for _ in range(body.count):
+        nxt_local = it.get_next(datetime)
+        nxt_utc = nxt_local.astimezone(timezone.utc)
+        next_runs.append({
+            "utc": nxt_utc.isoformat(),
+            "local": nxt_local.isoformat(),
+        })
+
+    return {
+        "cron_expression": body.cron_expression,
+        "timezone": timezone_name,
+        "next_runs": next_runs,
+    }
+
+
+@router.get("/scheduler/status")
+async def scheduler_status(
+    current_user: User = Depends(require_role("admin", "manager")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Surface scheduler freshness, health, and invocation counters to the UI.
+
+    `healthy` is true when the most recent heartbeat is fresher than the configured
+    stale-after window (default 180s). `age_seconds` is null until the scheduler
+    process writes its first heartbeat.
+    """
+    from app.infrastructure.database.models.scheduler_heartbeat import (
+        SchedulerHeartbeat,
+    )
+    from app.services.schedulers.heartbeat import (
+        HEARTBEAT_KIND,
+        HEARTBEAT_STALE_AFTER_SECONDS,
+    )
+
+    r = await db.execute(
+        select(SchedulerHeartbeat).where(SchedulerHeartbeat.kind == HEARTBEAT_KIND).limit(1)
+    )
+    row = r.scalar_one_or_none()
+    if row is None:
+        return {
+            "kind": HEARTBEAT_KIND,
+            "last_seen_at": None,
+            "age_seconds": None,
+            "healthy": False,
+            "process_id": None,
+            "host": None,
+            "scheduled_runs_total": 0,
+            "stale_after_seconds": HEARTBEAT_STALE_AFTER_SECONDS,
+        }
+
+    now = datetime.now(timezone.utc)
+    last_seen = row.last_seen_at
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    age = (now - last_seen).total_seconds()
+    return {
+        "kind": row.kind,
+        "last_seen_at": last_seen.isoformat(),
+        "age_seconds": round(age, 1),
+        "healthy": age <= HEARTBEAT_STALE_AFTER_SECONDS,
+        "process_id": row.process_id,
+        "host": row.host,
+        "scheduled_runs_total": int(row.scheduled_runs_total or 0),
+        "stale_after_seconds": HEARTBEAT_STALE_AFTER_SECONDS,
+    }
+
+
 @router.put("/schedule")
 async def put_schedule(
     body: ScheduleBody,
@@ -302,15 +462,27 @@ async def put_schedule(
             "Invalid cron expression",
             fields={"cron_expression": "Unparseable cron expression"},
         )
+    try:
+        timezone_name, schedule_tz = _resolve_schedule_timezone(body.timezone)
+    except ValueError:
+        raise validation_error(
+            "Invalid timezone",
+            fields={
+                "timezone": "Use a valid IANA timezone, e.g. UTC or Africa/Lagos, or a UTC/GMT offset like UTC+1"
+            },
+        )
     r = await db.execute(
         select(PipelineSchedule).where(PipelineSchedule.org_id == current_user.org_id).limit(1)
     )
     row = r.scalar_one_or_none()
     now = datetime.now(timezone.utc)
-    next_at = croniter(body.cron_expression, now).get_next(datetime)
+    next_at = None
+    if body.is_active:
+        base = now.astimezone(schedule_tz)
+        next_at = croniter(body.cron_expression, base).get_next(datetime)
     if row:
         row.cron_expression = body.cron_expression
-        row.timezone = body.timezone
+        row.timezone = timezone_name
         row.is_active = body.is_active
         row.mapping_id = body.mapping_id
         row.next_run_at = next_at
@@ -318,7 +490,7 @@ async def put_schedule(
         row = PipelineSchedule(
             org_id=current_user.org_id,
             cron_expression=body.cron_expression,
-            timezone=body.timezone,
+            timezone=timezone_name,
             is_active=body.is_active,
             mapping_id=body.mapping_id,
             next_run_at=next_at,
@@ -326,6 +498,11 @@ async def put_schedule(
         db.add(row)
     await db.commit()
     await db.refresh(row)
+
+    from app.services.schedulers.pipeline_scheduler import publish_schedule_reload
+
+    await publish_schedule_reload()
+
     return {
         "id": str(row.id),
         "cron_expression": row.cron_expression,

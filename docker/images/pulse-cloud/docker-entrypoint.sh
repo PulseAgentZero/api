@@ -6,11 +6,11 @@ set -e
 if [ "$(id -u)" = "0" ]; then
   storage="${LOCAL_STORAGE_PATH:-/app/uploads}"
   mkdir -p "$storage"
-  chown -R pulse:pulse "$storage"
+  chown -R entivia:entivia "$storage"
   if [ -d /app/logs ]; then
-    chown -R pulse:pulse /app/logs
+    chown -R entivia:entivia /app/logs
   fi
-  exec gosu pulse "$0" "$@"
+  exec gosu entivia "$0" "$@"
 fi
 
 SERVICE="${1:-${PULSE_SERVICE:-api}}"

@@ -49,7 +49,7 @@ def _create_backend() -> StorageBackend:
             endpoint_url=os.getenv("MINIO_ENDPOINT_URL", "http://minio:9000"),
             access_key=os.getenv("MINIO_ACCESS_KEY", ""),
             secret_key=os.getenv("MINIO_SECRET_KEY", ""),
-            bucket=os.getenv("MINIO_BUCKET", "pulse-assets"),
+            bucket=os.getenv("MINIO_BUCKET", "entivia-assets"),
             prefix=os.getenv("ASSETS_S3_PREFIX", "assets"),
             use_ssl=os.getenv("MINIO_USE_SSL", "false").lower() == "true",
             public_base_url=os.getenv("ASSETS_PUBLIC_BASE_URL"),

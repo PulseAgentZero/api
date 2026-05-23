@@ -89,11 +89,41 @@ async def _issue_tokens(user: User, org_id: UUID) -> tuple[str, str]:
 @router.get("/instance")
 async def auth_instance_status(db: AsyncSession = Depends(get_db)) -> dict:
     """Public instance metadata (registration gates, deployment mode)."""
+    from app.api.dependencies.plan_gate import LICENSE_FEATURE_SSO
+    from app.infrastructure.database.models.sso_configuration import SsoConfiguration
+    from app.services.self_hosted_license import resolve_self_hosted_entitlements
+
     open_ = await instance_registration_open(db)
+    sso_enabled = False
+    try:
+        if settings.DEPLOYMENT_MODE == "self_hosted":
+            # On self-hosted, SSO is a Pro-licensed feature. Showing the SSO
+            # input on the login page when no org has a license that includes
+            # SSO is misleading — the sign-in flow would fail at the entitlement
+            # gate. Require both an active SSO config AND a valid license.
+            rows = await db.execute(
+                select(SsoConfiguration.org_id).where(SsoConfiguration.is_active.is_(True))
+            )
+            for (org_id,) in rows.all():
+                ent = await resolve_self_hosted_entitlements(db, org_id)
+                if ent.locked:
+                    continue
+                if ent.plan in ("pro", "enterprise") or LICENSE_FEATURE_SSO in ent.features:
+                    sso_enabled = True
+                    break
+        else:
+            sso_check = await db.execute(
+                select(SsoConfiguration.id).where(SsoConfiguration.is_active.is_(True)).limit(1)
+            )
+            sso_enabled = sso_check.first() is not None
+    except Exception:
+        sso_enabled = False
     return {
         "deployment_mode": settings.DEPLOYMENT_MODE,
         "registration_open": open_,
         "can_create_organization": open_,
+        "google_oauth_enabled": settings.is_google_oauth_configured(),
+        "sso_enabled": sso_enabled,
     }
 
 
@@ -989,9 +1019,14 @@ async def me(
             name=org.name,
             slug=org.slug,
             industry=org.industry,
+            business_context=org.business_context,
+            entity_label=org.entity_label,
+            goal_label=org.goal_label,
             plan=org.plan,
+            timezone=org.timezone,
             onboarding_done=org.onboarding_done,
             created_at=org.created_at.isoformat(),
+            updated_at=org.updated_at.isoformat() if org.updated_at else None,
             logo_url=org.logo_url,
             tour_guide=getattr(org, "tour_guide", None) or {},
             require_2fa=bool(getattr(org, "require_2fa", False)),

@@ -25,7 +25,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-app: &app
-  # image: pulseai/pulse-cloud:${IMAGE_TAG:-latest}
+  # image: chideraozigbo488/entivia-cloud:${IMAGE_TAG:-latest}
   # In development, build from source instead:
   build:
     context: ../../..
@@ -235,7 +235,7 @@ services:
 
   license:
     # Internal license validation server — not exposed publicly.
-    # Self-hosted instances reach it via public URL (e.g. https://license.pulseai.io).
+    # Self-hosted instances reach it via public URL (e.g. https://license.entivia.online).
     build:
       context: ../../..
       dockerfile: docker/images/pulse-license/Dockerfile
@@ -244,7 +244,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
       PORT: "8002"
-      LICENSE_JWT_ISSUER: ${LICENSE_JWT_ISSUER:-https://license.pulseai.io}
+      LICENSE_JWT_ISSUER: ${LICENSE_JWT_ISSUER:-https://license.entivia.online}
       LICENSE_SIGNING_PRIVATE_KEY: ${LICENSE_SIGNING_PRIVATE_KEY:-}
       LICENSE_SERVER_API_KEY: ${LICENSE_SERVER_API_KEY:-}
       PULSE_LICENSE_PUBLIC_KEY: ${PULSE_LICENSE_PUBLIC_KEY:-}
@@ -280,3 +280,4 @@ networks:
     driver: bridge
   reverse-proxy_nginx-network:
     external: true
+

@@ -2,7 +2,7 @@
 
 ## Cloud subscriptions  (deployment_mode = "cloud")
 
-Manages recurring Pro plan subscriptions for cloud-hosted Pulse workspaces.
+Manages recurring Pro plan subscriptions for cloud-hosted Entivia workspaces.
 
   1. POST /billing/initialize
        Start a Paystack checkout. Returns an `authorization_url` to redirect the
@@ -40,13 +40,13 @@ Manages recurring Pro plan subscriptions for cloud-hosted Pulse workspaces.
 ## Self-hosted license purchase  (any deployment_mode)
 
 One-time payment that delivers a signed license key by email. The buyer then
-activates the key on their self-hosted Pulse instance via POST /license/activate.
+activates the key on their self-hosted Entivia instance via POST /license/activate.
 
   7. POST /billing/self-hosted/initialize
        Starts a one-time Paystack charge. Returns `authorization_url`.
 
   8. GET  /billing/self-hosted/verify/{reference}
-       Verifies the payment, requests a signed license key from the Pulse license
+       Verifies the payment, requests a signed license key from the Entivia license
        server, and emails it to the purchaser. Falls back gracefully if the
        license server is temporarily unreachable.
 """
@@ -63,7 +63,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,12 +71,19 @@ from app.api.auth.dependencies import get_current_user
 from app.api.auth.role_deps import require_role
 
 MANAGER_PLUS = require_role("admin", "manager")
-from app.api.errors import bad_request, not_found
+from app.api.errors import bad_request, not_found, unauthorized
 from app.config.settings import settings
+from app.infrastructure.database.models.license_issuance import LicenseIssuance
 from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.user import User
 from app.infrastructure.database.session import get_db
+from app.infrastructure.redis.client import get_redis
+from app.infrastructure.redis.rate_limit import (
+    client_ip,
+    enforce_auth_email_limit,
+    enforce_auth_ip_limit,
+)
 from app.services.email_queue import queue_email
 from app.services.billing_entitlements import (
     get_effective_cloud_plan,
@@ -84,6 +91,22 @@ from app.services.billing_entitlements import (
     subscription_response,
     tier_from_paystack_plan_code,
 )
+from app.services.license_portal import (
+    LicensePortalError,
+    LicensePortalUnauthorized,
+    create_portal_session_token,
+    decode_portal_session_token,
+    consume_magic_link_token,
+    issue_magic_link_token,
+    resend_license_key_email,
+)
+
+SELFHOST_INIT_IP_PER_HOUR = 30
+SELFHOST_VERIFY_IP_PER_HOUR = 60
+PORTAL_LINK_IP_PER_HOUR = 30
+PORTAL_LINK_EMAIL_PER_HOUR = 5
+PORTAL_EXCHANGE_IP_PER_HOUR = 60
+PORTAL_RESEND_IP_PER_HOUR = 20
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/billing", tags=["Billing"])
@@ -277,7 +300,7 @@ class ManageLinkResponse(BaseModel):
 
 
 class SelfHostedInitializeRequest(BaseModel):
-    email: str = Field(
+    email: EmailStr = Field(
         ...,
         description="Email address to deliver the license key to after payment.",
         examples=["admin@yourcompany.com"],
@@ -309,7 +332,7 @@ class SelfHostedVerifyResponse(BaseModel):
     response_model=InitializePaymentResponse,
     summary="Start a Pro plan checkout",
     description=(
-        "**Cloud only.** Initialises a Paystack transaction for the Pulse Pro plan. "
+        "**Cloud only.** Initialises a Paystack transaction for the Entivia Pro plan. "
         "Redirect the user to `authorization_url` to complete payment. "
         "After Paystack redirects back to `callback_url`, call "
         "`GET /billing/verify/{reference}` to activate the subscription.\n\n"
@@ -626,15 +649,20 @@ async def _dispatch(db: AsyncSession, event: str, data: dict) -> None:
 
 
 async def _on_charge_success(db: AsyncSession, data: dict) -> None:
-    """Payment succeeded. For first-time subscriptions the org_id is in metadata."""
+    """Payment succeeded. For first-time subscriptions the org_id is in metadata.
+
+    For self-hosted license purchases this is the authoritative trigger for issuing
+    and emailing the license key — the customer's browser tab may close before
+    the redirect-driven ``/verify`` endpoint runs, so we cannot rely on it.
+    """
     meta = data.get("metadata") or {}
     customer = data.get("customer") or {}
     authorization = data.get("authorization") or {}
     customer_code = customer.get("customer_code")
 
-    # Only process cloud subscription charges here
     if isinstance(meta, dict) and meta.get("purchase_type") == "self_hosted_license":
-        return  # handled by self-hosted verify endpoint, not by webhook
+        await _handle_selfhost_charge_success(data)
+        return
 
     org_id_str = meta.get("org_id") if isinstance(meta, dict) else None
     if org_id_str:
@@ -776,7 +804,7 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
     response_model=InitializePaymentResponse,
     summary="Start a self-hosted license purchase",
     description=(
-        "Initialises a **one-time** Paystack charge for a Pulse self-hosted license. "
+        "Initialises a **one-time** Paystack charge for an Entivia self-hosted license. "
         "Available on all deployment modes.\n\n"
         "The purchase price is configured server-side (`PAYSTACK_SELFHOSTED_LICENSE_PRICE` in kobo). "
         "After Paystack redirects to `callback_url`, call "
@@ -786,8 +814,37 @@ async def _on_invoice_payment_failed(db: AsyncSession, data: dict) -> None:
 )
 async def initialize_selfhosted_purchase(
     body: SelfHostedInitializeRequest,
-    current_user: User = Depends(get_current_user),
+    request: Request,
 ) -> dict:
+    """Anonymous: anyone with a payment method can buy a self-hosted license.
+
+    Buyers do not need a cloud workspace account. The Paystack metadata stores
+    only the delivery email (and the buyer IP, for fraud review). The license
+    key is bound to the eventual self-hosted ``org_id`` on first activation via
+    ``POST /license/activate`` from the customer's own instance.
+    """
+    if settings.DEPLOYMENT_MODE == "self_hosted":
+        purchase_url = f"{settings.MARKETING_URL.rstrip('/')}/pricing/self-hosted"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PURCHASE_OFF_INSTANCE",
+                "message": (
+                    "Self-hosted licenses are purchased from the Entivia marketing site, "
+                    "not from your self-hosted instance. After payment, paste the plc_… "
+                    "key into Settings → License."
+                ),
+                "purchase_url": purchase_url,
+            },
+        )
+
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "selfhost_init",
+        limit=SELFHOST_INIT_IP_PER_HOUR, window_sec=3600,
+        message="Too many license-purchase attempts. Please try again later.",
+    )
+
     price = settings.PAYSTACK_SELFHOSTED_LICENSE_PRICE
     if not price:
         raise HTTPException(status_code=503, detail="Self-hosted license purchase is not configured on this server")
@@ -795,15 +852,16 @@ async def initialize_selfhosted_purchase(
     if not settings.get_paystack_secret_key():
         raise HTTPException(status_code=503, detail="Payment service is not configured")
 
+    delivery_email = str(body.email).strip().lower()
+
     payload: dict[str, Any] = {
-        "email": body.email,
+        "email": delivery_email,
         "amount": price,
         "callback_url": body.callback_url,
         "metadata": {
-            "org_id": str(current_user.org_id),
-            "user_id": str(current_user.id),
-            "delivery_email": body.email,
+            "delivery_email": delivery_email,
             "purchase_type": "self_hosted_license",
+            "buyer_ip": client_ip(request),
         },
     }
 
@@ -834,7 +892,7 @@ async def initialize_selfhosted_purchase(
         "Call this after Paystack redirects back from the self-hosted license checkout.\n\n"
         "On success:\n"
         "1. Payment is verified with Paystack\n"
-        "2. A signed license key is requested from the Pulse license server\n"
+        "2. A signed license key is requested from the Entivia license server\n"
         "3. The key is emailed to the address provided during checkout\n\n"
         "The `license_key` field is also returned in the response body for "
         "immediate display to the user. If the license server is temporarily "
@@ -844,8 +902,19 @@ async def initialize_selfhosted_purchase(
 )
 async def verify_selfhosted_purchase(
     reference: str,
-    current_user: User = Depends(get_current_user),
+    request: Request,
 ) -> dict:
+    """Anonymous: callable by anyone holding the Paystack ``reference``.
+
+    Idempotent — the license server returns the same key for repeated calls
+    with the same payment reference.
+    """
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "selfhost_verify",
+        limit=SELFHOST_VERIFY_IP_PER_HOUR, window_sec=3600,
+    )
+
     if not settings.get_paystack_secret_key():
         raise HTTPException(status_code=503, detail="Payment service is not configured")
 
@@ -866,23 +935,21 @@ async def verify_selfhosted_purchase(
     if meta.get("purchase_type") != "self_hosted_license":
         raise bad_request("WRONG_TRANSACTION_TYPE", "This reference is not for a self-hosted license purchase")
 
-    delivery_email = meta.get("delivery_email") or current_user.email
-    org_id = str(meta.get("org_id", current_user.org_id))
+    delivery_email = (meta.get("delivery_email") or tx.get("customer", {}).get("email") or "").strip().lower()
+    if not delivery_email:
+        raise bad_request("MISSING_DELIVERY_EMAIL", "No delivery email associated with this transaction")
 
-    # Request a signed license key from the Pulse license server
-    license_key, expires_at = await _issue_license_key(
+    # ``org_id`` is intentionally optional for anonymous purchases — the buyer
+    # binds the license to their own self-hosted org_id on first activation.
+    purchaser_org_id = meta.get("org_id")
+
+    license_key, _expires_at = await _issue_and_deliver_self_hosted_license(
         payment_reference=reference,
-        email=delivery_email,
-        org_id=org_id,
+        delivery_email=delivery_email,
+        purchaser_org_id=str(purchaser_org_id) if purchaser_org_id else None,
     )
 
     if license_key:
-        await queue_email(
-            "license_key",
-            to=delivery_email,
-            license_key=license_key,
-            expires_at=expires_at,
-        )
         return {
             "status": "success",
             "message": f"License key delivered to {delivery_email}",
@@ -892,14 +959,16 @@ async def verify_selfhosted_purchase(
     # License server unreachable — purchase is recorded, key delivered when server recovers
     logger.error(
         "License server did not return key for payment %s (org %s) — will retry delivery",
-        reference, org_id,
+        reference, purchaser_org_id or "pending",
     )
+    portal_url = f"{settings.MARKETING_URL.rstrip('/')}/pricing/self-hosted/portal"
     return {
         "status": "success",
         "message": (
             f"Payment confirmed. Your license key will be emailed to {delivery_email} "
-            "within a few minutes. If it doesn't arrive, contact support with your "
-            f"payment reference: {reference}"
+            "within a few minutes (we retry automatically for up to 7 days). If it doesn't "
+            f"arrive, use the customer portal at {portal_url} to re-email it, or contact "
+            f"support with your payment reference: {reference}"
         ),
         "license_key": None,
     }
@@ -908,9 +977,9 @@ async def verify_selfhosted_purchase(
 async def _issue_license_key(
     payment_reference: str,
     email: str,
-    org_id: str,
+    org_id: str | None,
 ) -> tuple[str | None, str | None]:
-    """Request a signed license key from the Pulse license server.
+    """Request a signed license key from the Entivia license server.
 
     Returns (license_key, expires_at) on success, (None, None) on failure.
     The license server endpoint: POST {LICENSE_SERVER_URL}/api/v1/keys/purchase
@@ -920,16 +989,18 @@ async def _issue_license_key(
     api_key = settings.LICENSE_SERVER_API_KEY
     if api_key:
         headers["X-License-Api-Key"] = api_key
+    body: dict[str, Any] = {
+        "payment_reference": payment_reference,
+        "email": email,
+        "product": "self_hosted",
+    }
+    if org_id:
+        body["org_id"] = org_id
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 url,
-                json={
-                    "payment_reference": payment_reference,
-                    "email": email,
-                    "org_id": org_id,
-                    "product": "self_hosted",
-                },
+                json=body,
                 headers=headers,
             )
         if resp.status_code in (200, 201):
@@ -942,3 +1013,384 @@ async def _issue_license_key(
         logger.warning("License server key issuance failed for ref %s: %s", payment_reference, exc)
 
     return None, None
+
+
+SELFHOST_DELIVERY_TTL_SEC = 30 * 24 * 3600  # 30 days
+
+
+async def _claim_selfhost_email_delivery(payment_reference: str) -> bool:
+    """Atomically claim the right to email the license key for this payment.
+
+    Returns ``True`` on the first call for a given ``payment_reference`` and
+    ``False`` for subsequent calls within the dedup window. Used so the
+    Paystack webhook and the browser-triggered ``/verify`` endpoint never
+    both email the same key.
+
+    Falls back to allowing every send when Redis is unavailable — we'd rather
+    deliver twice than miss the email entirely.
+    """
+    r = await get_redis()
+    if r is None:
+        return True
+    key = f"selfhost_license_emailed:{payment_reference.strip()}"
+    try:
+        result = await r.set(key, "1", nx=True, ex=SELFHOST_DELIVERY_TTL_SEC)
+    except Exception:
+        logger.warning("Redis SET NX failed for license dedup; allowing send", exc_info=True)
+        return True
+    return bool(result)
+
+
+async def _issue_and_deliver_self_hosted_license(
+    *,
+    payment_reference: str,
+    delivery_email: str,
+    purchaser_org_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Issue a license key (idempotent) and email it exactly once.
+
+    Returns ``(license_key, expires_at)``. The license key is always returned
+    when the license server is reachable, even if the email was already sent
+    on a previous call — so the caller can show it in the UI.
+    """
+    license_key, expires_at = await _issue_license_key(
+        payment_reference=payment_reference,
+        email=delivery_email,
+        org_id=purchaser_org_id,
+    )
+    if not license_key:
+        from app.services.selfhost_license_pending import enqueue_pending_issuance
+
+        await enqueue_pending_issuance(
+            payment_reference=payment_reference,
+            delivery_email=delivery_email,
+            purchaser_org_id=purchaser_org_id,
+        )
+        return None, None
+
+    from app.services.selfhost_license_pending import remove_pending_issuance
+
+    await remove_pending_issuance(payment_reference)
+
+    if await _claim_selfhost_email_delivery(payment_reference):
+        await queue_email(
+            "license_key",
+            to=delivery_email,
+            license_key=license_key,
+            expires_at=expires_at,
+        )
+        logger.info("License key emailed for payment %s to %s", payment_reference, delivery_email)
+    else:
+        logger.info(
+            "License key already emailed for payment %s — skipping resend", payment_reference
+        )
+
+    return license_key, expires_at
+
+
+async def _handle_selfhost_charge_success(data: dict) -> None:
+    """Webhook-driven license issuance for self-hosted license purchases.
+
+    Runs as soon as Paystack confirms payment, independent of whether the
+    customer's browser ever lands back on ``/pricing/self-hosted``. Idempotent.
+    """
+    meta = data.get("metadata") or {}
+    customer = data.get("customer") or {}
+    reference = (data.get("reference") or "").strip()
+    if not reference:
+        logger.warning("Self-hosted charge.success missing reference; skipping")
+        return
+
+    delivery_email = ""
+    if isinstance(meta, dict):
+        delivery_email = (meta.get("delivery_email") or "").strip().lower()
+    if not delivery_email:
+        delivery_email = (customer.get("email") or "").strip().lower()
+    if not delivery_email:
+        logger.warning(
+            "Self-hosted charge.success has no delivery email (ref=%s)", reference
+        )
+        return
+
+    purchaser_org_id: str | None = None
+    if isinstance(meta, dict):
+        raw_org = meta.get("org_id")
+        if raw_org:
+            purchaser_org_id = str(raw_org)
+
+    license_key, _expires = await _issue_and_deliver_self_hosted_license(
+        payment_reference=reference,
+        delivery_email=delivery_email,
+        purchaser_org_id=purchaser_org_id,
+    )
+    if not license_key:
+        logger.error(
+            "License server unreachable from webhook for payment %s — verify endpoint will retry",
+            reference,
+        )
+
+
+# ── Self-hosted license customer portal (magic-link auth) ─────────────────────
+#
+# Lets buyers retrieve license keys they purchased without creating a cloud
+# workspace. Mirrors the pattern used by GitLab customers, n8n, Posthog etc.
+#
+#   1. POST /billing/self-hosted/portal/request-link
+#        Body: { email, callback_url }. Emails a one-time magic link if any
+#        licenses exist for this email; otherwise returns success anyway to
+#        avoid leaking whether the email is a customer.
+#
+#   2. POST /billing/self-hosted/portal/exchange
+#        Body: { token }. Returns a short-lived portal session JWT (15 min).
+#
+#   3. GET  /billing/self-hosted/portal/licenses
+#        Header: Authorization: Bearer <portal session JWT>. Lists license
+#        keys issued to the session email.
+#
+#   4. POST /billing/self-hosted/portal/licenses/{jti}/resend
+#        Re-emails the license key to its original delivery address.
+
+
+class PortalRequestLinkRequest(BaseModel):
+    email: EmailStr = Field(
+        ...,
+        description="Email used at checkout. We'll email any licenses bound to this address.",
+    )
+    callback_url: str = Field(
+        ...,
+        description=(
+            "URL the magic link should land on. We append `?token=<token>` to it. "
+            "The page should call `POST /billing/self-hosted/portal/exchange` with the token."
+        ),
+        examples=["https://entivia.online/pricing/self-hosted/portal/callback"],
+    )
+
+
+class PortalRequestLinkResponse(BaseModel):
+    status: str = Field(..., description="Always `ok` (we don't reveal whether the email is a customer).")
+    message: str = Field(..., description="Human-readable confirmation.")
+
+
+class PortalExchangeRequest(BaseModel):
+    token: str = Field(..., min_length=8)
+
+
+class PortalExchangeResponse(BaseModel):
+    portal_token: str = Field(..., description="Short-lived JWT (15 min). Pass as `Authorization: Bearer ...`.")
+    email: EmailStr = Field(..., description="Email this session is bound to.")
+    expires_in: int = Field(..., description="Seconds until the portal token expires.")
+
+
+class PortalLicenseRow(BaseModel):
+    jti: str
+    plan: str
+    features: list[str]
+    seat_limit: int | None
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    issued_at: datetime
+    payment_reference: str
+    license_key_preview: str = Field(
+        ..., description="Last 8 chars of the key, e.g. `…f3a2b9c1`. Full key is delivered by email."
+    )
+
+
+class PortalLicensesResponse(BaseModel):
+    email: EmailStr
+    licenses: list[PortalLicenseRow]
+
+
+class PortalResendResponse(BaseModel):
+    status: str
+    message: str
+
+
+async def _portal_session_email(authorization: str | None) -> str:
+    """Decode the portal Bearer token from the Authorization header."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise unauthorized("PORTAL_AUTH_REQUIRED", "Portal session required")
+    raw = authorization.split(" ", 1)[1].strip()
+    try:
+        email = decode_portal_session_token(raw)
+    except LicensePortalUnauthorized as exc:
+        raise unauthorized("PORTAL_SESSION_EXPIRED", str(exc)) from exc
+    return email
+
+
+@router.post(
+    "/self-hosted/portal/request-link",
+    response_model=PortalRequestLinkResponse,
+    summary="Email a magic link to access purchased license keys",
+    description=(
+        "**Anonymous.** Sends a one-time magic link (15 min TTL) to the supplied "
+        "email if any self-hosted licenses have been issued to it. Always returns "
+        "200 with the same message, so the response cannot be used to enumerate "
+        "customer emails."
+    ),
+)
+async def portal_request_link(
+    body: PortalRequestLinkRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "selfhost_portal_link",
+        limit=PORTAL_LINK_IP_PER_HOUR, window_sec=3600,
+    )
+    await enforce_auth_email_limit(
+        r, str(body.email), "selfhost_portal_link",
+        limit=PORTAL_LINK_EMAIL_PER_HOUR, window_sec=3600,
+        message="Too many magic-link requests for that email. Please try again in an hour.",
+    )
+
+    email = str(body.email).strip().lower()
+
+    exists = await db.execute(
+        select(LicenseIssuance.id).where(LicenseIssuance.email == email).limit(1)
+    )
+    if exists.first() is None:
+        # Don't leak existence of the customer record.
+        return {
+            "status": "ok",
+            "message": f"If a purchase exists for {email}, a sign-in link has been sent.",
+        }
+
+    try:
+        token = await issue_magic_link_token(email)
+    except LicensePortalError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "PORTAL_UNAVAILABLE", "message": str(exc)},
+        ) from exc
+
+    sep = "&" if "?" in body.callback_url else "?"
+    link = f"{body.callback_url}{sep}token={token}"
+
+    await queue_email(
+        "license_portal_link",
+        to=email,
+        link=link,
+        ip=client_ip(request),
+    )
+
+    return {
+        "status": "ok",
+        "message": f"If a purchase exists for {email}, a sign-in link has been sent.",
+    }
+
+
+@router.post(
+    "/self-hosted/portal/exchange",
+    response_model=PortalExchangeResponse,
+    summary="Exchange a magic-link token for a portal session JWT",
+)
+async def portal_exchange(
+    body: PortalExchangeRequest,
+    request: Request,
+) -> dict:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "selfhost_portal_exchange",
+        limit=PORTAL_EXCHANGE_IP_PER_HOUR, window_sec=3600,
+    )
+
+    email = await consume_magic_link_token(body.token)
+    if not email:
+        raise unauthorized(
+            "MAGIC_LINK_INVALID",
+            "This sign-in link has expired or has already been used. Request a new one.",
+        )
+
+    portal_token, ttl = create_portal_session_token(email)
+    return {"portal_token": portal_token, "email": email, "expires_in": ttl}
+
+
+@router.get(
+    "/self-hosted/portal/licenses",
+    response_model=PortalLicensesResponse,
+    summary="List license keys for the current portal session",
+)
+async def portal_list_licenses(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    email = await _portal_session_email(authorization)
+
+    result = await db.execute(
+        select(LicenseIssuance)
+        .where(LicenseIssuance.email == email)
+        .order_by(LicenseIssuance.created_at.desc())
+    )
+    rows = result.scalars().all()
+
+    licenses = [
+        {
+            "jti": row.jti,
+            "plan": row.plan,
+            "features": list(row.features or []),
+            "seat_limit": row.seat_limit,
+            "expires_at": row.expires_at,
+            "revoked_at": row.revoked_at,
+            "issued_at": row.created_at,
+            "payment_reference": row.payment_reference,
+            "license_key_preview": f"…{row.license_key[-8:]}" if row.license_key else "",
+        }
+        for row in rows
+    ]
+
+    return {"email": email, "licenses": licenses}
+
+
+@router.post(
+    "/self-hosted/portal/licenses/{jti}/resend",
+    response_model=PortalResendResponse,
+    summary="Re-email a previously issued license key",
+)
+async def portal_resend_license(
+    jti: str,
+    request: Request,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    r = await get_redis()
+    await enforce_auth_ip_limit(
+        r, request, "selfhost_portal_resend",
+        limit=PORTAL_RESEND_IP_PER_HOUR, window_sec=3600,
+    )
+
+    email = await _portal_session_email(authorization)
+
+    result = await db.execute(
+        select(LicenseIssuance).where(
+            LicenseIssuance.jti == jti,
+            LicenseIssuance.email == email,
+        )
+    )
+    issuance = result.scalar_one_or_none()
+    if issuance is None:
+        raise not_found("License not found for this portal session")
+    if issuance.revoked_at is not None:
+        raise bad_request("LICENSE_REVOKED", "This license has been revoked and cannot be resent")
+
+    license_key = issuance.license_key
+    expires_at = issuance.expires_at.isoformat() if issuance.expires_at else None
+    refreshed_key, refreshed_expires_at = await _issue_license_key(
+        payment_reference=issuance.payment_reference,
+        email=email,
+        org_id=issuance.purchaser_org_id,
+    )
+    if refreshed_key:
+        license_key = refreshed_key
+        expires_at = refreshed_expires_at
+
+    await resend_license_key_email(
+        to=email,
+        license_key=license_key,
+        expires_at=expires_at,
+    )
+
+    return {
+        "status": "ok",
+        "message": f"Your license key has been re-emailed to {email}.",
+    }

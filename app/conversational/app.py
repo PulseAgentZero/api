@@ -25,6 +25,7 @@ from app.config.settings import settings
 from app.conversational.router import router as agent_chat_router
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
+from app.infrastructure.logging.streams import start_log_stream_runtime, stop_log_stream_runtime
 
 configure_logging()
 
@@ -42,11 +43,15 @@ _openapi_tags = [
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """No pipeline schedulers — this process is stateless aside from the DB pool."""
-    yield
+    await start_log_stream_runtime()
+    try:
+        yield
+    finally:
+        await stop_log_stream_runtime()
 
 
 app = FastAPI(
-    title="Pulse — Conversational service",
+    title="Entivia — Conversational service",
     description=(
         "Dedicated process for dashboard chat.\n\n"
         "**Auth:** `Authorization: Bearer <jwt_token>` (same tokens as the main internal API)\n\n"

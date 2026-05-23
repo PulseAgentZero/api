@@ -11,7 +11,9 @@ from app.infrastructure.database.models.entity_risk_history import EntityRiskHis
 from app.infrastructure.database.models.invitation import Invitation
 from app.infrastructure.database.models.license_activation import LicenseActivation
 from app.infrastructure.database.models.license_issuance import LicenseIssuance
+from app.infrastructure.database.models.ldap_configuration import LdapConfiguration
 from app.infrastructure.database.models.license_key import LicenseKey
+from app.infrastructure.database.models.log_stream import LogStream
 from app.infrastructure.database.models.llm_key_store import LlmKeyStore
 from app.infrastructure.database.models.notification_channel import NotificationChannel
 from app.infrastructure.database.models.org_notification import OrgNotification
@@ -19,7 +21,9 @@ from app.infrastructure.database.models.organization import Organization
 from app.infrastructure.database.models.pipeline_run import PipelineRun
 from app.infrastructure.database.models.pipeline_schedule import PipelineSchedule
 from app.infrastructure.database.models.recommendation import Recommendation
+from app.infrastructure.database.models.scheduler_heartbeat import SchedulerHeartbeat
 from app.infrastructure.database.models.schema_mapping import SchemaMapping
+from app.infrastructure.database.models.sso_configuration import SsoConfiguration
 from app.infrastructure.database.models.subscription import Subscription
 from app.infrastructure.database.models.usage_event import UsageEvent
 from app.infrastructure.database.models.user import User
@@ -45,7 +49,9 @@ __all__ = [
     "Invitation",
     "LicenseActivation",
     "LicenseIssuance",
+    "LdapConfiguration",
     "LicenseKey",
+    "LogStream",
     "LlmKeyStore",
     "NotificationChannel",
     "OrgNotification",
@@ -53,7 +59,9 @@ __all__ = [
     "PipelineRun",
     "PipelineSchedule",
     "Recommendation",
+    "SchedulerHeartbeat",
     "SchemaMapping",
+    "SsoConfiguration",
     "Subscription",
     "UsageEvent",
     "User",

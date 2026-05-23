@@ -6,8 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.auth import auth_router
+from app.api.auth.sso_routes import router as sso_auth_router
 from app.api.exception_handlers import attach_exception_handlers
 from app.api.middleware import LoggingMiddleware
+from app.api.middleware.org_context_middleware import OrgContextMiddleware
 from app.api.routes import (
     agent_router,
     alerts_router,
@@ -18,13 +20,16 @@ from app.api.routes import (
     connections_router,
     dashboard_router,
     entities_router,
+    ldap_router,
     license_router,
+    log_streams_router,
     notifications_router,
     org_router,
     pipeline_router,
     recommendations_router,
     schema_mappings_router,
     settings_router,
+    sso_config_router,
     studio_router,
     users_router,
     webhooks_router,
@@ -40,9 +45,53 @@ from app.api.public.openapi import configure_public_openapi
 from app.config.settings import settings
 from app.infrastructure.database.session import async_session_factory
 from app.infrastructure.logging import configure_logging
+from app.infrastructure.logging.streams import start_log_stream_runtime, stop_log_stream_runtime
 from app.infrastructure.redis.client import close_redis
 
 configure_logging()
+
+
+def _origin(value: str) -> str | None:
+    from urllib.parse import urlparse
+
+    raw = (value or "").strip().rstrip("/")
+    if not raw:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _cors_origins() -> list[str]:
+    """Origins allowed to call the API from a browser.
+
+    The dashboard and marketing site are different production origins:
+    app.entivia.online hosts authenticated app pages, while entivia.online hosts
+    public checkout pages such as /pricing/self-hosted. Both need browser access
+    to /api/v1/billing/self-hosted/*.
+    """
+    origins: set[str] = set()
+    for value in (
+        settings.FRONTEND_URL,
+        settings.MARKETING_URL,
+        *settings.CORS_ALLOWED_ORIGINS.split(","),
+    ):
+        origin = _origin(value)
+        if origin:
+            origins.add(origin)
+
+    if not _is_prod:
+        origins.update(
+            {
+                "http://localhost:3000",
+                "http://127.0.0.1:3000",
+                "http://localhost:3001",
+                "http://127.0.0.1:3001",
+            }
+        )
+    return sorted(origins)
+
 
 # Mount local file storage if LOCAL backend is active
 def _mount_local_storage(app: "FastAPI") -> None:
@@ -75,14 +124,16 @@ def _mount_local_storage(app: "FastAPI") -> None:
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     # All APScheduler crons run in the dedicated scheduler process only
     # (docker compose `scheduler`, self-hosted supervisord, or `python -m app.services.schedulers.run`).
+    await start_log_stream_runtime()
     try:
         yield
     finally:
+        await stop_log_stream_runtime()
         await close_redis()
 
 
 # ── Internal API ──────────────────────────────────────────────────────────────
-# Used by the Pulse dashboard (frontend).
+# Used by the Entivia dashboard (frontend).
 # Auth: JWT Bearer token only.
 
 _is_prod = settings.is_production()
@@ -104,6 +155,9 @@ _internal_tags = [
     {"name": "Webhooks",        "description": "Outbound webhook delivery log"},
     {"name": "API Keys",        "description": "Programmatic API access"},
     {"name": "License",         "description": "Self-hosted license activation (self-hosted only)"},
+    {"name": "Log Streams",     "description": "Stream logs to HTTP, syslog, or file (self-hosted license)"},
+    {"name": "SSO",             "description": "OIDC / SAML SSO configuration (self-hosted license)"},
+    {"name": "LDAP",            "description": "LDAP / AD directory sync (self-hosted license)"},
     {"name": "Settings",        "description": "LLM key management (self-hosted only)"},
     {"name": "Audit Logs",      "description": "Immutable audit trail (Pro only)"},
     {"name": "Billing",         "description": "Paystack subscription management and webhooks"},
@@ -112,14 +166,14 @@ _internal_tags = [
 ]
 
 app = FastAPI(
-    title="Pulse — Internal API",
+    title="Entivia — Internal API",
     description=(
-        "Internal API used by the Pulse dashboard.\n\n"
+        "Internal API used by the Entivia dashboard.\n\n"
         "**Auth:** `Authorization: Bearer <jwt_token>`\n\n"
         "**Errors:** `{ \"error\": { \"code\": \"string\", \"message\": \"string\" } }`"
     ),
     version="1.0.0",
-    contact={"name": "Pulse Support", "email": "support@pulseai.io"},
+    contact={"name": "Entivia Support", "email": "support@entivia.online"},
     license_info={"name": "Proprietary"},
     openapi_tags=_internal_tags,
     lifespan=lifespan,
@@ -129,9 +183,10 @@ app = FastAPI(
 )
 
 app.add_middleware(LoggingMiddleware)
+app.add_middleware(OrgContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -140,6 +195,7 @@ app.add_middleware(
 attach_exception_handlers(app)
 
 app.include_router(auth_router,            prefix="/api/v1")
+app.include_router(sso_auth_router,      prefix="/api/v1")
 app.include_router(org_router,             prefix="/api/v1")
 app.include_router(connections_router,     prefix="/api/v1")
 app.include_router(schema_mappings_router, prefix="/api/v1")
@@ -152,6 +208,9 @@ app.include_router(notifications_router,   prefix="/api/v1")
 app.include_router(webhooks_router,        prefix="/api/v1")
 app.include_router(api_keys_router,        prefix="/api/v1")
 app.include_router(license_router,         prefix="/api/v1")
+app.include_router(log_streams_router,     prefix="/api/v1")
+app.include_router(sso_config_router,      prefix="/api/v1")
+app.include_router(ldap_router,            prefix="/api/v1")
 app.include_router(settings_router,        prefix="/api/v1")
 app.include_router(audit_logs_router,      prefix="/api/v1")
 app.include_router(agent_router,           prefix="/api/v1")

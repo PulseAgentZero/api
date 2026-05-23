@@ -1,4 +1,4 @@
-"""Pulse Studio — SQL editor, visualizations, custom dashboards, and AI tools.
+"""Entivia Studio — SQL editor, visualizations, custom dashboards, and AI tools.
 
 All endpoints require JWT auth (`Authorization: Bearer <token>`).
 Roles: admin > manager > analyst > viewer. Most write operations require analyst+.
@@ -37,6 +37,8 @@ from app.api.schemas.studio import (
     StudioDashboardUpdateRequest,
     StudioEmbedTokenRequest,
     StudioEmbedTokenResponse,
+    StudioGenerateSQLIntakeRequest,
+    StudioGenerateSQLIntakeResponse,
     StudioGenerateSQLRequest,
     StudioGenerateSQLResponse,
     StudioQueryCreateRequest,
@@ -451,6 +453,25 @@ async def list_queries(
     return {"queries": results, "total": total, "page": page}
 
 
+@router.post(
+    "/queries/generate/intake",
+    response_model=StudioGenerateSQLIntakeResponse,
+    summary="Intake questions before AI SQL generation",
+)
+async def generate_sql_intake(
+    body: StudioGenerateSQLIntakeRequest,
+    current_user: User = Depends(require_role("admin", "manager", "analyst")),
+    db: AsyncSession = Depends(get_db),
+) -> StudioGenerateSQLIntakeResponse:
+    """Return connections, schema preview, and clarifying questions (no SQL generated)."""
+    from app.services.studio_ai_service import generate_sql_intake as run_intake
+
+    result = await run_intake(
+        db, current_user.org_id, body.goal, body.connection_id,
+    )
+    return StudioGenerateSQLIntakeResponse(**result)
+
+
 @router.post("/queries/generate", response_model=StudioGenerateSQLResponse, summary="Generate SQL from natural language (AI)")
 async def generate_sql(
     body: StudioGenerateSQLRequest,
@@ -473,7 +494,16 @@ async def generate_sql(
     - 400 NO_SCHEMA — no tables found in the database.
     """
     from app.services.studio_ai_service import generate_sql_from_goal
-    result = await generate_sql_from_goal(db, current_user.org_id, body.goal, body.connection_id)
+    result = await generate_sql_from_goal(
+        db,
+        current_user.org_id,
+        body.goal,
+        body.connection_id,
+        time_window=body.time_window,
+        segments=body.segments,
+        filters_to_parameterize=body.filters_to_parameterize,
+        extra_context=body.extra_context,
+    )
     return StudioGenerateSQLResponse(**result)
 
 

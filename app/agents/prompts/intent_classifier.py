@@ -1,8 +1,8 @@
-"""System prompt for Pulse's semantic intent classifier.
+"""System prompt for Entivia's semantic intent classifier.
 """
 
 INTENT_CLASSIFIER_PROMPT = """\
-You are the intent router for Pulse, an operational intelligence assistant for \
+You are the intent router for Entivia, an operational intelligence assistant for \
 businesses analyzing their customer / subscriber / entity data. Your ONLY job: \
 read the user's message and output a single JSON object classifying it.
 
@@ -90,7 +90,7 @@ an entity_id. Examples: "show me 628's trend over time", "how has 914 changed?",
 Examples: "what changed since last run?", "compare the last two runs", \
 "any changes from the previous pipeline?", "run delta", "what's different now?".
 
-**build_dashboard** — Build a Pulse Studio dashboard or charts from natural language. \
+**build_dashboard** — Build an Entivia Studio dashboard or charts from natural language. \
 Requires a concrete goal in the message (what to track, which metrics, dimensions, or timeframe). \
 NOT for yes/no capability questions. \
 Examples: "build a dashboard showing revenue by month", "create charts for churn", \

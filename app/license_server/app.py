@@ -1,5 +1,5 @@
 """
-Pulse License Server — validates and issues license keys for self-hosted customers.
+Entivia License Server — validates and issues license keys for self-hosted customers.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from app.license_server.service import purchase_license, validate_license
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Pulse License Server",
-    description="Internal license validation and issuance for self-hosted Pulse instances",
+    title="Entivia License Server",
+    description="Internal license validation and issuance for self-hosted Entivia instances",
     version="1.0.0",
     docs_url="/docs",
     redoc_url=None,

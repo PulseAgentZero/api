@@ -34,6 +34,8 @@ class User(Base, UUIDMixin, TimestampMixin):
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     auth_provider: Mapped[str] = mapped_column(Text, default="email", server_default="email")
     auth_provider_id: Mapped[str | None] = mapped_column(Text)
+    sso_provider: Mapped[str | None] = mapped_column(Text)
+    sso_subject: Mapped[str | None] = mapped_column(Text)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     totp_secret_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
     totp_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

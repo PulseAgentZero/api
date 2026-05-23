@@ -1,11 +1,11 @@
 SELF_HOSTED_COMPOSE = docker/compose/self-hosted/docker-compose.yml
 CLOUD_COMPOSE       = docker/compose/cloud/docker-compose.yml
 
-SELF_HOSTED_IMAGE   = pulseai/pulse
-CLOUD_IMAGE         = pulseai/pulse-cloud
-LICENSE_IMAGE       = pulseai/pulse-license
+SELF_HOSTED_IMAGE   = chideraozigbo488/entivia
+CLOUD_IMAGE         = chideraozigbo488/entivia-cloud
+LICENSE_IMAGE       = chideraozigbo488/entivia-license
 
-# Maintainer builds only — public users pull pulseai/pulse from Docker Hub.
+# Maintainer builds only — public users pull chideraozigbo488/entivia from Docker Hub.
 # Default: ../dashboard (sibling of this repo, e.g. ~/Desktop/dashboard next to ~/Desktop/api).
 PULSE_DASHBOARD_DIR ?= ../dashboard
 tag                 ?= latest

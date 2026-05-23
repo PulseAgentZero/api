@@ -114,33 +114,16 @@ async def test_mongodb_uri(uri: str) -> tuple[bool, str]:
     if not uri:
         return False, "Missing MongoDB URI"
 
-    def _ping() -> None:
-        from motor.motor_asyncio import AsyncIOMotorClient
+    from motor.motor_asyncio import AsyncIOMotorClient
 
-        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
-        try:
-            import asyncio as _aio
-
-            loop = _aio.get_event_loop()
-            loop.run_until_complete(client.admin.command("ping"))
-        finally:
-            client.close()
-
+    client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
     try:
-        # Motor async API must run on loop — use inner async helper instead.
-        async def _async_ping() -> None:
-            from motor.motor_asyncio import AsyncIOMotorClient
-
-            c = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=8000)
-            try:
-                await c.admin.command("ping")
-            finally:
-                c.close()
-
-        await _async_ping()
+        await client.admin.command("ping")
         return True, "MongoDB ping successful"
     except Exception as exc:
         return False, f"MongoDB: {exc}"
+    finally:
+        client.close()
 
 
 async def test_clickhouse_https(base_url: str, *, user: str = "", password: str = "") -> tuple[bool, str]:
