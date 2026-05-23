@@ -45,6 +45,7 @@ jobs:
                   switches: >-
                       -avzr --delete
                       --exclude=docker/compose/cloud/.env
+                      --exclude=.env
                       --exclude=license_private.pem
                       --exclude=license_public.pem
                       --rsync-path="sudo rsync"
