@@ -23,7 +23,7 @@
 ## Local reproduction
 
 ```bash
-cp .env.example .env                # ANTHROPIC_API_KEY (+ optional GROQ_API_KEY)
+cp hackathon/.env.example hackathon/.env   # HACKATHON_DATABASE_PASSWORD + ANTHROPIC_API_KEY
 make hackathon-up                   # postgres + qdrant + task-a + task-b + gateway
 HACKATHON_YELP_HOST_DIR=~/datasets/yelp make hackathon-load
 open http://localhost:8011/docs     # Task A

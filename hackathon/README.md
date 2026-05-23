@@ -140,8 +140,8 @@ related helpers.
 (Groq is an optional automatic fallback).
 
 ```bash
-cp .env.example .env
-$EDITOR .env                        # ANTHROPIC_API_KEY=...  (GROQ_API_KEY optional)
+cp hackathon/.env.example hackathon/.env
+$EDITOR hackathon/.env              # HACKATHON_DATABASE_PASSWORD + ANTHROPIC_API_KEY (Groq optional)
 
 make hackathon-up                   # postgres · qdrant · task-a · task-b · gateway
 make hackathon-load                 # synthetic by default; real Yelp if mounted (§4)

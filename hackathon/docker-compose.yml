@@ -7,7 +7,7 @@
 # production endpoint to query instead of the internal Docker service URL.
 
 x-hackathon-env: &hackathon-env
-  HACKATHON_DATABASE_URL: postgresql+asyncpg://hackathon:hackathon@postgres:5432/hackathon
+  HACKATHON_DATABASE_URL: postgresql+asyncpg://hackathon:${HACKATHON_DATABASE_PASSWORD}@postgres:5432/hackathon
   QDRANT_URL: http://qdrant:6333
   HACKATHON_EMBEDDING_BACKEND: fastembed
   HACKATHON_FASTEMBED_MODEL: BAAI/bge-small-en-v1.5
@@ -20,7 +20,7 @@ x-hackathon-env: &hackathon-env
 x-hackathon-service: &hackathon-service
   image: entivia-hackathon:latest
   env_file:
-    - ../.env
+    - .env
   environment:
     <<: *hackathon-env
   depends_on:
@@ -37,7 +37,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: hackathon
-      POSTGRES_PASSWORD: hackathon
+      POSTGRES_PASSWORD: ${HACKATHON_DATABASE_PASSWORD}
       POSTGRES_DB: hackathon
     ports:
       - "5436:5432"
