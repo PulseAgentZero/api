@@ -34,6 +34,32 @@ plays in the production platform: a structured source of behavioral data the
 agents reason over without copying it elsewhere. The hackathon code lives in
 `hackathon/`; the reused runtime lives in `app/`.
 
+### Where the agent code actually lives
+
+Both agent implementations now sit in the main platform:
+
+| Concern | Module |
+|---------|--------|
+| Review simulation agent | [`app/agents/workflows/review_simulator.py`](../app/agents/workflows/review_simulator.py) |
+| Recommendation agent (cold-start + multi-turn + cross-domain) | [`app/agents/workflows/cold_start_recommender.py`](../app/agents/workflows/cold_start_recommender.py) |
+| Shared Pydantic contracts | [`app/api/schemas/simulation.py`](../app/api/schemas/simulation.py) |
+| Per-request runtime meta | [`app/agents/observability.py`](../app/agents/observability.py) |
+| System prompts (default + Nigerian voice) | [`app/agents/workflows/prompts/simulation/`](../app/agents/workflows/prompts/simulation) |
+
+The files at `hackathon/agents/*.py` are thin re-exports that hand the
+production agent a small adapter for DB-mode tools — that is what lets
+`task-a-api` and `task-b-api` keep the full `(user_id, item_id)` and
+warm-start flows against the loaded Yelp/Goodreads slice without forcing that
+hackathon-specific schema into the platform.
+
+The exact same agent code is also exposed as a first-class public API at
+`POST /api/public/v1/simulation/review` and `POST /api/public/v1/simulation/recommend`
+on the main Entivia API (direct / cold-start modes only — the
+tenant-agnostic paths), and shows up in the dashboard's **API Playground**
+under a *Simulation* group with pre-filled example bodies. The hackathon
+containers and the public routes therefore call into the same `BaseAgent`
+ReAct loop, prompts, and `meta` block.
+
 ---
 
 ## Submission at a glance
@@ -72,9 +98,9 @@ hackathon/
 │   ├── factory.py             # Shared FastAPI/CORS/logging factory
 │   └── schemas.py             # Pydantic request/response models
 ├── agents/
-│   ├── review_simulator.py    # ReviewSimulationAgent (Task A)
-│   ├── recommender.py         # RecommendationAgent   (Task B)
-│   └── prompts/               # System prompts (default + Nigerian voice)
+│   ├── review_simulator.py    # Shim → app/agents/workflows/review_simulator.py (Task A)
+│   └── recommender.py         # Shim → app/agents/workflows/cold_start_recommender.py (Task B)
+│                              # Prompts live at app/agents/workflows/prompts/simulation/
 ├── core/
 │   ├── db.py                  # Async SQLAlchemy session
 │   ├── repository.py          # Postgres queries used by agent tools

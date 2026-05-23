@@ -15,9 +15,10 @@
 1. **Two containerized apps** (same image, separate services in `docker-compose.yml`):
    - `task-a-api` — `POST /simulate-review` (persona + product **or** user_id + item_id)
    - `task-b-api` — `POST /recommend` (warm / cold / multi-turn / cross-domain)
-2. **Code** — both agents extend `app.agents.base.BaseAgent`; prompts in `hackathon/agents/prompts/`.
+2. **Code** — both agents are implemented in `app/agents/workflows/` (`review_simulator.py`, `cold_start_recommender.py`) on top of `app.agents.base.BaseAgent`; prompts live at `app/agents/workflows/prompts/simulation/`; `hackathon/agents/*` are thin shims that wire DB-mode tools.
 3. **Two solution papers** — one per task (`make hackathon-paper-a-pdf`, `make hackathon-paper-b-pdf`).
 4. **Evaluation** — RMSE, ROUGE-L (Task A); Hit@10, NDCG@10 (Task B); baselines in `GET /metrics`.
+5. **Same agents on the live platform** — the dashboard's API Playground exposes a *Simulation* group calling `POST /api/public/v1/simulation/{review,recommend}` (direct / cold-start modes only) against the same agent code, under `X-API-Key` auth and the standard public-API rate limits.
 
 ## Local reproduction
 

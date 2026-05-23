@@ -23,8 +23,8 @@ venv
 .env.*
 !.env.example
 
-# Paper sources are not needed at runtime — only the agents read prompts
-# from agents/prompts/*.md, which are kept.
+# Paper sources are not needed at runtime — agent prompts now live at
+# app/agents/workflows/prompts/simulation/*.md (single source of truth).
 paper/
 *.pdf
 

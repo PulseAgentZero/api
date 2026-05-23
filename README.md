@@ -13,10 +13,15 @@ This repository is the backend (FastAPI + autonomous agent pipeline + license se
 
 **Why we structured it this way.** The brief asks for two containerized agents on review/persona data. Rather than a throwaway demo, we built a full agent platform first — connect to structured data, profile behaviour, score risk, recommend actions — and used the hackathon domain (Yelp + Goodreads) as the **public proof** that the runtime works: Task A is behavioural simulation, Task B is next-best-action recommendations, both on the same [`app/agents/base.py`](app/agents/base.py) stack as the enterprise pipeline described below.
 
+**One codebase, two surfaces.** The two hackathon agents now live in `app/agents/workflows/` (`review_simulator.py`, `cold_start_recommender.py`) alongside the rest of the platform, and the same code is exposed two ways:
+
+1. **Dedicated hackathon containers** — `task-a-api:8011` and `task-b-api:8012` from [`hackathon/`](hackathon/). These keep the full challenge contract: persona+product *or* `user_id`+`item_id` for Task A, warm-start + cold-start + multi-turn + cross-domain for Task B against the loaded Yelp/Goodreads slice. They are the submission's reference deployment.
+2. **Production public API** — `POST /api/public/v1/simulation/review` and `POST /api/public/v1/simulation/recommend` on the main Entivia API, behind the standard `X-API-Key` auth and per-org rate limit, with `Simulation` endpoints surfaced in the dashboard's API Playground. Direct mode and cold-start mode only (the safe, tenant-agnostic paths).
+
 | Layer | Path | Role in the submission |
 |-------|------|-------------------------|
-| Agent runtime + product API | [`app/`](app/) | ReAct agents, live-SQL tools, pipeline, deployment |
-| Task A + Task B APIs | [`hackathon/`](hackathon/) | `POST /simulate-review`, `POST /recommend`, eval, papers |
+| Agent runtime + product API | [`app/`](app/) | ReAct agents, live-SQL tools, pipeline, simulation public routes |
+| Hackathon Task A / B containers | [`hackathon/`](hackathon/) | `POST /simulate-review`, `POST /recommend`, eval, papers |
 
 See [`hackathon/README.md`](hackathon/README.md) for `docker compose` quickstart, API examples, evaluation, and the two task papers.
 

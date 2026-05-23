@@ -39,6 +39,7 @@ from app.api.public import (
     public_entities_router,
     public_pipeline_router,
     public_recommendations_router,
+    public_simulation_router,
     public_studio_router,
 )
 from app.api.public.openapi import configure_public_openapi
@@ -231,6 +232,14 @@ _public_tags = [
     {"name": "Pipeline"},
     {"name": "Analytics"},
     {"name": "Studio"},
+    {
+        "name": "Simulation",
+        "description": (
+            "Persona-driven review simulation and recommendations. The same "
+            "agents power the hackathon Task A / Task B containers; see the "
+            "`hackathon/` directory in the repo for the dedicated apps."
+        ),
+    },
 ]
 
 public_app = FastAPI(
@@ -252,6 +261,7 @@ public_app.include_router(public_recommendations_router, prefix="/v1")
 public_app.include_router(public_pipeline_router,        prefix="/v1")
 public_app.include_router(public_analytics_router,       prefix="/v1")
 public_app.include_router(public_studio_router,          prefix="/v1")
+public_app.include_router(public_simulation_router,      prefix="/v1")
 
 # Mount public_app under /api/public
 # Routes become: /api/public/v1/entities, /api/public/docs, etc.
