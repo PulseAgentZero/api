@@ -92,6 +92,7 @@ from app.services.intent_router import (
     build_fastpath_args,
     classify_intent,
     filter_tools_by_intent,
+    is_dashboard_edit_request,
     is_dashboard_followup,
     resolve_followup_query,
 )
@@ -426,18 +427,17 @@ TOOLS = [
     {
         "name": "build_dashboard_from_plan",
         "description": (
-            "FINAL step: persist a plan the user has explicitly approved. Only call AFTER "
-            "draft_dashboard_plan and an explicit confirmation from the user. Requires the full "
-            "plan object returned by draft_dashboard_plan — if you don't already have it in this "
-            "turn, call draft_dashboard_plan again (same connection_id and answers) to obtain it."
+            "FINAL step: persist the plan the user just approved. Call this once, immediately "
+            "after the user confirms the previewed plan. The system already has that plan, so "
+            "you do NOT need to pass it or re-run draft_dashboard_plan — just call this tool. "
+            "Set is_public only if the user asked to make it shareable."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "plan": {"type": "object", "description": "The full plan object from draft_dashboard_plan."},
                 "is_public": {"type": "boolean", "description": "Make the dashboard publicly shareable. Default false."},
             },
-            "required": ["plan"],
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -461,18 +461,14 @@ TOOLS = [
     {
         "name": "apply_dashboard_changes",
         "description": (
-            "Persist approved changes to an existing dashboard. Only after propose_dashboard_changes "
-            "and an explicit user confirmation. Requires dashboard_id and the changes array from "
-            "propose_dashboard_changes — if you don't have it in this turn, call "
-            "propose_dashboard_changes again (same feedback) to obtain it."
+            "Persist the changes the user just approved. Call this once, immediately after the "
+            "user confirms the proposed changes. The system already has the proposed changeset, "
+            "so you do NOT need to pass it or re-run propose_dashboard_changes — just call this tool."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {
-                "dashboard_id": {"type": "string"},
-                "changes": {"type": "array", "items": {"type": "object"}},
-            },
-            "required": ["dashboard_id", "changes"],
+            "properties": {},
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -556,6 +552,37 @@ def _recent_active_dashboard(conversation_messages: list[dict]) -> dict | None:
             art = arts.get(key)
             if isinstance(art, dict) and art.get("dashboard_id"):
                 return {"id": str(art["dashboard_id"]), "name": art.get("dashboard_name")}
+    return None
+
+
+def _recent_draft_plan(conversation_messages: list[dict]) -> dict | None:
+    """The plan dict from the most recent draft_dashboard_plan artifact.
+
+    Tool results aren't replayed into the ReAct message history, so on the
+    'confirm & build' turn the agent has no plan to pass. We resolve it from
+    the prior turn's artifact instead of asking the LLM to copy a large JSON.
+    """
+    for msg in reversed(conversation_messages or []):
+        if msg.get("role") != "assistant":
+            continue
+        arts = msg.get("artifacts")
+        if isinstance(arts, dict):
+            draft = arts.get("draft_dashboard_plan")
+            if isinstance(draft, dict) and isinstance(draft.get("plan"), dict):
+                return draft["plan"]
+    return None
+
+
+def _recent_proposed_changes(conversation_messages: list[dict]) -> dict | None:
+    """{dashboard_id, changes} from the most recent propose_dashboard_changes artifact."""
+    for msg in reversed(conversation_messages or []):
+        if msg.get("role") != "assistant":
+            continue
+        arts = msg.get("artifacts")
+        if isinstance(arts, dict):
+            prop = arts.get("propose_dashboard_changes")
+            if isinstance(prop, dict) and prop.get("changes") is not None:
+                return {"dashboard_id": prop.get("dashboard_id"), "changes": prop.get("changes")}
     return None
 
 
@@ -1113,6 +1140,7 @@ async def _run_tool(
     db: AsyncSession,
     org_id: UUID,
     current_user: User | None = None,
+    chat_state: dict | None = None,
 ) -> dict:
     try:
         result = None
@@ -1194,9 +1222,14 @@ async def _run_tool(
             if current_user is None:
                 return {"error": "build_dashboard_from_plan requires an authenticated user"}
             from app.services.dashboard_builder_service import build_dashboard_from_plan
-            plan = tool_input.get("plan")
-            if not isinstance(plan, dict):
-                return {"error": "plan must be the object returned by draft_dashboard_plan"}
+            # Source of truth is the plan we already previewed this conversation.
+            # The LLM-passed plan is a fallback only (it may be truncated/mangled).
+            plan = (chat_state or {}).get("draft_plan")
+            if not isinstance(plan, dict) or not plan.get("charts"):
+                cand = tool_input.get("plan")
+                plan = cand if isinstance(cand, dict) and cand.get("charts") else None
+            if not plan:
+                return {"error": "No drafted plan to build. Draft a plan first, then confirm."}
             if "is_public" in tool_input:
                 plan = {**plan, "is_public": bool(tool_input["is_public"])}
             return await build_dashboard_from_plan(db, org_id, current_user, plan)
@@ -1214,14 +1247,20 @@ async def _run_tool(
             if current_user is None:
                 return {"error": "apply_dashboard_changes requires an authenticated user"}
             from app.services.dashboard_builder_service import apply_dashboard_changes
-            changes = tool_input.get("changes")
+            # Source of truth is the changeset we already proposed this conversation.
+            proposed = (chat_state or {}).get("proposed_changes") or {}
+            changes = proposed.get("changes")
+            dash_id = tool_input.get("dashboard_id") or proposed.get("dashboard_id")
             if not isinstance(changes, list):
-                return {"error": "changes must be the array from propose_dashboard_changes"}
+                cand = tool_input.get("changes")
+                changes = cand if isinstance(cand, list) else None
+            if not changes or not dash_id:
+                return {"error": "No proposed changes to apply. Propose changes first, then confirm."}
             return await apply_dashboard_changes(
                 db,
                 org_id,
                 current_user,
-                dashboard_id=UUID(str(tool_input["dashboard_id"])),
+                dashboard_id=UUID(str(dash_id)),
                 changes=changes,
             )
     except ClientDBError as exc:
@@ -1885,6 +1924,12 @@ async def run(
     last_tool_context: dict[str, Any] = {}
     last_artifacts: dict[str, Any] = {}
     active_dashboard = _recent_active_dashboard(conversation_messages)
+    # Cross-turn dashboard state: build/apply resolve their payload from here so
+    # the agent never has to re-draft or copy a large plan/changes JSON.
+    chat_state: dict[str, Any] = {
+        "draft_plan": _recent_draft_plan(conversation_messages),
+        "proposed_changes": _recent_proposed_changes(conversation_messages),
+    }
     followup_rewrite = resolve_followup_query(conversation_messages, latest_user)
     if followup_rewrite:
         effective_user = followup_rewrite
@@ -1955,8 +2000,11 @@ async def run(
             intent = apply_dashboard_intent_override(intent, effective_user)
         # Mid dashboard intake/preview/edit flow: force the dashboard ReAct path so
         # card replies ("...draft the plan", "...build", "apply these changes") don't
-        # get short-circuited to a conversational reply or the wrong intent.
-        if is_dashboard_followup(conversation_messages, latest_user):
+        # get short-circuited to a conversational reply or the wrong intent. Also catch
+        # edit requests once a dashboard exists ("rename it", "add a chart").
+        if is_dashboard_followup(conversation_messages, latest_user) or (
+            active_dashboard and is_dashboard_edit_request(latest_user)
+        ):
             intent = IntentResult(intent="build_dashboard", confidence=0.95)
         if intent:
             chat_intent = intent.intent
@@ -2110,11 +2158,22 @@ async def run(
                     db,
                     current_user.org_id,
                     current_user=current_user,
+                    chat_state=chat_state,
                 )
                 last_tool_context[tool_use.name] = _condense_tool_result(
                     _json_ready(result)
                 )
                 _capture_dashboard_artifact(last_artifacts, tool_use.name, result)
+                # Make a fresh draft/proposal available to a build/apply call later
+                # in this same turn (agent that drafts and builds in one go).
+                if isinstance(result, dict) and "error" not in result:
+                    if tool_use.name == "draft_dashboard_plan" and isinstance(result.get("plan"), dict):
+                        chat_state["draft_plan"] = result["plan"]
+                    elif tool_use.name == "propose_dashboard_changes" and result.get("changes") is not None:
+                        chat_state["proposed_changes"] = {
+                            "dashboard_id": result.get("dashboard_id"),
+                            "changes": result.get("changes"),
+                        }
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -2174,6 +2233,10 @@ async def run_stream(
         return
 
     latest_user = _latest_user_message(conversation_messages)
+    chat_state: dict[str, Any] = {
+        "draft_plan": _recent_draft_plan(conversation_messages),
+        "proposed_changes": _recent_proposed_changes(conversation_messages),
+    }
     recalled = await recall_memories(current_user, latest_user) if latest_user else []
     recalled_block = format_recalled_for_prompt(recalled)
 
@@ -2242,7 +2305,16 @@ async def run_stream(
                     db,
                     current_user.org_id,
                     current_user=current_user,
+                    chat_state=chat_state,
                 )
+                if isinstance(result, dict) and "error" not in result:
+                    if tool_use.name == "draft_dashboard_plan" and isinstance(result.get("plan"), dict):
+                        chat_state["draft_plan"] = result["plan"]
+                    elif tool_use.name == "propose_dashboard_changes" and result.get("changes") is not None:
+                        chat_state["proposed_changes"] = {
+                            "dashboard_id": result.get("dashboard_id"),
+                            "changes": result.get("changes"),
+                        }
                 tool_results.append(
                     {
                         "type": "tool_result",

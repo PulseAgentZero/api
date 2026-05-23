@@ -152,6 +152,26 @@ _DASHBOARD_FOLLOWUP_TOOLS = frozenset({
     "propose_dashboard_changes",
 })
 
+# Edit phrasing that, when a dashboard is already active, means "change THIS dashboard"
+# (the topic regex also catches "chart"/"dashboard"). Gated by an active dashboard so
+# it never hijacks ordinary questions just because edit verbs appear.
+_DASHBOARD_EDIT_MARKERS = (
+    "rename", "add a chart", "add another chart", "another chart", "add chart",
+    "make it public", "make it private", "make this public", "make this private",
+    "edit the dashboard", "update the dashboard", "to the dashboard",
+    "from the dashboard", "swap", "replace the chart", "replace chart",
+)
+
+
+def is_dashboard_edit_request(message: str) -> bool:
+    """True when the message asks to modify a dashboard (use only with an active dashboard)."""
+    lower = (message or "").lower().strip()
+    if not lower:
+        return False
+    if _DASHBOARD_TOPIC_RE.search(lower):
+        return True
+    return any(m in lower for m in _DASHBOARD_EDIT_MARKERS)
+
 
 def is_dashboard_goal_ready(message: str) -> bool:
     """True when the user stated enough to auto-build a Studio dashboard."""
