@@ -75,7 +75,7 @@ The agent uses three tools in its ReAct loop, namely a user history lookup, an i
 
 The Recommendation Agent is an Entivia workflow that sits on top of the same three architectural layers used by the broader platform.
 
-The first layer is the embedded item catalogue. We embed every item in the loaded slice once, at load time, with a small open-source sentence model, BGE small in our case, run locally so there is no per-token cost or API rate limit. The vectors are stored in Qdrant. For the user persona vectors, we average the embeddings of the user's training reviews, then cache the result. The same approach is used by Entivia tenants on their own data.
+The first layer is the embedded item catalogue. We embed every item in the loaded slice once, at load time, with the same hosted retrieval model that the production Entivia stack runs on, namely Voyage voyage-4-large, which produces one thousand and twenty four dimensional vectors. The vectors are stored in Qdrant. For the user persona vectors, we average the embeddings of the user's training reviews, then cache the result inside Postgres on the user record. The same approach is used by Entivia tenants on their own data, so the hackathon container exercises exactly the retrieval stack that powers the live platform.
 
 The second layer is the agent runtime. The Recommendation Agent is a class in the production Entivia codebase that the hackathon container imports unchanged. The runtime takes care of provider fallback, tool dispatch, ReAct loop control, structured JSON output validation, and metadata collection. None of that has to be re-implemented for the hackathon.
 
@@ -86,8 +86,8 @@ The third layer is the application database. Postgres holds users, items, review
 | Frontend (judging) | OpenAPI documentation served at the Task B container endpoint, identical schema to the production cold-start Simulation route. |
 | Backend API | FastAPI, async first, one container dedicated to Task B, isolated from Task A per the brief. |
 | Agent runtime | Entivia ReAct loop with Anthropic Claude Sonnet primary and Groq fallback. |
-| Embedding model | BGE small, run locally via fastembed, three hundred and eighty four dimensional vectors. |
-| Vector store | Qdrant, holding the embedded item catalogue and the cached persona vectors. |
+| Embedding model | Voyage voyage-4-large, the same hosted retrieval model the Entivia production stack uses, one thousand and twenty four dimensional vectors. |
+| Vector store | Qdrant, holding the embedded item catalogue. Cached persona vectors live alongside the user record in Postgres. |
 | Application database | Postgres, holding the users, items, reviews, and cached persona summaries. |
 | Deployment | Docker Compose for local reproduction, a private VPS for the hosted Swagger demo, the live production runtime for the public cold-start Simulation route. |
 

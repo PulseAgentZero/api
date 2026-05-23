@@ -105,7 +105,7 @@ hackathon/
 ├── core/
 │   ├── db.py                  # Async SQLAlchemy session
 │   ├── repository.py          # Postgres queries used by agent tools
-│   ├── embeddings.py          # fastembed (BAAI/bge-small-en-v1.5) wrapper
+│   ├── embeddings.py          # Voyage `voyage-4-large` (1024-d) embedding client
 │   ├── vector_store.py        # Qdrant client + upsert / search helpers
 │   └── observability.py       # Per-request `meta` (tokens, latency, tool calls)
 ├── data/
@@ -402,9 +402,11 @@ End-to-end flow:
 
 1. **Loaders** (`hackathon/data/`) stream the Yelp Open Dataset (and an optional
    Goodreads slice) into Postgres.
-2. **`fastembed`** (BAAI/bge-small-en-v1.5, 384-d) embeds item text locally —
-   no embedding API, fully offline once the model is cached in a Docker volume.
-3. **Qdrant** stores item vectors and per-user persona vectors used by Task B.
+2. **Voyage `voyage-4-large`** (1024-d) embeds item text — the same hosted
+   retrieval model the production Entivia stack uses, so the hackathon
+   container exercises the real pipeline.
+3. **Qdrant** stores the item vectors. Per-user persona vectors are cached on
+   the user record in Postgres.
 4. **Task A** (`task-a-api`, port 8011) runs `ReviewSimulationAgent`. In direct
    mode it works from the request payload alone; in DB mode it grounds via
    `fetch_user_profile` and `fetch_item`.
@@ -433,10 +435,13 @@ Set via `.env` (loaded automatically; for secrets) or environment variables
 |----------|---------|---------|
 | `ANTHROPIC_API_KEY` | — | Required. Primary LLM. |
 | `GROQ_API_KEY` | — | Optional. Automatic fallback when Anthropic fails. |
+| `VOYAGEAI_API_KEY` | — | Required for the default `voyage` embedding backend. |
 | `HACKATHON_DATABASE_URL` | `postgresql+asyncpg://hackathon:hackathon@postgres:5432/hackathon` | Async Postgres DSN. |
 | `QDRANT_URL` | `http://qdrant:6333` | Qdrant endpoint. |
-| `HACKATHON_EMBEDDING_BACKEND` | `fastembed` | `fastembed` (default) or `pseudo` (smoke tests). |
-| `HACKATHON_FASTEMBED_MODEL` | `BAAI/bge-small-en-v1.5` | 384-d sentence model. |
+| `HACKATHON_EMBEDDING_BACKEND` | `voyage` | `voyage` (default) · `fastembed` (offline) · `pseudo` (smoke tests). |
+| `HACKATHON_VOYAGE_MODEL` | `voyage-4-large` | Voyage embedding model (1024-d). |
+| `HACKATHON_VECTOR_SIZE` | `1024` | Auto-derived from the active backend. |
+| `HACKATHON_FASTEMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Used only when backend is `fastembed`. |
 | `HACKATHON_YELP_DIR` | `/data/yelp` | Path inside the loader container. |
 | `HACKATHON_YELP_HOST_DIR` | `~/datasets/yelp` | Host folder mounted by the Makefile. |
 | `HACKATHON_MAX_YELP_USERS` | `5000` | Cap for loader sampling. |

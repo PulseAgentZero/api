@@ -161,7 +161,7 @@ def main() -> None:
         ax, 8.0, 6.6, 5.0, 1.0,
         "Qdrant vector store",
         "store",
-        sub="11,397 item vectors, 384 dimensions",
+        sub="11,397 item vectors, 1,024 dimensions",
     )
 
     fe = box(
@@ -170,9 +170,9 @@ def main() -> None:
         5.0,
         7.0,
         0.9,
-        "Open-source sentence embedder",
+        "Voyage voyage-4-large embedding model",
         "compute",
-        sub="runs locally, no embedding API, cached in a Docker volume",
+        sub="hosted API, same model as the Entivia production stack",
     )
 
     task_a = box(

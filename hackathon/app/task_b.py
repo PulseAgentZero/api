@@ -30,7 +30,7 @@ app = create_app(
         "- Warm-start (`user_id`) and cold-start (`persona`)\n"
         "- Multi-turn refinement (`conversation_id` + `follow_up`)\n"
         "- Cross-domain (`dataset=goodreads`)\n"
-        "- Local BGE embeddings + Qdrant ANN + LLM reranking\n\n"
+        "- Voyage voyage-4-large embeddings (1024-d) + Qdrant ANN + LLM reranking\n\n"
         "Requires Postgres + Qdrant (see `docker compose`). Every response includes `meta`. "
         "Offline eval: `GET /metrics`."
     ),

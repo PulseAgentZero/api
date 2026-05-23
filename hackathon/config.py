@@ -1,8 +1,8 @@
 """Hackathon runtime configuration.
 
 All values are environment-driven so the same image can run locally, in CI, and
-on a VPS without code changes. Defaults assume the bundled docker-compose
-stack and the open-source BGE embedding backend.
+on a VPS without code changes. Defaults match the Entivia production stack:
+Postgres for storage, Qdrant for vectors, Voyage voyage-4-large for embeddings.
 """
 
 from __future__ import annotations
