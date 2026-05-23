@@ -13,6 +13,9 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     conversation_id: UUID | None = None
+    tools_called: list[str] | None = None
+    
+    artifacts: dict | None = None
 
 
 class ConversationListItem(BaseModel):

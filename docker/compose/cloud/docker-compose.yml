@@ -52,6 +52,8 @@ x-app: &app
   dns:
     - 8.8.8.8
     - 8.8.4.4
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   restart: unless-stopped
   depends_on:
     postgres:

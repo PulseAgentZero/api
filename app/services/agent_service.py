@@ -37,6 +37,8 @@ class ChatResult:
     reply: str
     tool_context: dict[str, Any] = field(default_factory=dict)
     tools_called: list[str] = field(default_factory=list)
+    # UI artifacts keyed by dashboard-builder tool name (intake/plan/built/changes).
+    artifacts: dict[str, Any] = field(default_factory=dict)
 
 
 from app.config.settings import settings
@@ -72,6 +74,7 @@ from app.infrastructure.database.models.entity_profile import EntityProfile
 
 from app.agents.prompts.conversational import (
     CLARIFICATION_REPLY_PROMPT,
+    DASHBOARD_DISCOVERY_REPLY_PROMPT,
     DATA_ACCESS_REPLY_PROMPT,
     GREETING_REPLY_PROMPT,
     HELP_REPLY_PROMPT,
@@ -82,11 +85,14 @@ from app.agents.prompts.conversational import (
 )
 from app.services.intent_router import (
     CONVERSATIONAL_INTENTS,
+    IntentResult,
+    apply_dashboard_intent_override,
     apply_data_access_intent_override,
     apply_pipeline_intent_override,
     build_fastpath_args,
     classify_intent,
     filter_tools_by_intent,
+    is_dashboard_followup,
     resolve_followup_query,
 )
 
@@ -206,6 +212,7 @@ def _get_conv_groq() -> AsyncGroq | None:
 _CONV_REPLY_PROMPTS = {
     "greeting": GREETING_REPLY_PROMPT,
     "help": HELP_REPLY_PROMPT,
+    "dashboard_discovery": DASHBOARD_DISCOVERY_REPLY_PROMPT,
     "data_access": DATA_ACCESS_REPLY_PROMPT,
     "off_topic": OFF_TOPIC_REPLY_PROMPT,
     "unknown": CLARIFICATION_REPLY_PROMPT,
@@ -228,7 +235,7 @@ async def _craft_conversational_reply(intent_name: str, state: dict) -> str | No
     client = _get_conv_groq()
     if client is None:
         return None
-    max_tokens = 450 if intent_name in ("help", "data_access") else 320
+    max_tokens = 450 if intent_name in ("help", "data_access", "dashboard_discovery") else 320
     try:
         response = await asyncio.wait_for(
             client.chat.completions.create(
@@ -239,7 +246,7 @@ async def _craft_conversational_reply(intent_name: str, state: dict) -> str | No
                 ],
                 temperature=(
                     0.82 if intent_name == "greeting"
-                    else 0.65 if intent_name in ("help", "data_access")
+                    else 0.65 if intent_name in ("help", "data_access", "dashboard_discovery")
                     else 0.78
                 ),
                 max_tokens=max_tokens,
@@ -373,37 +380,99 @@ TOOLS = [
         },
     },
     {
-        "name": "build_custom_dashboard",
+        "name": "start_dashboard_intake",
         "description": (
-            "Build a complete Pulse Studio dashboard from a natural language goal. "
-            "Introspects the client database schema, generates SQL queries, picks chart types, "
-            "creates visualizations, and returns a link to the new dashboard. "
-            "Use when the user asks to 'build a dashboard', 'create charts', "
-            "'show me X visually', 'make a report on Y', or 'visualise Z'."
+            "FIRST step when the user wants a dashboard. Returns clarifying questions and "
+            "the org's available data connections (so the user can pick one). Call this as "
+            "soon as the user expresses a concrete dashboard goal. Do NOT skip straight to "
+            "building — the user must answer intake questions first."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "goal": {
                     "type": "string",
-                    "description": "Natural language description of what the dashboard should show",
-                },
-                "dashboard_name": {
-                    "type": "string",
-                    "description": "Name for the new dashboard (optional, defaults to goal summary)",
-                },
-                "is_public": {
-                    "type": "boolean",
-                    "description": "Whether to make the dashboard publicly shareable via a link. Default false.",
-                },
-                "max_charts": {
-                    "type": "integer",
-                    "description": "Maximum number of charts to generate (1–6). Default 4.",
-                    "minimum": 1,
-                    "maximum": 6,
+                    "description": "What the user wants the dashboard to show, in their words.",
                 },
             },
             "required": ["goal"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "draft_dashboard_plan",
+        "description": (
+            "SECOND step, after the user answers the intake questions. Produces a reviewable "
+            "plan (charts, SQL, filters) WITHOUT saving anything. Pass the user's answers; "
+            "include connection_id when intake offered a choice, otherwise omit it (the org's "
+            "only connection is used). Show the plan and ask the user to confirm before building."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "connection_id": {"type": "string", "description": "Connection chosen during intake."},
+                "goal": {"type": "string", "description": "The dashboard goal / business question."},
+                "dashboard_name": {"type": "string"},
+                "time_window": {"type": "string", "description": "Default time window, e.g. 'last 30 days'."},
+                "segments": {"type": "string", "description": "How to break the data down, e.g. 'by region'."},
+                "filters_to_parameterize": {"type": "string", "description": "Filters users should control."},
+                "compare_period": {"type": "string", "description": "Comparison period, e.g. 'vs prior month'."},
+                "max_charts": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Charts to generate. Default 3, max 4 — keep it focused."},
+            },
+            "required": ["goal"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "build_dashboard_from_plan",
+        "description": (
+            "FINAL step: persist a plan the user has explicitly approved. Only call AFTER "
+            "draft_dashboard_plan and an explicit confirmation from the user. Requires the full "
+            "plan object returned by draft_dashboard_plan — if you don't already have it in this "
+            "turn, call draft_dashboard_plan again (same connection_id and answers) to obtain it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "plan": {"type": "object", "description": "The full plan object from draft_dashboard_plan."},
+                "is_public": {"type": "boolean", "description": "Make the dashboard publicly shareable. Default false."},
+            },
+            "required": ["plan"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "propose_dashboard_changes",
+        "description": (
+            "Read-only: turn the user's natural-language edit request into a list of structured "
+            "changes to an EXISTING dashboard. Use the active dashboard_id from the context note. "
+            "Show the proposed changes for approval; nothing is saved by this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {"type": "string", "description": "Id of the dashboard to edit."},
+                "feedback": {"type": "string", "description": "What the user wants changed."},
+            },
+            "required": ["dashboard_id", "feedback"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_dashboard_changes",
+        "description": (
+            "Persist approved changes to an existing dashboard. Only after propose_dashboard_changes "
+            "and an explicit user confirmation. Requires dashboard_id and the changes array from "
+            "propose_dashboard_changes — if you don't have it in this turn, call "
+            "propose_dashboard_changes again (same feedback) to obtain it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dashboard_id": {"type": "string"},
+                "changes": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["dashboard_id", "changes"],
             "additionalProperties": False,
         },
     },
@@ -449,6 +518,45 @@ def _condense_tool_result(result: Any, max_chars: int = 500) -> Any:
     if isinstance(result, str) and len(result) > max_chars:
         return result[:max_chars]
     return result
+
+
+_DASHBOARD_ARTIFACT_TOOLS = frozenset({
+    "start_dashboard_intake", "draft_dashboard_plan", "build_dashboard_from_plan",
+    "propose_dashboard_changes", "apply_dashboard_changes",
+})
+
+
+def _capture_dashboard_artifact(bag: dict[str, Any], tool_name: str, result: Any) -> None:
+    """Record a dashboard-builder result as the turn's single UI artifact.
+
+    Skips error results so a failed step keeps the prior card (e.g. the plan to retry).
+    """
+    if tool_name not in _DASHBOARD_ARTIFACT_TOOLS:
+        return
+    if not isinstance(result, dict) or "error" in result:
+        return
+    bag.clear()
+    bag[tool_name] = _json_ready(result)
+
+
+def _recent_active_dashboard(conversation_messages: list[dict]) -> dict | None:
+    """Most recent built/edited dashboard {id, name} from prior-turn artifacts."""
+    for msg in reversed(conversation_messages or []):
+        if msg.get("role") != "assistant":
+            continue
+        arts = msg.get("artifacts")
+        if not isinstance(arts, dict):
+            continue
+        built = arts.get("build_dashboard_from_plan")
+        if isinstance(built, dict) and isinstance(built.get("dashboard"), dict):
+            dash = built["dashboard"]
+            if dash.get("id"):
+                return {"id": str(dash["id"]), "name": dash.get("name")}
+        for key in ("apply_dashboard_changes", "propose_dashboard_changes"):
+            art = arts.get(key)
+            if isinstance(art, dict) and art.get("dashboard_id"):
+                return {"id": str(art["dashboard_id"]), "name": art.get("dashboard_name")}
+    return None
 
 
 async def _overview(db: AsyncSession, org_id: UUID) -> dict:
@@ -999,212 +1107,6 @@ async def _action_draft(
         return _action_draft_fallback(detail, entity_id, action_type)
 
 
-def _extract_json_array(raw_text: str) -> list[dict]:
-    """Parse a JSON array from LLM output, stripping markdown fences if present."""
-    text = raw_text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1:
-        raise ValueError("Expected JSON array")
-    data = json.loads(text[start : end + 1])
-    if not isinstance(data, list):
-        raise ValueError("Expected JSON array")
-    return [x for x in data if isinstance(x, dict)]
-
-
-async def _build_custom_dashboard(
-    db: AsyncSession,
-    org_id: UUID,
-    current_user: User,
-    goal: str,
-    dashboard_name: str | None,
-    is_public: bool,
-    max_charts: int,
-) -> dict:
-    """Build a Pulse Studio dashboard from a natural language goal.
-
-    Steps:
-    1. Introspect the client database schema
-    2. Ask the LLM to generate SQL queries + chart configs for the goal
-    3. Persist queries → visualizations → dashboard → items
-    4. Return dashboard link
-    """
-    import re as _re
-    import secrets as _secrets
-
-    from app.agents.tools.client_db import open_client_engine, safe_client_connection
-    from app.infrastructure.audit import log_audit
-    from app.infrastructure.database.repositories.studio_dashboard_item_repository import (
-        StudioDashboardItemRepository,
-    )
-    from app.infrastructure.database.repositories.studio_dashboard_repository import (
-        StudioDashboardRepository,
-    )
-    from app.infrastructure.database.repositories.studio_query_repository import (
-        StudioQueryRepository,
-    )
-    from app.infrastructure.database.repositories.studio_visualization_repository import (
-        StudioVisualizationRepository,
-    )
-    from app.api.dependencies.plan_gate import check_studio_dashboard_limit
-    from app.services.studio_query_service import _inject_limit, _is_select_only
-    from app.agents.tools.client_db import schema_columns_sql
-
-    max_charts = max(1, min(max_charts, 6))
-
-    try:
-        await check_studio_dashboard_limit(db, org_id)
-    except Exception as exc:
-        from app.api.errors import PulseHTTPException
-        if isinstance(exc, PulseHTTPException):
-            detail = exc.detail
-            msg = detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail)
-            return {"error": msg}
-        return {"error": str(exc)}
-
-    # Step 1: Introspect schema
-    schema_context = ""
-    try:
-        engine, conn = await open_client_engine(db, org_id)
-        try:
-            async with safe_client_connection(engine, conn) as client_conn:
-                from sqlalchemy import text as _text
-                db_type = getattr(conn, "db_type", None)
-                if db_type == "mysql":
-                    tables_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() LIMIT 20"
-                elif db_type == "mssql":
-                    tables_sql = "SELECT TOP 20 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
-                elif db_type == "sqlite":
-                    tables_sql = "SELECT name FROM sqlite_master WHERE type='table' LIMIT 20"
-                else:
-                    tables_sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' LIMIT 20"
-                table_rows = (await client_conn.execute(_text(tables_sql))).all()
-                table_names = [r[0] for r in table_rows]
-                cols_sql = schema_columns_sql(db_type)
-                lines = []
-                for tname in table_names[:20]:
-                    try:
-                        col_rows = (await client_conn.execute(_text(cols_sql), {"tname": tname})).all()
-                        cols = [r[0] for r in col_rows[:20]]
-                        lines.append(f"table: {tname} | columns: {', '.join(cols)}")
-                    except Exception:
-                        lines.append(f"table: {tname}")
-                schema_context = "\n".join(lines)
-        finally:
-            await engine.dispose()
-    except Exception as exc:
-        return {"error": f"Could not connect to client database: {exc}"}
-
-    if not schema_context:
-        return {"error": "No tables found in client database"}
-
-    # Step 2: LLM planning
-    system_prompt = (
-        "You are a SQL expert. Given a database schema and a goal, generate a JSON array "
-        "of chart specifications. Each spec must have: "
-        "\"query_name\" (string), \"description\" (string), \"sql\" (valid SELECT SQL), "
-        "\"chart_type\" (one of: bar, line, area, pie, scatter, table, number), "
-        "\"config\" (object with relevant fields: x_axis, y_axis, color, title, value_column, label_column). "
-        "Output ONLY valid JSON. No markdown. No explanation."
-    )
-    user_prompt = (
-        f"Schema:\n{schema_context}\n\n"
-        f"Goal: {goal}\n\n"
-        f"Generate {max_charts} chart specifications."
-    )
-
-    try:
-        from app.infrastructure.llm.factory import get_llm_client
-        llm = get_llm_client()
-        if not llm.is_configured():
-            return {"error": f"AI provider '{llm.provider_name}' is not configured"}
-        raw_text = await llm.complete(system_prompt, user_prompt, max_tokens=2000, temperature=0.1)
-        plan = _extract_json_array(raw_text)
-    except Exception as exc:
-        logger.warning("[build_dashboard] LLM planning failed: %s", exc)
-        return {"error": "Agent could not generate a dashboard plan from the goal"}
-
-    safe_plan = [
-        spec for spec in plan
-        if isinstance(spec, dict) and spec.get("sql") and _is_select_only(str(spec["sql"]))
-    ]
-    if not safe_plan:
-        return {"error": "Generated SQL was not safe to execute — only SELECT statements are allowed"}
-
-    # Step 3: Persist
-    query_repo = StudioQueryRepository(db)
-    viz_repo = StudioVisualizationRepository(db)
-    dash_repo = StudioDashboardRepository(db)
-    item_repo = StudioDashboardItemRepository(db)
-
-    created_vizs = []
-    for spec in safe_plan:
-        safe_sql = _inject_limit(str(spec["sql"]).strip(), 5000)
-        q = await query_repo.create(
-            org_id, current_user.id,
-            name=str(spec.get("query_name", "Query")),
-            description=str(spec.get("description", "")),
-            sql_text=safe_sql,
-            connection_id=None,
-        )
-        viz = await viz_repo.create(
-            org_id, q.id, current_user.id,
-            name=str(spec.get("query_name", "Chart")),
-            chart_type=str(spec.get("chart_type", "table")),
-            config={k: v for k, v in (spec.get("config") or {}).items() if v is not None},
-        )
-        created_vizs.append(viz)
-
-    slug: str | None = None
-    if is_public:
-        name_for_slug = dashboard_name or goal
-        base = _re.sub(r"[^a-z0-9]+", "-", name_for_slug.lower()).strip("-")[:60]
-        for _ in range(5):
-            candidate = f"{base}-{_secrets.token_hex(2)}"
-            if not await dash_repo.slug_exists(candidate):
-                slug = candidate
-                break
-
-    dashboard_name_final = dashboard_name or goal[:80]
-    dashboard = await dash_repo.create(
-        org_id, current_user.id,
-        name=dashboard_name_final,
-        description=f"Auto-generated from goal: {goal[:200]}",
-        is_public=is_public,
-        slug=slug,
-        layout=[],
-    )
-
-    layout = []
-    for i, viz in enumerate(created_vizs):
-        item = await item_repo.create(org_id, dashboard.id, viz.id, i)
-        layout.append({"item_id": str(item.id), "x": (i % 2) * 6, "y": (i // 2) * 4, "w": 6, "h": 4})
-
-    await dash_repo.update(dashboard, layout=layout)
-    await db.commit()
-
-    # Step 4: Audit + return
-    try:
-        await log_audit(
-            db, org_id=org_id, user_id=current_user.id,
-            action="studio.agent_build_dashboard",
-            metadata={"goal": goal[:200], "charts": len(created_vizs)},
-        )
-    except Exception:
-        pass
-
-    return {
-        "dashboard_id": str(dashboard.id),
-        "dashboard_name": dashboard_name_final,
-        "chart_count": len(created_vizs),
-        "is_public": is_public,
-        "slug": slug,
-        "message": f"Dashboard '{dashboard_name_final}' created with {len(created_vizs)} chart(s).",
-    }
-
-
 async def _run_tool(
     name: str,
     tool_input: dict,
@@ -1266,17 +1168,61 @@ async def _run_tool(
                 str(tool_input["entity_id"]),
                 limit=int(tool_input.get("limit") or 10),
             )
-        if name == "build_custom_dashboard":
+        if name == "start_dashboard_intake":
             if current_user is None:
-                return {"error": "build_custom_dashboard requires an authenticated user"}
-            return await _build_custom_dashboard(
+                return {"error": "start_dashboard_intake requires an authenticated user"}
+            from app.services.dashboard_builder_service import start_dashboard_intake
+            return await start_dashboard_intake(db, org_id, goal=str(tool_input.get("goal", "")))
+        if name == "draft_dashboard_plan":
+            if current_user is None:
+                return {"error": "draft_dashboard_plan requires an authenticated user"}
+            from app.services.dashboard_builder_service import draft_dashboard_plan
+            cid = tool_input.get("connection_id")
+            return await draft_dashboard_plan(
+                db,
+                org_id,
+                connection_id=UUID(str(cid)) if cid else None,
+                goal=str(tool_input.get("goal", "")),
+                dashboard_name=tool_input.get("dashboard_name"),
+                time_window=tool_input.get("time_window"),
+                segments=tool_input.get("segments"),
+                filters_to_parameterize=tool_input.get("filters_to_parameterize"),
+                compare_period=tool_input.get("compare_period"),
+                max_charts=int(tool_input.get("max_charts") or 3),
+            )
+        if name == "build_dashboard_from_plan":
+            if current_user is None:
+                return {"error": "build_dashboard_from_plan requires an authenticated user"}
+            from app.services.dashboard_builder_service import build_dashboard_from_plan
+            plan = tool_input.get("plan")
+            if not isinstance(plan, dict):
+                return {"error": "plan must be the object returned by draft_dashboard_plan"}
+            if "is_public" in tool_input:
+                plan = {**plan, "is_public": bool(tool_input["is_public"])}
+            return await build_dashboard_from_plan(db, org_id, current_user, plan)
+        if name == "propose_dashboard_changes":
+            if current_user is None:
+                return {"error": "propose_dashboard_changes requires an authenticated user"}
+            from app.services.dashboard_builder_service import propose_dashboard_changes
+            return await propose_dashboard_changes(
+                db,
+                org_id,
+                dashboard_id=UUID(str(tool_input["dashboard_id"])),
+                feedback=str(tool_input.get("feedback", "")),
+            )
+        if name == "apply_dashboard_changes":
+            if current_user is None:
+                return {"error": "apply_dashboard_changes requires an authenticated user"}
+            from app.services.dashboard_builder_service import apply_dashboard_changes
+            changes = tool_input.get("changes")
+            if not isinstance(changes, list):
+                return {"error": "changes must be the array from propose_dashboard_changes"}
+            return await apply_dashboard_changes(
                 db,
                 org_id,
                 current_user,
-                goal=str(tool_input["goal"]),
-                dashboard_name=tool_input.get("dashboard_name"),
-                is_public=bool(tool_input.get("is_public", False)),
-                max_charts=int(tool_input.get("max_charts") or 4),
+                dashboard_id=UUID(str(tool_input["dashboard_id"])),
+                changes=changes,
             )
     except ClientDBError as exc:
         return {"error": str(exc)}
@@ -1486,6 +1432,7 @@ async def _system_prompt(
     recalled_block: str = "",
     handoff_block: str = "",
     overflow_summary: str = "",
+    active_dashboard: dict | None = None,
 ) -> str:
     org = await OrganizationRepository(db).get_by_id(current_user.org_id)
     org_name = org.name if org else "this organization"
@@ -1508,6 +1455,18 @@ async def _system_prompt(
             "for context on what was discussed earlier.\n\n"
         )
 
+    # Surface the most recently built/edited dashboard so the agent has the
+    # dashboard_id for propose_dashboard_changes / apply_dashboard_changes.
+    dashboard_block = ""
+    if active_dashboard and active_dashboard.get("id"):
+        name = active_dashboard.get("name") or "the dashboard"
+        dashboard_block = (
+            "## Active dashboard\n"
+            f"The user's most recent dashboard is \"{name}\" "
+            f"(dashboard_id: {active_dashboard['id']}). Use this dashboard_id when "
+            "they ask to change, rename, add charts to, or edit a dashboard.\n\n"
+        )
+
     return render_chat_system_prompt(
         org_name=org_name,
         entity_label=entity_label,
@@ -1516,7 +1475,7 @@ async def _system_prompt(
         industry=industry,
         pipeline_block=pipeline_block,
         memory_block=memory_block,
-        handoff_block=handoff_block + overflow_block,
+        handoff_block=handoff_block + overflow_block + dashboard_block,
         recalled_block=recalled_block,
     )
 
@@ -1847,9 +1806,18 @@ def _conversational_reply_template(intent_name: str, state: dict) -> str:
         return sanitize_pulse_reply(
             f"I'm Entivia for {org_name}. I can summarize {entity_label}, look up IDs, "
             f"surface actions, check pipeline runs, review model metrics, track trends, "
-            f"find similar records, or draft outreach. "
+            f"find similar records, draft outreach, or build Studio dashboards when you "
+            f"describe what to track. "
             f"Try \"show critical {entity_label}\" or \"tell me about 628\". "
             f"What should we look at first?"
+        )
+
+    if intent_name == "dashboard_discovery":
+        return sanitize_pulse_reply(
+            f"Yes, I can build Pulse Studio dashboards from {org_name}'s live data. "
+            f"Before I create one, what decision are you trying to support, which metrics "
+            f"or breakdowns matter, and any timeframe? Dashboards start private. "
+            f"For example: \"build a dashboard showing churn by region for the last 90 days.\""
         )
 
     if intent_name == "off_topic":
@@ -1909,11 +1877,14 @@ async def run(
             reply=clean,
             tool_context=dict(last_tool_context),
             tools_called=list(chat_tools),
+            artifacts=dict(last_artifacts),
         )
 
     latest_user = _latest_user_message(conversation_messages)
     effective_user = latest_user
     last_tool_context: dict[str, Any] = {}
+    last_artifacts: dict[str, Any] = {}
+    active_dashboard = _recent_active_dashboard(conversation_messages)
     followup_rewrite = resolve_followup_query(conversation_messages, latest_user)
     if followup_rewrite:
         effective_user = followup_rewrite
@@ -1981,10 +1952,17 @@ async def run(
         if intent:
             intent = apply_pipeline_intent_override(intent, effective_user)
             intent = apply_data_access_intent_override(intent, effective_user)
+            intent = apply_dashboard_intent_override(intent, effective_user)
+        # Mid dashboard intake/preview/edit flow: force the dashboard ReAct path so
+        # card replies ("...draft the plan", "...build", "apply these changes") don't
+        # get short-circuited to a conversational reply or the wrong intent.
+        if is_dashboard_followup(conversation_messages, latest_user):
+            intent = IntentResult(intent="build_dashboard", confidence=0.95)
+        if intent:
             chat_intent = intent.intent
             chat_confidence = intent.confidence
 
-        # Conversational intents — greeting / help / off_topic / (low-confidence) unknown.
+        # Conversational intents — greeting / help / dashboard_discovery / off_topic / unknown.
         # Skip ReAct and tool calls entirely; return a context-aware reply.
         if (
             not followup_rewrite
@@ -2000,6 +1978,10 @@ async def run(
                 db, current_user, intent.intent, latest_user,
                 conversation_messages=conversation_messages,
             )
+            # Tag the discovery reply so the user's next (goal) message bridges into
+            # the dashboard intake flow even if the classifier doesn't catch it.
+            if intent.intent == "dashboard_discovery":
+                last_tool_context["dashboard_discovery"] = True
             return _finish(
                 reply, "conversational", intent.intent, intent.confidence,
                 effective_query=followup_rewrite,
@@ -2023,6 +2005,7 @@ async def run(
                     last_tool_context[tool_name] = _condense_tool_result(
                         _json_ready(tool_result)
                     )
+                    _capture_dashboard_artifact(last_artifacts, tool_name, tool_result)
                     base_system = await _system_prompt(
                         db, current_user,
                         recalled_block=recalled_block, handoff_block=handoff_block,
@@ -2058,7 +2041,10 @@ async def run(
             )
 
     # Optional Query+Synthesis split (hierarchical pattern from Agentic Architectures e-book).
-    if settings.CONV_AGENT_SPLIT_ENABLED:
+    # Dashboard building/editing must use the ReAct path below so tool results are
+    # captured as UI artifacts (the split orchestrator does not surface them).
+    _is_dashboard_turn = (chat_intent == "build_dashboard") or active_dashboard is not None
+    if settings.CONV_AGENT_SPLIT_ENABLED and not _is_dashboard_turn:
         chat_path = "split"
         base_system = await _system_prompt(
             db, current_user, recalled_block=recalled_block, handoff_block=handoff_block,
@@ -2095,7 +2081,7 @@ async def run(
         response = await client.messages.create(
             model=settings.ANTHROPIC_LLM_MODEL,
             max_tokens=900,
-            system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary),
+            system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary, active_dashboard=active_dashboard),
             tools=tools_for_run,
             messages=messages,
         )
@@ -2128,6 +2114,7 @@ async def run(
                 last_tool_context[tool_use.name] = _condense_tool_result(
                     _json_ready(result)
                 )
+                _capture_dashboard_artifact(last_artifacts, tool_use.name, result)
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -2139,7 +2126,7 @@ async def run(
             response = await client.messages.create(
                 model=settings.ANTHROPIC_LLM_MODEL,
                 max_tokens=900,
-                system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary),
+                system=await _system_prompt(db, current_user, recalled_block=recalled_block, handoff_block=handoff_block, overflow_summary=overflow_summary, active_dashboard=active_dashboard),
                 tools=tools_for_run,
                 messages=messages,
             )

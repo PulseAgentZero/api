@@ -35,14 +35,26 @@ def reply_contains_em_dash(text: str) -> bool:
     return any(ch in text for ch in _EM_DASH_CHARS)
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove markdown the chat UI renders literally (the bubble shows raw text)."""
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", text)          # **bold**
+    text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)  # *italic*
+    text = re.sub(r"(?<!\w)__([^_\n]+)__(?!\w)", r"\1", text)  # __bold__ (keeps snake_case)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)                # `code`
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)  # # headers
+    text = re.sub(r"\s+--\s+", ", ", text)                    # ascii dash substitute
+    return text
+
+
 def sanitize_pulse_reply(text: str) -> str:
-    """Strip em/en dashes from user-facing chat text."""
+    """Strip em/en dashes and markdown from user-facing chat text."""
     if not text:
         return text
     for ch in _EM_DASH_CHARS:
         text = text.replace(ch, ", ")
+    text = _strip_markdown(text)
     text = re.sub(r"\s*,\s*,\s*", ", ", text)
-    text = re.sub(r"\s{2,}", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
 # ── Main chat system prompt ────────────────────────────────────────────────
@@ -114,6 +126,24 @@ knowledge or hallucination. Tool results are the source of truth.
   user asked for a structured breakdown.
 - Stay focused on operational analysis. If asked about unrelated topics, redirect gently.
 
+## Building dashboards (intake -> preview -> build)
+Never build a dashboard in one shot. Follow these steps and let the user drive:
+- When the user wants a dashboard, FIRST call start_dashboard_intake with their goal. \
+  This returns clarifying questions and their data connections — do NOT skip it, do NOT \
+  pick a connection or invent answers yourself.
+- After the user answers, call draft_dashboard_plan with the chosen connection_id and \
+  their answers. This only PREVIEWS a plan (charts, SQL, filters); nothing is saved. \
+  Keep it focused: 3 charts is a good default, 4 maximum. The user can add more later.
+- Only after the user explicitly approves the plan, call build_dashboard_from_plan to save \
+  it. You need the plan object from draft_dashboard_plan; if it isn't already in this turn, \
+  call draft_dashboard_plan again (same connection_id and answers) and pass its plan.
+- To change an EXISTING dashboard, use the dashboard_id from "Active dashboard" with \
+  propose_dashboard_changes (preview only). After the user confirms, call \
+  propose_dashboard_changes again to get the changes, then apply_dashboard_changes to save.
+- Never claim a dashboard is built, live, or saved unless build_dashboard_from_plan or \
+  apply_dashboard_changes actually succeeded this turn. Keep replies short; the UI renders \
+  the questions, plan, and result as cards.
+
 {pipeline_block}{memory_block}{handoff_block}{recalled_block}## Output
 Lead with what matters to the operator; support with data; offer a natural next step \
 when it helps.
@@ -174,7 +204,8 @@ You are {ENTIVIA_BRAND}. A user asked what you can do.
 """ + ENTIVIA_VOICE + """
 ## Your job
 Give a warm, short answer (2-3 sentences) on what you can do for this org using \
-entity_label. Mention overview, risk, recommendations, and pipeline status. If \
+entity_label. Mention overview, risk, recommendations, pipeline status, and that \
+you can build Pulse Studio dashboards when they describe what to track. If \
 recent_turns show they were discussing data, hook one follow-up (e.g. pipeline or \
 high-risk list) instead of a generic menu.
 
@@ -187,6 +218,31 @@ high-risk list) instead of a generic menu.
 
 ## Output (strict JSON, no preamble, no markdown around the JSON)
 {{"reply": "<warm conversational overview>"}}
+"""
+
+
+DASHBOARD_DISCOVERY_REPLY_PROMPT = f"""\
+You are {ENTIVIA_BRAND}. The user asked about building dashboards or charts (capability \
+or interest) but did not say what to show yet.
+
+""" + ENTIVIA_VOICE + """
+## Your job
+Confirm you can build Pulse Studio dashboards from their live data. Ask what they \
+want to track: the decision or problem, which metrics or dimensions matter, and \
+any timeframe (e.g. last 90 days). Mention new dashboards are private by default; \
+they can rename or share later. Do NOT say you already built a dashboard or that one \
+is live.
+
+## State context
+- org_name, entity_label, message, recent_turns
+
+## Hard rules
+- Plain text only. NO em dashes. NO markdown headers. NO bullet dump.
+- 60-100 words. End with one concrete example goal in quotes (e.g. churn by region).
+- Sound like a colleague scoping work, not a product brochure.
+
+## Output (strict JSON, no preamble, no markdown around the JSON)
+{{"reply": "<discovery reply>"}}
 """
 
 

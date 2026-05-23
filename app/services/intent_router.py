@@ -107,6 +107,82 @@ _TIME_PRESSURE_PATTERNS = (
     "due today", "by tomorrow", "time-sensitive",
 )
 
+_DASHBOARD_TOPIC_RE = re.compile(
+    r"\b(dashboard|dashboards|chart|charts|visuali[sz]e|visuali[sz]ation|reports?)\b",
+    re.I,
+)
+
+_DASHBOARD_CAPABILITY_RE = re.compile(
+    r"^(can you|could you|do you|does it|are you able|is it possible|am i able)\b"
+    r"|"
+    r"\b(can you|could you|do you|are you able|is it possible)\b.{0,60}\b"
+    r"(build|make|create|support)\b",
+    re.I,
+)
+
+_DASHBOARD_IMPERATIVE_PHRASES = (
+    "build me", "build a dashboard", "create a dashboard", "make me a dashboard",
+    "create charts for", "create charts showing", "visualize ", "visualise ",
+    "show me ", "make a report on", "report on ", "dashboard showing",
+    "dashboard for", "charts for", "charts showing",
+)
+
+_DASHBOARD_GOAL_SIGNALS = (
+    "churn", "revenue", "by month", "by region", "over time", "last ", "past ",
+    "signups", "signup", "registration", "growth", "risk", "tier", "outcome",
+    "fraud", "subscriber", "customer", "ticket", "support", "kpi", "metric",
+    "showing ", "tracking ", "for the last", "per month", "per region",
+    "broken down", "breakdown", "trend",
+)
+
+_DASHBOARD_CARD_REPLY_MARKERS = (
+    "here are my answers",
+    "please draft the plan",
+    "please build this dashboard",
+    "apply these changes",
+    "change the plan:",
+    "don't apply these",
+)
+
+# Tools whose presence on the prior assistant turn means the user is mid-flow
+# (intake/plan shown, or changes proposed — still awaiting the user's next step).
+_DASHBOARD_FOLLOWUP_TOOLS = frozenset({
+    "start_dashboard_intake",
+    "draft_dashboard_plan",
+    "propose_dashboard_changes",
+})
+
+
+def is_dashboard_goal_ready(message: str) -> bool:
+    """True when the user stated enough to auto-build a Studio dashboard."""
+    lower = (message or "").lower().strip()
+    if not lower:
+        return False
+    has_topic = bool(_DASHBOARD_TOPIC_RE.search(lower))
+    has_goal_signal = any(p in lower for p in _DASHBOARD_GOAL_SIGNALS)
+    has_imperative = any(p in lower for p in _DASHBOARD_IMPERATIVE_PHRASES)
+    if has_imperative and (has_goal_signal or "showing" in lower or " for " in lower):
+        return True
+    if has_imperative and len(lower) > 45 and has_topic:
+        return True
+    if has_topic and has_goal_signal:
+        return True
+    return False
+
+
+def is_dashboard_capability_question(message: str) -> bool:
+    """True for yes/no capability asks about dashboards without a concrete goal."""
+    lower = (message or "").lower().strip()
+    if not lower or not _DASHBOARD_TOPIC_RE.search(lower):
+        return False
+    if is_dashboard_goal_ready(message):
+        return False
+    if _DASHBOARD_CAPABILITY_RE.search(lower):
+        return True
+    if lower.rstrip("?") in ("dashboard", "dashboards", "charts", "chart"):
+        return True
+    return False
+
 
 def message_mentions_pipeline(message: str) -> bool:
     """True when the user is asking about autonomous pipeline / analysis runs."""
@@ -136,6 +212,38 @@ def apply_data_access_intent_override(intent: IntentResult, message: str) -> Int
     if any(p in lower for p in _DATA_ACCESS_PATTERNS):
         return IntentResult(
             intent="data_access",
+            confidence=max(intent.confidence, 0.88),
+            entity_ids=intent.entity_ids,
+            tier_filter=intent.tier_filter,
+            urgency_filter=intent.urgency_filter,
+            raw=intent.raw,
+        )
+    return intent
+
+
+def apply_dashboard_intent_override(intent: IntentResult, message: str) -> IntentResult:
+    """Route capability-only dashboard asks to discovery; require a goal before build."""
+    if is_dashboard_capability_question(message):
+        return IntentResult(
+            intent="dashboard_discovery",
+            confidence=max(intent.confidence, 0.92),
+            entity_ids=intent.entity_ids,
+            tier_filter=intent.tier_filter,
+            urgency_filter=intent.urgency_filter,
+            raw=intent.raw,
+        )
+    if intent.intent == "build_dashboard" and not is_dashboard_goal_ready(message):
+        return IntentResult(
+            intent="dashboard_discovery",
+            confidence=max(intent.confidence, 0.85),
+            entity_ids=intent.entity_ids,
+            tier_filter=intent.tier_filter,
+            urgency_filter=intent.urgency_filter,
+            raw=intent.raw,
+        )
+    if intent.intent in ("help", "unknown") and is_dashboard_goal_ready(message):
+        return IntentResult(
+            intent="build_dashboard",
             confidence=max(intent.confidence, 0.88),
             entity_ids=intent.entity_ids,
             tier_filter=intent.tier_filter,
@@ -204,15 +312,12 @@ def _heuristic_fallback(message: str) -> IntentResult:
     if any(kw in lower for kw in ("critical", "high risk", "high-risk", "at risk", "list", "show")):
         tier = "critical" if "critical" in lower else ("high" if "high" in lower else None)
         return IntentResult("lookup_entities", 0.6, tier_filter=tier)
-    if any(
-        kw in lower
-        for kw in (
-            "dashboard", "build a chart", "build me a chart",
-            "visuali", "visualize", "visualise", "report on",
-            "make a report", "create charts",
-        )
-    ):
-        return IntentResult("build_dashboard", 0.75)
+    if _DASHBOARD_TOPIC_RE.search(lower):
+        if is_dashboard_capability_question(message):
+            return IntentResult("dashboard_discovery", 0.85)
+        if is_dashboard_goal_ready(message):
+            return IntentResult("build_dashboard", 0.75)
+        return IntentResult("dashboard_discovery", 0.7)
     return IntentResult("unknown", 0.3)
 
 
@@ -283,7 +388,9 @@ async def classify_intent(
 
 # Conversational intents bypass the ReAct loop entirely — handled by
 # agent_service._conversational_reply with no tool calls.
-CONVERSATIONAL_INTENTS = frozenset({"greeting", "help", "data_access", "off_topic", "unknown"})
+CONVERSATIONAL_INTENTS = frozenset({
+    "greeting", "help", "data_access", "off_topic", "unknown", "dashboard_discovery",
+})
 
 # Tool subset the ReAct loop should see when this intent fires.
 # None = no prefilter (give the agent all tools).
@@ -302,7 +409,13 @@ INTENT_TOOLS: dict[str, Optional[tuple[str, ...]]] = {
     "compare_runs": ("compare_pipeline_runs", "get_pipeline_status"),
     "find_similar": ("find_similar_entities", "get_entity_detail"),
     "generate_draft": ("generate_action_draft", "get_entity_detail"),
-    "build_dashboard": ("build_custom_dashboard",),
+    "build_dashboard": (
+        "start_dashboard_intake",
+        "draft_dashboard_plan",
+        "build_dashboard_from_plan",
+        "propose_dashboard_changes",
+        "apply_dashboard_changes",
+    ),
     "compare_or_explain": None,
     "unknown": None,
 }
@@ -321,7 +434,6 @@ _FASTPATH_TOOL: dict[str, str] = {
     "compare_runs": "compare_pipeline_runs",
     "find_similar": "find_similar_entities",
     "generate_draft": "generate_action_draft",
-    "build_dashboard": "build_custom_dashboard",
 }
 
 
@@ -363,11 +475,6 @@ def build_fastpath_args(
         if not intent.entity_ids:
             return None
         return tool, {"entity_id": intent.entity_ids[0], "action_type": "message"}
-    if tool == "build_custom_dashboard":
-        goal = (user_message or "").strip()
-        if not goal:
-            return None
-        return tool, {"goal": goal, "max_charts": 4}
     return None
 
 
@@ -474,6 +581,42 @@ def resolve_followup_query(
     if is_affirmative or is_vague:
         return "what's our status?"
     return None
+
+
+def is_dashboard_followup(conversation_messages: list[dict], user_message: str) -> bool:
+    """True when the user is mid dashboard discovery/intake/preview/edit flow.
+
+    This turn must reach the dashboard tools (ReAct), not a conversational
+    short-circuit or the wrong intent. Signals: the frontend cards reply with
+    fixed phrases; the prior assistant turn ran a dashboard intake/plan/propose
+    tool; or the prior turn was a dashboard discovery reply and the user answered
+    with a substantive goal.
+    """
+    lower = (user_message or "").lower().strip()
+    if any(p in lower for p in _DASHBOARD_CARD_REPLY_MARKERS):
+        return True
+
+    last_assistant = next(
+        (m for m in reversed(conversation_messages or []) if m.get("role") == "assistant"),
+        None,
+    )
+    if last_assistant is None:
+        return False
+
+    called = last_assistant.get("tools_called") or []
+    if any(t in _DASHBOARD_FOLLOWUP_TOOLS for t in called):
+        return True
+    arts = last_assistant.get("artifacts") or {}
+    if isinstance(arts, dict) and any(k in _DASHBOARD_FOLLOWUP_TOOLS for k in arts):
+        return True
+
+    # Bridge: the assistant just ran a dashboard discovery reply (asked what to
+    # track) and the user answered with a goal rather than a new capability ask.
+    ctx = last_assistant.get("tool_context") or {}
+    if isinstance(ctx, dict) and ctx.get("dashboard_discovery"):
+        if len(lower) >= 6 and not is_dashboard_capability_question(user_message):
+            return True
+    return False
 
 
 def filter_tools_by_intent(

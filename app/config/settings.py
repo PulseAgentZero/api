@@ -311,6 +311,9 @@ class Settings:
     CHAT_INTENT_DETECTION_ENABLED: bool = os.getenv("CHAT_INTENT_DETECTION_ENABLED", "true").lower() == "true"
     CHAT_INTENT_FASTPATH_CONFIDENCE: float = float(os.getenv("CHAT_INTENT_FASTPATH_CONFIDENCE", "0.85"))
 
+    # Dashboard builder: allow add_chart/replace_chart.
+    DASHBOARD_ITERATION_ALLOW_NEW_SQL: bool = os.getenv("DASHBOARD_ITERATION_ALLOW_NEW_SQL", "true").lower() == "true"
+
     # ------------------------------------------------------------------
     # Groq API (LLM)
     # ------------------------------------------------------------------
@@ -419,7 +422,7 @@ class Settings:
     # Email (Resend)
     # ------------------------------------------------------------------
     RESEND_API_KEY: Optional[str] = os.getenv("RESEND_API_KEY")
-    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@pulse.club")
+    DEFAULT_FROM_EMAIL: str = os.getenv("DEFAULT_FROM_EMAIL", "noreply@flowpilot.club")
     ACCEPT_INVITE_PATH: str = os.getenv("ACCEPT_INVITE_PATH", "/accept-invite")
 
     @classmethod

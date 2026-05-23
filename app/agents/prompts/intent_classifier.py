@@ -18,15 +18,18 @@ read the user's message and output a single JSON object classifying it.
    or target rates? -> lookup_outcome
 6. Does the message ask about a specific entity's trend/history over time? -> lookup_entity_trend
 7. Does the message ask to compare pipeline runs or what changed since last run? -> compare_runs
-8. Does the message ask to BUILD a dashboard, charts, visualization, or report (not just read data)? -> build_dashboard
-9. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
-10. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
-11. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
-12. Does the message ask "why", "explain", "compare", "vs", "what drove"? -> compare_or_explain
-13. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
-14. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
-15. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
-16. Otherwise truly ambiguous? -> unknown
+8. Is the message ONLY asking WHETHER dashboards/charts/reports can be built (can you, do you, \
+   support, able to) WITHOUT stating what to show? -> help
+9. Does the message ask to BUILD a dashboard, charts, visualization, or report with a concrete \
+   goal (metrics, topic, timeframe, dimensions)? -> build_dashboard
+10. Does the message mention a SPECIFIC entity_id AND ask for its details/profile/status? -> lookup_entity
+11. Does the message ask to compose/draft/write a message or outreach for a specific entity? -> generate_draft
+12. Does the message ask for entities SIMILAR to a specific reference entity? -> find_similar
+13. Does the message ask "why", "explain", "compare", "vs", "what drove"? -> compare_or_explain
+14. Does the message ask for the high-level snapshot / overview / status? -> lookup_overview
+15. Does the message ask for a LIST filtered by tier (critical/high/medium/low) or "show me X"? -> lookup_entities
+16. Does the message ask for active recommendations / what to action / what's on the plate? -> lookup_recommendations
+17. Otherwise truly ambiguous? -> unknown
 
 ## Intent reference
 
@@ -36,7 +39,8 @@ read the user's message and output a single JSON object classifying it.
 "who are you", "what's your name", "what is this".
 
 **help** — "What can you do?", "how does this work?", "help", "show me commands", \
-"what should I ask?", "what are your capabilities", "how do I use you".
+"what should I ask?", "what are your capabilities", "how do I use you", \
+"can you build dashboards?" (capability only, no metrics stated).
 
 **off_topic** — Weather, jokes, personal preferences, world events, coding requests, \
 "are you a real person", abuse, philosophical chat. NEVER use for pipeline or \
@@ -87,6 +91,8 @@ Examples: "what changed since last run?", "compare the last two runs", \
 "any changes from the previous pipeline?", "run delta", "what's different now?".
 
 **build_dashboard** — Build a Pulse Studio dashboard or charts from natural language. \
+Requires a concrete goal in the message (what to track, which metrics, dimensions, or timeframe). \
+NOT for yes/no capability questions. \
 Examples: "build a dashboard showing revenue by month", "create charts for churn", \
 "visualize subscriber growth", "make a report on support tickets".
 
@@ -113,7 +119,8 @@ confidence ~0.5 and let the caller ask which entity.
 ## Confidence rules
 
 - **0.90 - 1.00** — Intent is unambiguous AND required params are present \
-  (e.g. "tell me about 628" -> lookup_entity / 628, confidence 0.95).
+  (e.g. "tell me about 628" -> lookup_entity / 628, confidence 0.95). \
+  For build_dashboard, use 0.90+ only when the message states what the dashboard should show.
 - **0.70 - 0.89** — Intent is clear but a required param is implied or missing.
 - **0.40 - 0.69** — Message could fit 2+ intents; you picked the most likely.
 - **0.30 - 0.39** — Truly ambiguous (unknown intent).
@@ -191,6 +198,12 @@ Output: {"intent":"lookup_entity_trend","confidence":0.95,"entity_ids":["628"],"
 
 Input: "what changed since last run?"
 Output: {"intent":"compare_runs","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
+
+Input: "Can you build dashboards?"
+Output: {"intent":"help","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
+
+Input: "Do you support charts and visualizations?"
+Output: {"intent":"help","confidence":0.92,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
 
 Input: "build a dashboard showing churn by region"
 Output: {"intent":"build_dashboard","confidence":0.95,"entity_ids":[],"tier_filter":null,"urgency_filter":null}
