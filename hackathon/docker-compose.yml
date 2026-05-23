@@ -3,6 +3,8 @@
 #   make hackathon-load        # one-shot data loader
 #   open http://localhost:8011/docs   # Task A only
 #   open http://localhost:8012/docs   # Task B only
+# Swagger/OpenAPI uses HACKATHON_PUBLIC_API_URL below so judges see the
+# production endpoint to query instead of the internal Docker service URL.
 
 x-hackathon-env: &hackathon-env
   HACKATHON_DATABASE_URL: postgresql+asyncpg://hackathon:hackathon@postgres:5432/hackathon
@@ -57,6 +59,9 @@ services:
   # Task A — Review Simulation Agent (hackathon requirement: one container per task)
   task-a-api:
     <<: *hackathon-service
+    environment:
+      <<: *hackathon-env
+      HACKATHON_PUBLIC_API_URL: https://hackathon-a.entivia.online
     build:
       context: ..
       dockerfile: hackathon/Dockerfile
@@ -67,6 +72,9 @@ services:
   # Task B — Recommendation Agent
   task-b-api:
     <<: *hackathon-service
+    environment:
+      <<: *hackathon-env
+      HACKATHON_PUBLIC_API_URL: https://hackathon-b.entivia.online
     ports:
       - "8012:8000"
     command: ["uvicorn", "hackathon.app.task_b:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -74,6 +82,9 @@ services:
   # Combined gateway (both tasks on one port — optional for local demos)
   hackathon-api:
     <<: *hackathon-service
+    environment:
+      <<: *hackathon-env
+      HACKATHON_PUBLIC_API_URL: https://hackathon.entivia.online
     ports:
       - "8010:8000"
     command: ["uvicorn", "hackathon.app.main:app", "--host", "0.0.0.0", "--port", "8000"]

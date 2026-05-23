@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from hackathon.agents.recommender import RecommendationAgent
 from hackathon.agents.review_simulator import ReviewSimulationAgent
+from hackathon.app.factory import openapi_servers
 from hackathon.app.schemas import (
     HealthResponse,
     MetricsResponse,
@@ -57,6 +58,7 @@ app = FastAPI(
     version="1.0.0",
     contact={"name": "Entivia / Pulse AI"},
     license_info={"name": "Hackathon submission"},
+    servers=openapi_servers(),
     openapi_tags=[
         {"name": TAG_SYSTEM, "description": "Health and metadata."},
         {"name": TAG_DEMO, "description": "Helpers for discovering real ids to test with."},

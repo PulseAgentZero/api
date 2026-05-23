@@ -7,7 +7,7 @@
 | **Combined gateway (optional)** | http://localhost:8010/docs |
 | **Platform context** | https://entivia.online |
 | **Repository** | GitHub monorepo — `hackathon/` (challenge code) + `app/` (Entivia engine) |
-| **Solution papers** | [`paper/task_a_review_simulation.md`](paper/task_a_review_simulation.md), [`paper/task_b_recommendation.md`](paper/task_b_recommendation.md) |
+| **Solution papers (PDF)** | [`paper/task_a_review_simulation.pdf`](paper/task_a_review_simulation.pdf), [`paper/task_b_recommendation.pdf`](paper/task_b_recommendation.pdf) — generated from the `.md` sources via `make hackathon-paper-pdf` |
 | **Eval metrics** | [`eval/data/EVAL.md`](eval/data/EVAL.md) — `GET /metrics` on either task container |
 
 ## Artifacts

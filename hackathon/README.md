@@ -79,7 +79,7 @@ Swagger UI on every container at `/docs`. Health probe at `/healthz`.
 | Task B input: persona dataset built on review history | `POST /recommend` reads the Yelp persona slice loaded for Task A |
 | Cross-domain demonstration | `dataset=goodreads` in `POST /recommend` |
 | Nigerian English / Pidgin variant | `voice=nigerian` in `POST /simulate-review` |
-| Two solution papers | `paper/task_a_review_simulation.md`, `paper/task_b_recommendation.md` |
+| Two solution papers (PDF) | `paper/task_a_review_simulation.pdf`, `paper/task_b_recommendation.pdf` — built from the `.md` sources via `make hackathon-paper-pdf` |
 | Evaluation metrics | `eval/data/EVAL.md` + `GET /metrics` |
 | Code repository | This monorepo — see `hackathon/` |
 | Live demo | <https://hackathon.entivia.online> |
@@ -117,9 +117,11 @@ hackathon/
 │   ├── metrics.py             # Parser for the /metrics endpoint
 │   └── data/                  # holdout_yelp.jsonl + generated EVAL.md
 ├── paper/
-│   ├── task_a_review_simulation.md
-│   ├── task_b_recommendation.md
-│   └── solution_paper.md      # Index linking both papers
+│   ├── task_a_review_simulation.md       # Source for Task A paper
+│   ├── task_a_review_simulation.pdf      # Submitted PDF (built via `make hackathon-paper-a-pdf`)
+│   ├── task_b_recommendation.md          # Source for Task B paper
+│   ├── task_b_recommendation.pdf         # Submitted PDF (built via `make hackathon-paper-b-pdf`)
+│   └── solution_paper.md                 # Index linking both papers
 ├── Dockerfile                 # Single image used by all task containers
 ├── docker-compose.yml         # postgres · qdrant · task-a · task-b · gateway · loader
 ├── requirements.txt
