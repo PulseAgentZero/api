@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
@@ -21,6 +20,7 @@ from app.api.public.schemas import (
 )
 from app.infrastructure.database.repositories.recommendation_repository import RecommendationRepository
 from app.infrastructure.database.session import get_db
+from app.services.recommendation_service import set_recommendation_status
 
 router = APIRouter(prefix="/recommendations", tags=["Recommendations"])
 
@@ -150,12 +150,7 @@ async def action_recommendation(
     rec = await RecommendationRepository(db).get_by_id(_rid(recommendation_id))
     if not rec or rec.org_id != org_id:
         raise not_found("Recommendation not found")
-    rec.status = "actioned"
-    rec.actioned_at = datetime.now(timezone.utc)
-    if body.outcome_notes:
-        rec.outcome_notes = body.outcome_notes
-    await db.commit()
-    await db.refresh(rec)
+    await set_recommendation_status(db, rec, "actioned", outcome_notes=body.outcome_notes or None)
     return envelope(_rec_dict(rec), ctx.org_id)
 
 
@@ -181,7 +176,5 @@ async def dismiss_recommendation(
     rec = await RecommendationRepository(db).get_by_id(_rid(recommendation_id))
     if not rec or rec.org_id != org_id:
         raise not_found("Recommendation not found")
-    rec.status = "dismissed"
-    await db.commit()
-    await db.refresh(rec)
+    await set_recommendation_status(db, rec, "dismissed")
     return envelope(_rec_dict(rec), ctx.org_id)

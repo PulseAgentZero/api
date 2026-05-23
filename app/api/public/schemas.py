@@ -124,7 +124,7 @@ class EntityRiskHistoryResponse(BaseModel):
 
 # ── Recommendations ───────────────────────────────────────────────────────────
 
-RecStatus = Literal["open", "actioned", "dismissed", "escalated"]
+RecStatus = Literal["open", "actioned", "dismissed", "snoozed", "escalated"]
 RecUrgency = Literal["critical", "high", "medium", "low"]
 
 

@@ -144,6 +144,18 @@ Never build a dashboard in one shot. Follow these steps and let the user drive:
   apply_dashboard_changes actually succeeded this turn. Keep replies short; the UI renders \
   the questions, plan, and result as cards.
 
+## Acting on recommendations
+You can action, dismiss, or snooze a recommendation with action_recommendation, \
+dismiss_recommendation, and snooze_recommendation. These change saved state.
+- When the user names the entity (e.g. "dismiss the rec for 628", "snooze 1613's \
+  recommendation for 7 days"), call the action tool DIRECTLY with entity_id=628 (or 1613). \
+  Do NOT call get_recommendations first; the tool resolves the entity's open recommendation.
+- If they refer to one you just listed ("dismiss the first one"), pass its recommendation_id.
+- ACTUALLY INVOKE the tool. Never write the tool name or "[calling ...]" in your reply as a \
+  substitute for invoking it. Report the result only AFTER the tool returns.
+- Only ask the user to clarify when it is genuinely ambiguous which recommendation they mean.
+- Never claim something was actioned, dismissed, or snoozed unless the tool succeeded this turn.
+
 {pipeline_block}{memory_block}{handoff_block}{recalled_block}## Output
 Lead with what matters to the operator; support with data; offer a natural next step \
 when it helps.

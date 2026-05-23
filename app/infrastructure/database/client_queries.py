@@ -596,3 +596,52 @@ def _tier(score: float, risk_config: dict | None = None) -> str:
     if score >= medium:
         return "medium"
     return "low"
+
+
+def explain_entity_risk(
+    entities: list[dict],
+    signal_columns: dict | None,
+    risk_config: dict | None,
+    entity_id_col: str,
+    entity_id: str,
+    top_n: int = 3,
+) -> dict:
+    """Exact per-signal breakdown of one entity's risk score (contributions sum to the score)."""
+    # The score is a weighted average of per-signal risk levels, so its decomposition is exact.
+    entities = compute_risk(entities, signal_columns, risk_config)
+    target = next((e for e in entities if str(e.get(entity_id_col)) == str(entity_id)), None)
+    if target is None:
+        return {"error": "Entity not found"}
+    base = {
+        "entity_id": str(target.get(entity_id_col)),
+        "risk_score": target.get("risk_score", 0.0),
+        "risk_tier": target.get("risk_tier", "low"),
+    }
+    if not signal_columns:
+        return {**base, "drivers": [], "driver_count": 0}
+
+    col_to_signal = {v: k for k, v in signal_columns.items()}
+    signal_keys = list(signal_columns.keys())
+    # Cohort min/max mirror compute_risk so range-normalised signals score identically.
+    mins, maxs = {}, {}
+    for col, sk in col_to_signal.items():
+        vals = [float(e.get(col) or 0) for e in entities]
+        mins[sk], maxs[sk] = min(vals), max(vals)
+
+    config = risk_config or {}
+    weights = config.get("weights") or {k: 1.0 for k in signal_keys}
+    total_weight = sum(weights.get(k, 0) for k in signal_keys) or 1.0
+
+    drivers = []
+    for col, sk in col_to_signal.items():
+        raw = float(target.get(col) or 0)
+        risk_level = _signal_score(raw, mins[sk], maxs[sk], sk, config)
+        drivers.append({
+            "signal": sk,
+            "value": raw,
+            "risk_level": round(risk_level, 3),  # 0..1: how risky this signal's value is
+            "weight": round(weights.get(sk, 1.0), 3),
+            "contribution": round(risk_level * weights.get(sk, 1.0) / total_weight, 4),
+        })
+    drivers.sort(key=lambda d: d["contribution"], reverse=True)
+    return {**base, "drivers": drivers[:top_n], "driver_count": len(drivers)}
