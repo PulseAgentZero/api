@@ -151,11 +151,26 @@ hackathon-paper-b-pdf:
 
 hackathon-paper-pdf: hackathon-paper-a-pdf hackathon-paper-b-pdf
 
+hackathon-paper-a-docx:
+	@command -v pandoc >/dev/null || (echo "Install pandoc to export DOCX" && exit 1)
+	pandoc hackathon/paper/task_a_review_simulation.md -o hackathon/paper/task_a_review_simulation.docx \
+		--resource-path=hackathon/paper
+
+hackathon-paper-b-docx:
+	@command -v pandoc >/dev/null || (echo "Install pandoc to export DOCX" && exit 1)
+	pandoc hackathon/paper/task_b_recommendation.md -o hackathon/paper/task_b_recommendation.docx \
+		--resource-path=hackathon/paper
+
+hackathon-paper-docx: hackathon-paper-a-docx hackathon-paper-b-docx
+
+hackathon-paper: hackathon-paper-pdf hackathon-paper-docx
+
 .PHONY: build-self-hosted build-cloud build-license build \
         push-self-hosted push-cloud push-license push \
         sh-up sh-down sh-logs sh-pull \
         up down logs scale-workers dev dev-scheduler \
         migrate revision seed reset-db \
         hackathon-build hackathon-up hackathon-down hackathon-logs \
-        hackathon-load hackathon-eval hackathon-paper-pdf \
-        hackathon-paper-a-pdf hackathon-paper-b-pdf
+        hackathon-load hackathon-eval hackathon-paper hackathon-paper-pdf \
+        hackathon-paper-a-pdf hackathon-paper-b-pdf \
+        hackathon-paper-docx hackathon-paper-a-docx hackathon-paper-b-docx

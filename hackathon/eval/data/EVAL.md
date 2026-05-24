@@ -5,8 +5,8 @@ Metrics on Yelp holdout (`eval/data/holdout_yelp.jsonl`). Re-run with `ANTHROPIC
 ## Task A — Review simulation (agent)
 | Voice | N | RMSE ↓ | ROUGE-L ↑ | BERTScore F1 ↑ |
 |---|---:|---:|---:|---:|
-| default | 30 | 0.913 | 0.152 | — |
-| nigerian | 15 | 0.894 | 0.129 | — |
+| default | 30 | 0.931 | 0.144 | — |
+| nigerian | 15 | 1.000 | 0.130 | — |
 
 ## Task A — Baselines
 | Mode | N | RMSE |
@@ -16,6 +16,6 @@ Metrics on Yelp holdout (`eval/data/holdout_yelp.jsonl`). Re-run with `ANTHROPIC
 ## Task B — Recommendation
 | Mode | Users/N | K | Hit@K ↑ | NDCG@K ↑ |
 |---|---:|---:|---:|---:|
-| ann-only | 30 | 10 | 0.033 | 0.017 |
-| ann+llm | 30 | 10 | 0.033 | 0.033 |
-| cold-persona | 20 | 10 | 0.250 | — |
+| ann-only | 0 | 10 | 0.000 | 0.000 |
+| ann+llm | 0 | 10 | 0.000 | 0.000 |
+| cold-persona | 0 | 10 | 0.000 | — |
