@@ -17,7 +17,6 @@ on:
 env:
     DEPLOY_REMOTE_PATH: /home/github/pulse-backend
     COMPOSE_FILE: docker/compose/cloud/docker-compose.yml
-    HACKATHON_COMPOSE_FILE: hackathon/docker-compose.yml
 jobs:
     build:
         name: Docker Compose build and deploy
@@ -77,7 +76,7 @@ jobs:
                   script: |
                       set -euo pipefail
                       cd "${{ env.DEPLOY_REMOTE_PATH }}/hackathon"
-                      docker compose -f "${{ env.HACKATHON_COMPOSE_FILE }}" up -d --build --remove-orphans
+                      docker compose up -d --build --remove-orphans
 
             - name: Notify deployment status
               if: always()
