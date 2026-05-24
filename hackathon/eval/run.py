@@ -305,6 +305,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--task-a-sample", type=int, default=30)
     parser.add_argument("--task-b-users", type=int, default=30)
     parser.add_argument("--nigerian-sample", type=int, default=15)
+    parser.add_argument("--cold-sample", type=int, default=20)
     parser.add_argument("--bert", action="store_true", help="Add BERTScore F1 to Task A")
     parser.add_argument("--skip-llm", action="store_true", help="ANN + baseline only")
     return parser.parse_args()
@@ -334,7 +335,7 @@ async def main() -> None:
                 await task_a(args.nigerian_sample, "nigerian", use_bert=False)
             )
         report.task_b.append(await task_b_warm(args.task_b_users, k=10, use_llm=True))
-        report.task_b.append(await task_b_cold(min(20, args.task_b_users), k=10))
+        report.task_b.append(await task_b_cold(min(args.cold_sample, args.task_b_users), k=10))
 
     report.write(OUTPUT)
     print(f"Done: {OUTPUT}")

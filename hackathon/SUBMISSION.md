@@ -37,7 +37,9 @@ open http://localhost:8012/docs     # Task B
 
 Submitted run loaded a 5,000-user / 11,397-item / 112,157-review food slice
 of real Yelp (~9,447 holdout rows). Agent beats the avg-stars baseline by
-25 % on RMSE (0.913 vs 1.216); cold-start persona Hit@10 = 0.250.
+23 % on RMSE (0.894 vs 1.164); cold-start persona Hit@10 = 0.350 (~400× random
+on an 11,397-item catalogue). The warm-start retrieval row sits at 0 on this
+holdout — see Task B paper §7.3 for the geometric explanation.
 
 **Task A direct input (challenge spec):**
 

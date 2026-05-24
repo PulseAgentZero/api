@@ -132,6 +132,12 @@ hackathon-eval:
 	docker compose -f hackathon/docker-compose.yml run --rm hackathon-api \
 		python -m hackathon.eval.run --task-a-sample 30 --task-b-users 30
 
+hackathon-eval-big:
+	docker compose -f hackathon/docker-compose.yml run --rm hackathon-api \
+		python -m hackathon.eval.run \
+			--task-a-sample 60 --nigerian-sample 30 \
+			--task-b-users 100 --cold-sample 40
+
 # Use xelatex + system Unicode fonts so symbols (≥, ↑, ↓, ★, ≈) and the
 # box-drawing characters in the inline ASCII diagrams render correctly.
 # Helvetica/Menlo/DejaVu Sans are present on macOS and most Linux distros.
@@ -171,6 +177,6 @@ hackathon-paper: hackathon-paper-pdf hackathon-paper-docx
         up down logs scale-workers dev dev-scheduler \
         migrate revision seed reset-db \
         hackathon-build hackathon-up hackathon-down hackathon-logs \
-        hackathon-load hackathon-eval hackathon-paper hackathon-paper-pdf \
+        hackathon-load hackathon-eval hackathon-eval-big hackathon-paper hackathon-paper-pdf \
         hackathon-paper-a-pdf hackathon-paper-b-pdf \
         hackathon-paper-docx hackathon-paper-a-docx hackathon-paper-b-docx

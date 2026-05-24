@@ -5,17 +5,17 @@ Metrics on Yelp holdout (`eval/data/holdout_yelp.jsonl`). Re-run with `ANTHROPIC
 ## Task A — Review simulation (agent)
 | Voice | N | RMSE ↓ | ROUGE-L ↑ | BERTScore F1 ↑ |
 |---|---:|---:|---:|---:|
-| default | 30 | 0.931 | 0.144 | — |
-| nigerian | 15 | 1.000 | 0.130 | — |
+| default | 60 | 0.894 | 0.139 | — |
+| nigerian | 30 | 0.983 | 0.130 | — |
 
 ## Task A — Baselines
 | Mode | N | RMSE |
 |---|---:|---:|
-| avg-stars-baseline | 90 | 1.216 |
+| avg-stars-baseline | 180 | 1.164 |
 
 ## Task B — Recommendation
 | Mode | Users/N | K | Hit@K ↑ | NDCG@K ↑ |
 |---|---:|---:|---:|---:|
-| ann-only | 0 | 10 | 0.000 | 0.000 |
-| ann+llm | 0 | 10 | 0.000 | 0.000 |
-| cold-persona | 0 | 10 | 0.000 | — |
+| ann-only | 99 | 10 | 0.000 | 0.000 |
+| ann+llm | 97 | 10 | 0.000 | 0.000 |
+| cold-persona | 40 | 10 | 0.350 | — |

@@ -24,7 +24,7 @@ Behavioral review simulation is the first of two challenge tasks. The agent rece
 
 We do not treat this as a stand-alone exercise. Entivia, our open-source operational intelligence platform, already runs a tool-calling agent runtime against live customer databases. The Review Simulation Agent is a new workflow on that same runtime. The hackathon container is a thin entry point that wires database-mode tools onto the production agent class, so the same code that powers Entivia's public Simulation API on entivia.online answers the challenge brief.
 
-On a real slice of the Yelp Open Dataset (five thousand users, eleven thousand food and restaurant businesses, one hundred and twelve thousand reviews, nine thousand four hundred and forty seven held out for evaluation), the agent delivers a star rating root-mean-square error of zero point nine one three. The strongest no-language-model baseline, predicting each user's mean historical rating, scores one point two one six on the same holdout. The agent therefore reduces error by roughly twenty five percent relative to the baseline, while also producing graded review text that the baseline cannot generate. A Nigerian English voice variant, included for the localisation track, scores zero point eight nine four root-mean-square error on the same metric.
+On a real slice of the Yelp Open Dataset (five thousand users, eleven thousand food and restaurant businesses, one hundred and twelve thousand reviews, nine thousand four hundred and forty seven held out for evaluation), the agent delivers a star rating root-mean-square error of zero point eight nine four. The strongest no-language-model baseline, predicting each user's mean historical rating, scores one point one six four on the same holdout. The agent therefore reduces error by roughly twenty three percent relative to the baseline, while also producing graded review text that the baseline cannot generate. A Nigerian English voice variant, included for the localisation track, scores zero point nine eight three root-mean-square error on the same metric.
 
 ## 2. Problem Statement and Context
 
@@ -109,14 +109,14 @@ Two ranking-friendly metrics are computed against the holdout. Root-mean-square 
 
 | Voice | Number of samples | Star rating error (lower is better) | ROUGE-L (higher is better) |
 |---|---:|---:|---:|
-| Default English | 30 | 0.913 | 0.152 |
-| Nigerian English | 15 | 0.894 | 0.129 |
+| Default English | 60 | 0.894 | 0.139 |
+| Nigerian English | 30 | 0.983 | 0.130 |
 
 | Baseline | Number of samples | Star rating error |
 |---|---:|---:|
-| Average historical rating per user | 90 | 1.216 |
+| Average historical rating per user | 180 | 1.164 |
 
-The agent reduces star rating error by roughly twenty five percent against the no-language-model baseline. ROUGE-L is generally low across review simulation studies because two reviews of the same restaurant by the same person can use almost no overlapping vocabulary while still expressing the same opinion. The number we should care about is the rating error, which the agent dominates, and the qualitative review of the generated text, which is good enough that human readers cannot reliably tell the agent reviews from the held-out ones.
+The agent reduces star rating error by roughly twenty three percent against the no-language-model baseline. ROUGE-L is generally low across review simulation studies because two reviews of the same restaurant by the same person can use almost no overlapping vocabulary while still expressing the same opinion. The number we should care about is the rating error, which the agent dominates, and the qualitative review of the generated text, which is good enough that human readers cannot reliably tell the agent reviews from the held-out ones.
 
 ### 7.4 Nigerian English variant
 
@@ -144,4 +144,4 @@ The Task A container exposes Swagger documentation at the standard documentation
 
 The Review Simulation Agent demonstrates that user behaviour, including the specific way an individual rates and writes about a product, can be modelled by a tool-calling agent grounded in the user's own history rather than by a stand-alone language model. It also demonstrates that this capability does not have to be built from scratch for every hackathon submission. By layering the workflow on top of Entivia, we get the runtime, the provider fallback, the tool calling, the validation retries, and the per-request observability for free, and we hand back any improvement we make to the broader platform.
 
-On a real slice of the Yelp Open Dataset, the agent reduces star rating error by roughly twenty five percent against the strongest no-language-model baseline, produces graded review text in two languages, and leaves a complete audit trail on every call. The same agent class powers the public Simulation route on entivia.online, so the artifact submitted here is a real piece of operating infrastructure, not a one-off prototype.
+On a real slice of the Yelp Open Dataset, the agent reduces star rating error by roughly twenty three percent against the strongest no-language-model baseline, produces graded review text in two languages, and leaves a complete audit trail on every call. The same agent class powers the public Simulation route on entivia.online, so the artifact submitted here is a real piece of operating infrastructure, not a one-off prototype.
