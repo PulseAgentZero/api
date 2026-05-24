@@ -55,6 +55,17 @@ class _ConversationStore:
             return []
         return list(self._sessions[conversation_id].get("shown_ids", []))
 
+    def get(self, conversation_id: str) -> dict[str, Any] | None:
+        """Return the stored session dict (dataset, shown_ids, turns) or None."""
+        session = self._sessions.get(conversation_id)
+        if session is None:
+            return None
+        return {
+            "dataset": session.get("dataset"),
+            "shown_ids": list(session.get("shown_ids", [])),
+            "turns": int(session.get("turns", 0)),
+        }
+
     def remember(
         self,
         conversation_id: str | None,
@@ -62,12 +73,19 @@ class _ConversationStore:
         new_ids: list[str],
     ) -> str:
         cid = conversation_id or str(uuid.uuid4())
-        existing = self._sessions.get(cid, {}).get("shown_ids", [])
+        existing = self._sessions.get(cid, {})
+        existing_ids = existing.get("shown_ids", [])
         self._sessions[cid] = {
             "dataset": dataset,
-            "shown_ids": list({*existing, *new_ids}),
+            "shown_ids": list({*existing_ids, *new_ids}),
+            "turns": int(existing.get("turns", 0)) + 1,
         }
         return cid
+
+
+def get_conversation_store() -> _ConversationStore:
+    """Public accessor so other modules (e.g. hackathon system router) can read history."""
+    return _CONVERSATIONS
 
 
 _CONVERSATIONS = _ConversationStore()

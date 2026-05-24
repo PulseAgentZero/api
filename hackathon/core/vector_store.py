@@ -64,6 +64,36 @@ class HackathonVectorStore:
             await client.delete_collection(collection_name=self.collection)
         await self.ensure_collection()
 
+    async def info(self) -> dict[str, Any]:
+        """Return collection metadata (vector size + point count) for /healthz."""
+        client = await self.client()
+        if not await client.collection_exists(self.collection):
+            return {"collection": self.collection, "exists": False, "points": 0}
+        info = await client.get_collection(collection_name=self.collection)
+        points = await client.count(collection_name=self.collection, exact=False)
+        try:
+            vector_size = int(info.config.params.vectors.size)  # type: ignore[union-attr]
+        except Exception:
+            vector_size = VECTOR_SIZE
+        return {
+            "collection": self.collection,
+            "exists": True,
+            "points": int(getattr(points, "count", 0)),
+            "vector_size": vector_size,
+        }
+
+    async def ping(self) -> tuple[bool, float | None, str | None]:
+        """Return (ok, latency_ms, error) for a trivial collection-list call."""
+        import time
+
+        start = time.perf_counter()
+        try:
+            client = await self.client()
+            await client.get_collections()
+        except Exception as exc:
+            return False, None, str(exc)
+        return True, round((time.perf_counter() - start) * 1000.0, 2), None
+
     async def upsert_items(self, rows: Sequence[ItemRow]) -> None:
         if not rows:
             return

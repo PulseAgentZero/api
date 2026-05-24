@@ -131,3 +131,92 @@ async def list_sample_user_ids(dataset: str = "yelp", limit: int = 5) -> list[st
             {"ds": dataset, "limit": limit},
         )
         return [row.id for row in result]
+
+
+async def list_sample_items(dataset: str = "yelp", limit: int = 5) -> list[dict[str, Any]]:
+    """Return real items (id + name) the API can use in DB-mode demos."""
+    async with get_session() as session:
+        result = await session.execute(
+            text(
+                """
+                SELECT i.id, i.name
+                FROM items i
+                JOIN (
+                    SELECT item_id, COUNT(*) AS n
+                    FROM reviews
+                    WHERE dataset = :ds
+                    GROUP BY item_id
+                ) r ON r.item_id = i.id
+                WHERE i.dataset = :ds
+                ORDER BY r.n DESC
+                LIMIT :limit
+                """
+            ),
+            {"ds": dataset, "limit": limit},
+        )
+        return [{"item_id": row.id, "name": row.name} for row in result]
+
+
+async def get_dataset_stats() -> dict[str, Any]:
+    """Per-dataset and overall counts for the demo / health endpoints."""
+    async with get_session() as session:
+        per_dataset = await session.execute(
+            text(
+                """
+                SELECT
+                    COALESCE(u.dataset, i.dataset, r.dataset) AS dataset,
+                    COALESCE(u.n_users, 0)          AS users,
+                    COALESCE(i.n_items, 0)          AS items,
+                    COALESCE(r.n_reviews, 0)        AS reviews,
+                    COALESCE(r.n_holdout, 0)        AS holdout_reviews
+                FROM (
+                    SELECT dataset, COUNT(*) AS n_users FROM users GROUP BY dataset
+                ) u
+                FULL OUTER JOIN (
+                    SELECT dataset, COUNT(*) AS n_items FROM items GROUP BY dataset
+                ) i USING (dataset)
+                FULL OUTER JOIN (
+                    SELECT dataset,
+                           COUNT(*)                            AS n_reviews,
+                           COUNT(*) FILTER (WHERE is_holdout)  AS n_holdout
+                    FROM reviews GROUP BY dataset
+                ) r USING (dataset)
+                ORDER BY dataset NULLS LAST
+                """
+            )
+        )
+        rows = [dict(row._mapping) for row in per_dataset]
+
+        totals = (
+            await session.execute(
+                text(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM users)                              AS users,
+                        (SELECT COUNT(*) FROM items)                              AS items,
+                        (SELECT COUNT(*) FROM reviews)                            AS reviews,
+                        (SELECT COUNT(*) FROM reviews WHERE is_holdout)           AS holdout_reviews
+                    """
+                )
+            )
+        ).first()
+        return {
+            "datasets": rows,
+            "users": int(totals.users or 0),
+            "items": int(totals.items or 0),
+            "reviews": int(totals.reviews or 0),
+            "holdout_reviews": int(totals.holdout_reviews or 0),
+        }
+
+
+async def database_ping() -> tuple[bool, float | None, str | None]:
+    """Return (ok, latency_ms, error) for a trivial round-trip."""
+    import time
+
+    start = time.perf_counter()
+    try:
+        async with get_session() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:  # broad: any connection or auth issue counts as down
+        return False, None, str(exc)
+    return True, round((time.perf_counter() - start) * 1000.0, 2), None

@@ -38,6 +38,9 @@ _MAX_AGENT_ITERATIONS = 6
 _MAX_OUTPUT_TOKENS = 1024
 _RETRY_ATTEMPTS = 2
 
+_RATING_DIRECT_MAX_TOKENS = 96
+_RATING_DB_MAX_TOKENS = 384
+
 
 class ReviewParseError(ValueError):
     """Raised when the LLM JSON cannot be coerced into (stars, text)."""
@@ -143,6 +146,106 @@ class ReviewSimulationAgent(BaseAgent):
             ),
         }
 
+    async def simulate_from_context(
+        self,
+        *,
+        user_id: str,
+        item_id: str,
+        persona: dict[str, Any],
+        product: dict[str, Any],
+        voice: str = "default",
+    ) -> dict[str, Any]:
+        """Simulate DB-mode output using server-prefetched context."""
+        self.reset_metrics()
+        started_at = start_timer()
+        try:
+            stars, text = await self._simulate_once(
+                user_id=user_id,
+                item_id=item_id,
+                persona=persona,
+                product=product,
+                voice=voice,
+                input_mode="direct",
+            )
+        except ReviewParseError as exc:
+            raise RuntimeError(f"Review simulation failed: {exc}") from exc
+
+        return {
+            "user_id": user_id,
+            "item_id": item_id,
+            "stars": stars,
+            "text": text,
+            "meta": agent_run_meta(
+                self,
+                started_at,
+                task="review_simulation",
+                voice=voice,
+                input_mode="db_prefetched",
+            ),
+        }
+
+    async def predict_rating(
+        self,
+        *,
+        user_id: str | None = None,
+        item_id: str | None = None,
+        persona: dict[str, Any] | None = None,
+        product: dict[str, Any] | None = None,
+        input_mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Predict stars only with a smaller prompt and token budget.
+
+        Token budgets are per ReAct iteration, not per request. Direct mode
+        emits only a tiny JSON object, but DB mode has to fit ``tool_use``
+        blocks (50-150 tokens each on Anthropic) plus the final JSON in a
+        single iteration, so it needs a larger ceiling to avoid mid-response
+        truncation.
+        """
+        if persona is not None and product is not None:
+            resolved_mode = input_mode or "direct"
+            user_prompt = self._rating_prompt_from_context(persona, product)
+            max_iterations = 1
+            max_tokens = _RATING_DIRECT_MAX_TOKENS
+        elif user_id and item_id:
+            resolved_mode = input_mode or "db"
+            user_prompt = (
+                f"Predict only the star rating for user_id={user_id} on item_id={item_id}. "
+                "Call fetch_user_profile and fetch_item first, then return JSON: "
+                '{"stars": <1-5>}. Do not write a review.'
+            )
+            max_iterations = _MAX_AGENT_ITERATIONS
+            max_tokens = _RATING_DB_MAX_TOKENS
+        else:
+            raise ValueError(
+                "Provide (persona + product) for direct mode, or (user_id + item_id) for DB mode."
+            )
+
+        self.reset_metrics()
+        started_at = start_timer()
+        try:
+            raw = await self.reason_and_act_json(
+                self._rating_system_prompt(),
+                user_prompt,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                max_iterations=max_iterations,
+                required_keys=["stars"],
+            )
+            stars = self._parse_stars(raw)
+        except ReviewParseError as exc:
+            raise RuntimeError(f"Rating prediction failed: {exc}") from exc
+        return {
+            "user_id": user_id,
+            "item_id": item_id,
+            "stars": stars,
+            "meta": agent_run_meta(
+                self,
+                started_at,
+                task="rating_prediction",
+                input_mode=resolved_mode,
+            ),
+        }
+
     @retry(
         retry=retry_if_exception_type(ReviewParseError),
         stop=stop_after_attempt(_RETRY_ATTEMPTS),
@@ -188,6 +291,32 @@ class ReviewSimulationAgent(BaseAgent):
             "\nReturn JSON: {\"stars\": <1-5>, \"text\": \"<review>\"}",
         ]
         return "".join(parts)
+
+    @staticmethod
+    def _rating_system_prompt() -> str:
+        return (
+            "You predict how a specific user persona would rate a product. "
+            'Return strict JSON only with this shape: {"stars": <integer 1-5>}. '
+            "Do not include prose, markdown, or a review body."
+        )
+
+    @staticmethod
+    def _rating_prompt_from_context(persona: dict[str, Any], product: dict[str, Any]) -> str:
+        return (
+            "Predict only the star rating for this persona and product.\n"
+            f"\n## User persona\n{json.dumps(persona, indent=2, default=str)}"
+            f"\n## Product / item\n{json.dumps(product, indent=2, default=str)}"
+            '\nReturn JSON: {"stars": <1-5>}'
+        )
+
+    @staticmethod
+    def _parse_stars(raw: str) -> int:
+        try:
+            data = json.loads(raw)
+            return max(1, min(5, int(data["stars"])))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("rating JSON parse failed: %s", exc)
+            raise ReviewParseError(str(exc)) from exc
 
     @staticmethod
     def _parse_response(raw: str) -> tuple[int, str]:

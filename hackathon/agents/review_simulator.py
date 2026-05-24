@@ -12,6 +12,7 @@ from app.agents.workflows.review_simulator import (
     ReviewParseError,
     ReviewSimulationAgent as _PromotedReviewSimulationAgent,
 )
+from hackathon.agents.runtime import apply_hackathon_llm_config
 
 
 class ReviewSimulationAgent(_PromotedReviewSimulationAgent):
@@ -19,6 +20,7 @@ class ReviewSimulationAgent(_PromotedReviewSimulationAgent):
 
     def __init__(self) -> None:
         super().__init__(register_db_tools=True)
+        apply_hackathon_llm_config(self)
 
 
 __all__ = ["ReviewSimulationAgent", "ReviewParseError"]

@@ -5,19 +5,17 @@ from __future__ import annotations
 import logging
 
 from fastapi import HTTPException, status
+from fastapi.responses import StreamingResponse
 
 from hackathon.agents.recommender import RecommendationAgent
 from hackathon.app.factory import configure_logging, create_app
-from hackathon.app.schemas import (
-    HealthResponse,
-    MetricsResponse,
-    RecommendRequest,
-    RecommendResponse,
-)
-from hackathon.eval.metrics import load_eval_snapshot
+from hackathon.app.schemas import RecommendRequest, RecommendResponse
+from hackathon.app.streaming import stream_recommend
 
 configure_logging()
 logger = logging.getLogger("hackathon.task_b")
+
+TAG_TASK_B = "Task B — Recommendations"
 
 app = create_app(
     title="Entivia — Task B: Recommendation Agent",
@@ -32,22 +30,19 @@ app = create_app(
         "- Cross-domain (`dataset=goodreads`)\n"
         "- Voyage voyage-4-large embeddings (1024-d) + Qdrant ANN + LLM reranking\n\n"
         "Requires Postgres + Qdrant (see `docker compose`). Every response includes `meta`. "
-        "Offline eval: `GET /metrics`."
+        "Offline eval: `GET /metrics`. Dependency status: `GET /healthz` and `GET /readyz`."
     ),
+    task_id="task_b",
+    extra_tags=[{"name": TAG_TASK_B, "description": "Personalized recommendations."}],
 )
 
 
-@app.get("/healthz", response_model=HealthResponse, summary="Health check")
-async def healthz() -> HealthResponse:
-    return HealthResponse()
-
-
-@app.get("/metrics", response_model=MetricsResponse, summary="Latest Task B evaluation metrics")
-async def metrics() -> MetricsResponse:
-    return MetricsResponse(**load_eval_snapshot().to_dict())
-
-
-@app.post("/recommend", response_model=RecommendResponse, summary="Personalized recommendations")
+@app.post(
+    "/recommend",
+    response_model=RecommendResponse,
+    summary="Personalized recommendations",
+    tags=[TAG_TASK_B],
+)
 async def recommend(req: RecommendRequest) -> RecommendResponse:
     if not req.user_id and not req.persona:
         raise HTTPException(
@@ -69,3 +64,18 @@ async def recommend(req: RecommendRequest) -> RecommendResponse:
         logger.exception("recommend failed")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
     return RecommendResponse(**result)
+
+
+@app.post(
+    "/recommend/stream",
+    summary="Recommend as a Server-Sent Event stream",
+    tags=[TAG_TASK_B],
+    description=(
+        "Same input as `/recommend`, but streamed as SSE: `start` -> "
+        "`heartbeat` (every 0.5s while the agent works) -> `result` (full JSON) "
+        "-> `token` (rationale replayed word by word) -> `complete`."
+    ),
+    response_class=StreamingResponse,
+)
+async def recommend_stream(req: RecommendRequest):
+    return await stream_recommend(req)

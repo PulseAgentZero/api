@@ -39,7 +39,7 @@ Both task containers expose Swagger UI at `/docs` and a health probe at `/health
 ## Quickstart for judges
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/PulseAgentZero/api.git
 cd api
 
 cp hackathon/.env.example hackathon/.env

@@ -81,6 +81,15 @@ else:
 VECTOR_SIZE: int = _env_int("HACKATHON_VECTOR_SIZE", _DEFAULT_DIM)
 
 
+# ── Agent runtime ─────────────────────────────────────────────────────────────
+# Leave unset to keep each promoted agent's production default (Anthropic
+# Sonnet). For faster demos, set HACKATHON_LLM_PROVIDER=groq and optionally
+# HACKATHON_LLM_MODEL=llama-3.1-8b-instant.
+
+HACKATHON_LLM_PROVIDER: str = os.getenv("HACKATHON_LLM_PROVIDER", "").strip().lower()
+HACKATHON_LLM_MODEL: str = os.getenv("HACKATHON_LLM_MODEL", "").strip()
+
+
 # ── Loader behaviour ──────────────────────────────────────────────────────────
 
 ALLOW_SYNTHETIC: bool = _env_bool("HACKATHON_ALLOW_SYNTHETIC", True)
