@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.api.schemas.simulation import (
     AgentRunMeta,
@@ -228,10 +228,32 @@ class ItemSimilarResponse(BaseModel):
 
 
 class PredictRatingRequest(BaseModel):
+    """Optional payload for `/predict-rating`.
+
+    Three valid shapes:
+
+    - Empty body — defaults to DB mode, requires `user_id` from the URL path.
+      In that case `item_id` must be set (`{"item_id": "..."}`).
+    - `{"persona": {...}, "product": {...}}` — direct mode.
+    - `{"item_id": "..."}` — DB mode (uses the `user_id` from the URL path).
+
+    Partial payloads (e.g. `persona` without `product`) are rejected to avoid
+    silently dropping fields the caller meant to supply.
+    """
+
     user_id: str | None = None
     item_id: str | None = None
     persona: PersonaInput | None = None
     product: ProductInput | None = None
+
+    @model_validator(mode="after")
+    def _check_modes(self) -> "PredictRatingRequest":
+        if (self.persona is None) ^ (self.product is None):
+            raise ValueError(
+                "`persona` and `product` must be provided together (direct mode), or "
+                "both omitted (DB mode uses `item_id`)."
+            )
+        return self
 
 
 class PredictRatingResponse(BaseModel):

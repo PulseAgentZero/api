@@ -556,6 +556,8 @@ async def predict_rating(
                 status.HTTP_400_BAD_REQUEST,
                 detail="Provide (persona + product) or item_id for DB mode.",
             )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except RuntimeError as exc:

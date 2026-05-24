@@ -52,34 +52,41 @@ async def sse_stream(
         started = time.perf_counter()
         run_task = asyncio.create_task(agent_call())
 
-        # Heartbeat until the agent finishes.
         try:
-            while not run_task.done():
-                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
-                yield _format(
-                    "heartbeat",
-                    {"elapsed_ms": int((time.perf_counter() - started) * 1000)},
-                )
-            result = run_task.result()
-        except HTTPException as exc:
-            yield _format("error", {"status_code": exc.status_code, "message": exc.detail})
-            return
-        except Exception as exc:
-            logger.exception("%s stream failed", task_name)
-            yield _format("error", {"message": str(exc)})
-            return
+            try:
+                while not run_task.done():
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                    yield _format(
+                        "heartbeat",
+                        {"elapsed_ms": int((time.perf_counter() - started) * 1000)},
+                    )
+                result = run_task.result()
+            except HTTPException as exc:
+                yield _format("error", {"status_code": exc.status_code, "message": exc.detail})
+                return
+            except Exception as exc:
+                logger.exception("%s stream failed", task_name)
+                yield _format("error", {"message": str(exc)})
+                return
 
-        yield _format("result", result)
+            yield _format("result", result)
 
-        text = result.get(text_field, "") or ""
-        for word in text.split():
-            yield _format("token", {"token": word + " "})
-            await asyncio.sleep(_TOKEN_DELAY_SECONDS)
+            text = result.get(text_field, "") or ""
+            for word in text.split():
+                yield _format("token", {"token": word + " "})
+                await asyncio.sleep(_TOKEN_DELAY_SECONDS)
 
-        yield _format(
-            "complete",
-            {"duration_ms": int((time.perf_counter() - started) * 1000)},
-        )
+            yield _format(
+                "complete",
+                {"duration_ms": int((time.perf_counter() - started) * 1000)},
+            )
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                try:
+                    await run_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     return StreamingResponse(
         generator(),
