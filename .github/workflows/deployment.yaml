@@ -2,7 +2,7 @@ name: Build and deploy Backend
 
 on:
     push:
-        branches: [main, master]
+        branches: [main, master, feature/hackathon-revamp]
         paths:
             - 'app/**'
             - 'scripts/**'
@@ -17,7 +17,6 @@ on:
 env:
     DEPLOY_REMOTE_PATH: /home/github/pulse-backend
     COMPOSE_FILE: docker/compose/cloud/docker-compose.yml
-
 jobs:
     build:
         name: Docker Compose build and deploy
@@ -45,6 +44,7 @@ jobs:
                   switches: >-
                       -avzr --delete
                       --exclude=docker/compose/cloud/.env
+                      --exclude=hackathon/.env
                       --exclude=license_private.pem
                       --exclude=license_public.pem
                       --rsync-path="sudo rsync"
@@ -54,7 +54,7 @@ jobs:
                   remote_user: ${{ secrets.VPS_USER }}
                   remote_key: ${{ secrets.VPS_SSH_KEY }}
 
-            - name: Build and run with Docker Compose
+            - name: Build and run Prod Application
               uses: appleboy/ssh-action@v1.2.4
               with:
                   host: ${{ secrets.VPS_HOST }}
@@ -65,6 +65,18 @@ jobs:
                       set -euo pipefail
                       cd "${{ env.DEPLOY_REMOTE_PATH }}"
                       docker compose -f "${{ env.COMPOSE_FILE }}" up -d --build --remove-orphans
+
+            - name: Build and run Hackathon Application
+              uses: appleboy/ssh-action@v1.2.4
+              with:
+                  host: ${{ secrets.VPS_HOST }}
+                  username: ${{ secrets.VPS_USER }}
+                  key: ${{ secrets.VPS_SSH_KEY }}
+                  script_stop: true
+                  script: |
+                      set -euo pipefail
+                      cd "${{ env.DEPLOY_REMOTE_PATH }}/hackathon"
+                      docker compose up -d --build --remove-orphans
 
             - name: Notify deployment status
               if: always()

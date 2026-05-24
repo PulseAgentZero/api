@@ -1,0 +1,31 @@
+# Runtime dependencies for the hackathon image.
+# Trimmed down from the full Pulse production stack — only what the agents,
+# FastAPI surface, and eval scripts need at import time.
+
+# API + ASGI
+fastapi==0.122.0
+uvicorn==0.38.0
+pydantic[email]==2.12.4
+pydantic-settings==2.12.0
+python-multipart==0.0.20
+
+# Datastore
+sqlalchemy[asyncio]==2.0.44
+asyncpg==0.31.0
+qdrant-client==1.15.1
+
+# Entivia BaseAgent runtime deps
+anthropic==0.101.0
+groq==0.36.0
+httpx==0.28.1
+aiohttp==3.13.2
+tenacity==9.1.2
+jinja2==3.1.6
+PyJWT==2.10.1
+cryptography==46.0.5
+python-dotenv==1.2.1
+
+# Hackathon: local embeddings + eval metrics
+fastembed>=0.7.0
+rouge-score>=0.1.2
+numpy>=1.26.0

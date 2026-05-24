@@ -1,0 +1,44 @@
+# Active only if the Docker build context is set to this folder
+# (i.e. `docker build -f Dockerfile .` from inside hackathon/).
+# The current docker-compose.yml uses `context: ..`, so the *root*
+# .dockerignore is what Docker actually reads today. This file mirrors
+# the hackathon-specific exclusions for parity.
+
+# Python build artifacts
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtualenvs and editor noise
+.venv
+venv
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Paper sources are not needed at runtime — agent prompts now live at
+# app/agents/workflows/prompts/simulation/*.md (single source of truth).
+paper/
+*.pdf
+
+# Docs, dev-only checklists, and the architecture diagram source
+README.md
+SUBMISSION.md
+
+# Local dataset mounts (Yelp/Goodreads JSON is mounted at runtime, never
+# baked into the image)
+data/yelp/
+data/goodreads/
+*.tar.gz
+*.tgz
+
+# Test scratch
+.coverage
+htmlcov/
